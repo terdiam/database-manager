@@ -1,6 +1,7 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import { page } from '$app/state';
-	import { request, type DbServer, type Queued, type Snapshot } from '#lib/api/http.ts';
+	import { ApiError, request, type DbServer, type Queued, type Snapshot } from '#lib/api/http.ts';
 	import ConfirmDialog from '#lib/components/ConfirmDialog.svelte';
 	import EmptyState from '#lib/components/EmptyState.svelte';
 	import FormField from '#lib/components/FormField.svelte';
@@ -11,6 +12,7 @@
 	import { errorText } from '#lib/errors.ts';
 	import { bytes, dateTime } from '#lib/format.ts';
 	import { t } from '#lib/i18n/index.svelte.ts';
+	import { live } from '#lib/events.ts';
 	import { canOperate, isAdmin } from '#lib/session.svelte.ts';
 
 	let snapshot = $state<Snapshot>();
@@ -31,6 +33,7 @@
 		const id = page.params.id;
 		Promise.all([request<Snapshot>('GET', `/snapshots/${id}`), request<DbServer[]>('GET', '/database-servers')]).then(
 			([s, list]) => {
+				missing = false;
 				snapshot = s;
 				servers = list;
 				database = `${s.database_name}_restore`;
@@ -41,6 +44,23 @@
 			}
 		);
 	});
+
+	// Picks up a deletion or a newly added server without touching what was typed.
+	async function reload() {
+		const id = page.params.id;
+		try {
+			const [s, list] = await Promise.all([request<Snapshot>('GET', `/snapshots/${id}`), request<DbServer[]>('GET', '/database-servers')]);
+			if (id !== page.params.id) return;
+			snapshot = s;
+			servers = list;
+		} catch (e) {
+			if (e instanceof ApiError && e.code === 'not_found') {
+				missing = true;
+				error = errorText(e);
+			}
+		}
+	}
+	onMount(() => live(['snapshots', 'database_servers'], () => missing || reload()));
 
 	async function queue(method: string, path: string, body?: unknown) {
 		try {

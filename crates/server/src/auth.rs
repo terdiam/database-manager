@@ -9,7 +9,7 @@ use argon2::{Argon2, PasswordHasher, PasswordVerifier, password_hash::phc::Passw
 use axum::{
     Json,
     extract::{ConnectInfo, FromRequestParts, State},
-    http::{StatusCode, request::Parts},
+    http::{HeaderMap, StatusCode, request::Parts},
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use serde::{Deserialize, Serialize};
@@ -219,22 +219,26 @@ impl FromRequestParts<AppState> for Auth {
     type Rejection = Error;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Error> {
-        let jar = CookieJar::from_headers(&parts.headers);
-        let token = jar
-            .get(COOKIE)
-            .ok_or(Error::Unauthorized)?
-            .value()
-            .to_owned();
-        sqlx::query_as::<_, User>(
-            "SELECT u.id, u.name, u.email, u.role FROM sessions s JOIN users u ON u.id = s.user_id
-             WHERE s.token_hash = $1 AND s.expires_at > now()",
-        )
-        .bind(token_hash(&token))
-        .fetch_optional(&state.db)
-        .await?
-        .map(Auth)
-        .ok_or(Error::Unauthorized)
+        session_user(state, &parts.headers).await.map(Auth)
     }
+}
+
+/// Who the session cookie in `headers` belongs to, if it is still valid.
+pub async fn session_user(state: &AppState, headers: &HeaderMap) -> Result<User, Error> {
+    let jar = CookieJar::from_headers(headers);
+    let token = jar
+        .get(COOKIE)
+        .ok_or(Error::Unauthorized)?
+        .value()
+        .to_owned();
+    sqlx::query_as::<_, User>(
+        "SELECT u.id, u.name, u.email, u.role FROM sessions s JOIN users u ON u.id = s.user_id
+         WHERE s.token_hash = $1 AND s.expires_at > now()",
+    )
+    .bind(token_hash(&token))
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(Error::Unauthorized)
 }
 
 fn session_cookie(state: &AppState, value: String, max_age: time::Duration) -> Cookie<'static> {

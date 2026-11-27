@@ -11,11 +11,13 @@
 	import { toast } from '#lib/components/toast.svelte.ts';
 	import { errorText } from '#lib/errors.ts';
 	import { t } from '#lib/i18n/index.svelte.ts';
+	import { live } from '#lib/events.ts';
 	import { session } from '#lib/session.svelte.ts';
 
 	const blank = () => ({ name: '', email: '', password: '', role: 'viewer' as string });
 	let users = $state<User[]>([]);
 	let loadError = $state('');
+	let actionError = $state('');
 	let form = $state(blank());
 	let formError = $state('');
 	let removing = $state<User>();
@@ -30,7 +32,10 @@
 			loadError = errorText(e);
 		}
 	}
-	onMount(load);
+	onMount(() => {
+		load();
+		return live(['users'], load);
+	});
 
 	function open() {
 		form = blank();
@@ -57,9 +62,10 @@
 			await request('DELETE', `/users/${removing!.id}`);
 			toast(t('toast.deleted', { name: removing!.email }));
 		} catch (e) {
-			loadError = errorText(e);
+			actionError = errorText(e);
 			return;
 		}
+		actionError = '';
 		await load();
 	}
 </script>
@@ -68,7 +74,7 @@
 	{#snippet actions()}<button type="button" class="btn btn-primary" onclick={open}>{t('users.new')}</button>{/snippet}
 </PageHeader>
 
-<p class="mb-3 text-sm text-bad empty:hidden" role="alert">{loadError}</p>
+<p class="mb-3 text-sm text-bad empty:hidden" role="alert">{actionError || loadError}</p>
 
 <DataTable label={t('nav.users')} columns={[t('col.name'), 'Email', 'Role', t('col.actions')]} rows={users}>
 	{#snippet cell(user, i)}

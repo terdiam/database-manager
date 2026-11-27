@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import { resolve } from '$app/paths';
 	import { request, type DbServer, type Page, type Snapshot } from '#lib/api/http.ts';
 	import DataTable from '#lib/components/DataTable.svelte';
@@ -9,6 +10,7 @@
 	import { errorText } from '#lib/errors.ts';
 	import { bytes, dateTime } from '#lib/format.ts';
 	import { t } from '#lib/i18n/index.svelte.ts';
+	import { live } from '#lib/events.ts';
 
 	let period = $state(emptyDate());
 	let server = $state('');
@@ -16,8 +18,10 @@
 	let rows = $state<Snapshot[]>([]);
 	let next = $state<string | null>(null);
 	let error = $state('');
+	let paged = false; // older pages are on screen; a refresh would drop them
 
-	request<DbServer[]>('GET', '/database-servers').then((list) => (servers = list), (e) => (error = errorText(e)));
+	const loadServers = () => request<DbServer[]>('GET', '/database-servers').then((list) => (servers = list), (e) => void (error = errorText(e)));
+	loadServers();
 
 	const filter = $derived.by(() => {
 		const params = dateParams(period);
@@ -26,6 +30,7 @@
 	});
 
 	async function load(query: string, before: string | null) {
+		paged = before !== null;
 		try {
 			const page = await request<Page<Snapshot>>('GET', `/snapshots?${query}${before ? `&before=${before}` : ''}`);
 			if (query !== filter) return;
@@ -37,6 +42,7 @@
 		}
 	}
 	$effect(() => void load(filter, null));
+	onMount(() => live(['snapshots', 'database_servers'], () => paged || Promise.all([load(filter, null), loadServers()])));
 </script>
 
 <PageHeader title={t('nav.snapshots')} description={t('snapshots.desc')} />

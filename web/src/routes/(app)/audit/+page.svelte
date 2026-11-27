@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import { request, type AuditEntry, type AuditPage, type User } from '#lib/api/http.ts';
 	import DataTable from '#lib/components/DataTable.svelte';
 	import DateFilter from '#lib/components/DateFilter.svelte';
@@ -9,6 +10,7 @@
 	import { dateTime } from '#lib/format.ts';
 	import { t, type Key } from '#lib/i18n/index.svelte.ts';
 	import { messages } from '#lib/i18n/messages.ts';
+	import { live } from '#lib/events.ts';
 
 	const actions = ['login', 'backup', 'restore', 'create', 'update', 'delete', 'download'] as const;
 	const label = (action: string) => (`audit.${action}` in messages ? t(`audit.${action}` as Key) : action);
@@ -22,6 +24,7 @@
 	let next = $state<number | null>(null);
 	let error = $state('');
 	let sequence = 0;
+	let paged = false; // older pages are on screen; a refresh would drop them
 
 	request<User[]>('GET', '/users').then((list) => (users = list), (e) => (error = errorText(e)));
 
@@ -45,6 +48,7 @@
 
 	async function load(filter: string, before: number | null) {
 		const mine = ++sequence;
+		paged = before !== null;
 		try {
 			const page = await request<AuditPage>('GET', `/audit?${filter}${before ? `&before=${before}` : ''}`);
 			if (mine !== sequence) return; // a newer filter already replaced this one
@@ -62,6 +66,7 @@
 		const timer = setTimeout(() => load(filter, null), 250);
 		return () => clearTimeout(timer);
 	});
+	onMount(() => live(['audit_logs'], () => paged || load(params, null)));
 </script>
 
 <PageHeader title={t('nav.audit')} description={t('audit.desc')} />

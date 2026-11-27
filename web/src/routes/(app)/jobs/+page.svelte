@@ -12,6 +12,7 @@
 	import { errorText } from '#lib/errors.ts';
 	import { bytes, dateTime } from '#lib/format.ts';
 	import { t } from '#lib/i18n/index.svelte.ts';
+	import { live } from '#lib/events.ts';
 
 	let period = $state(emptyDate());
 	let status = $state('');
@@ -19,6 +20,7 @@
 	let next = $state<string | null>(null);
 	let selected = $state('');
 	let error = $state('');
+	let paged = false; // older pages are on screen; a refresh would drop them
 
 	const filter = $derived.by(() => {
 		const params = dateParams(period);
@@ -27,6 +29,7 @@
 	});
 
 	async function load(query: string, before: string | null) {
+		paged = before !== null;
 		try {
 			const page = await request<Page<Job>>('GET', `/jobs?${query}${before ? `&before=${before}` : ''}`);
 			if (query !== filter) return;
@@ -40,14 +43,7 @@
 	}
 	$effect(() => void load(filter, null));
 
-	// Keep the first page fresh while something is still moving.
-	onMount(() => {
-		const timer = setInterval(() => {
-			const busy = rows.some((j) => j.status === 'pending' || j.status === 'running');
-			if (busy && rows.length <= 100 && document.visibilityState === 'visible') load(filter, null);
-		}, 5000);
-		return () => clearInterval(timer);
-	});
+	onMount(() => live(['jobs'], () => paged || load(filter, null)));
 </script>
 
 <PageHeader title={t('nav.jobs')} description={t('jobs.desc')} />

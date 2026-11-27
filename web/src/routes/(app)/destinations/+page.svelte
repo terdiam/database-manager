@@ -13,6 +13,7 @@
 	import { toast } from '#lib/components/toast.svelte.ts';
 	import { errorText } from '#lib/errors.ts';
 	import { t } from '#lib/i18n/index.svelte.ts';
+	import { live } from '#lib/events.ts';
 	import { sealFor } from '#lib/secrets.ts';
 	import { canOperate } from '#lib/session.svelte.ts';
 
@@ -20,6 +21,7 @@
 	let destinations = $state<Destination[]>([]);
 	let agents = $state<Agent[]>([]);
 	let error = $state('');
+	let loadError = $state('');
 	let formError = $state('');
 	let form = $state(blank());
 	let removing = $state<Destination>();
@@ -27,8 +29,18 @@
 	let confirm: ConfirmDialog;
 	let job: JobDialog;
 
-	const load = () => request<Destination[]>('GET', '/destinations').then((list) => (destinations = list), (e) => (error = errorText(e)));
-	onMount(() => void load());
+	const load = () =>
+		request<Destination[]>('GET', '/destinations').then(
+			(list) => {
+				destinations = list;
+				loadError = '';
+			},
+			(e) => void (loadError = errorText(e))
+		);
+	onMount(() => {
+		load();
+		return live(['destinations'], load);
+	});
 
 	async function open() {
 		form = blank();
@@ -83,7 +95,7 @@
 	{#snippet actions()}{#if canOperate()}<button type="button" class="btn btn-primary" onclick={open}>{t('destinations.new')}</button>{/if}{/snippet}
 </PageHeader>
 
-<p class="mb-3 text-sm text-bad empty:hidden" role="alert">{error}</p>
+<p class="mb-3 text-sm text-bad empty:hidden" role="alert">{error || loadError}</p>
 
 <DataTable label={t('nav.destinations')} columns={[t('col.name'), t('col.type'), t('col.target'), t('col.via'), ...(canOperate() ? [t('col.actions')] : [])]} rows={destinations}>
 	{#snippet cell(d, i)}

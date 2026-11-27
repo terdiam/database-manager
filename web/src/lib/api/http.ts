@@ -1,6 +1,6 @@
 import { goto } from '$app/navigation';
 import { resolve } from '$app/paths';
-import { CONTENT_TYPE, HEADER, sealRequest } from '../e2ee.ts';
+import { CONTENT_TYPE, HEADER, STREAM_CONTENT_TYPE, sealRequest, type Sealed } from '../e2ee.ts';
 
 /** `code` matches the server's error codes and is translated as `error.<code>`. */
 export class ApiError extends Error {
@@ -61,15 +61,28 @@ async function encrypted(method: string, url: string, body: string, key: string)
 		},
 		body: sealed.body
 	});
+	return reply(sealed, response);
+}
+
+async function reply(sealed: Sealed, response: Response): Promise<Raw> {
 	if (response.headers.get('content-type') === CONTENT_TYPE) {
-		const reply = await sealed.open(await response.arrayBuffer()).catch(() => {
+		const opened = await sealed.open(await response.arrayBuffer()).catch(() => {
 			throw new ApiError('e2ee_invalid');
 		});
-		return { status: reply.status, data: parse(reply.body) };
+		return { status: opened.status, data: parse(opened.body) };
 	}
 	// Refused before decryption. Plain text is never accepted as success.
 	if (response.ok) throw new ApiError('e2ee_invalid');
 	return { status: response.status, data: parse(await response.text()) };
+}
+
+async function fail({ data }: Raw): Promise<never> {
+	const code: string = data?.error ?? 'internal';
+	// The setting or key changed while the app was open: fetch it again next time.
+	if (code === 'e2ee_required' || code === 'e2ee_invalid') encryption = undefined;
+	// The session ended while the app was open.
+	if (code === 'unauthorized') await goto(resolve('login'), { invalidateAll: true });
+	throw new ApiError(code);
 }
 
 export async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -78,17 +91,42 @@ export async function request<T>(method: string, path: string, body?: unknown): 
 	const target = new URL(`/api${path}`, location.origin);
 	const url = target.pathname + target.search;
 	const json = body ? JSON.stringify(body) : '';
-	const { status, data } = config.required
+	const raw = config.required
 		? await encrypted(method, url, json, config.public_key)
 		: await plain(method, url, json);
 
-	if (status >= 200 && status < 300) return data as T;
-	const code: string = data?.error ?? 'internal';
-	// The setting or key changed while the app was open: fetch it again next time.
-	if (code === 'e2ee_required' || code === 'e2ee_invalid') encryption = undefined;
-	// The session ended while the app was open.
-	if (code === 'unauthorized') await goto(resolve('login'), { invalidateAll: true });
-	throw new ApiError(code);
+	if (raw.status >= 200 && raw.status < 300) return raw.data as T;
+	return fail(raw);
+}
+
+/**
+ * A response without an end (server events), one call of `onLine` per line, encrypted like every
+ * other payload. Resolves when the server closes it; `EventSource` cannot send the encryption header.
+ */
+export async function openStream(path: string, onLine: (line: string) => void, signal: AbortSignal): Promise<void> {
+	const config = await e2eeInfo();
+	const url = `/api${path}`;
+	if (config.required && !window.isSecureContext) throw new ApiError('insecure_context');
+	const sealed = config.required ? await sealRequest(config.public_key, 'GET', url, '') : undefined;
+	const response = await send('GET', url, { headers: sealed ? { [HEADER]: sealed.header } : {}, signal });
+
+	const type = response.headers.get('content-type') ?? '';
+	if (sealed ? type !== STREAM_CONTENT_TYPE : !response.ok) {
+		await fail(sealed ? await reply(sealed, response) : { status: response.status, data: parse(await response.text()) });
+	}
+
+	const open = sealed?.stream();
+	const decoder = new TextDecoder();
+	let rest = '';
+	const reader = response.body!.getReader();
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) return;
+		rest += open ? (await open(value)).join('') : decoder.decode(value, { stream: true });
+		const lines = rest.split('\n');
+		rest = lines.pop()!;
+		lines.forEach(onLine);
+	}
 }
 
 export type Role = 'admin' | 'operator' | 'viewer';

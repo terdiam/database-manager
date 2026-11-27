@@ -8,9 +8,9 @@ use std::{
 
 use axum::{
     Json,
-    body::{Body, to_bytes},
+    body::{Body, Bytes, to_bytes},
     extract::{OriginalUri, Request, State},
-    http::{HeaderValue, header},
+    http::{HeaderValue, header, response::Parts},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -18,6 +18,7 @@ use dbm_shared::{
     E2eeInfo,
     e2ee::{self, Keypair, MAX_SKEW_SECS},
 };
+use futures_util::{StreamExt, future, stream};
 use time::OffsetDateTime;
 
 use crate::{AppState, Error};
@@ -56,6 +57,33 @@ impl Transport {
         seen.insert(enc.to_vec(), Instant::now());
         true
     }
+}
+
+/// Marks a response without an end: it is sealed chunk by chunk instead of as a whole.
+#[derive(Clone, Copy)]
+pub struct Streaming;
+
+fn seal_stream(exchange: &e2ee::Exchange, mut head: Parts, body: Body) -> Response {
+    let mut seed = [0; 32];
+    if getrandom::fill(&mut seed).is_err() {
+        return Error::Internal("response encryption".into()).into_response();
+    }
+    let mut cipher = e2ee::StreamCipher::new(exchange, &seed);
+    let chunks = body.into_data_stream().map(move |chunk| {
+        let chunk = chunk?;
+        cipher
+            .seal(&chunk)
+            .map(Bytes::from)
+            .map_err(axum::Error::new)
+    });
+    let start = stream::once(future::ready(Ok::<_, axum::Error>(Bytes::copy_from_slice(
+        &seed,
+    ))));
+    head.headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(e2ee::STREAM_CONTENT_TYPE),
+    );
+    Response::from_parts(head, Body::from_stream(start.chain(chunks)))
 }
 
 pub async fn info(State(app): State<AppState>) -> Json<E2eeInfo> {
@@ -147,6 +175,9 @@ pub async fn layer(State(app): State<AppState>, request: Request, next: Next) ->
         .run(Request::from_parts(parts, Body::from(opened.body)))
         .await;
     let (mut head, body) = response.into_parts();
+    if head.extensions.remove::<Streaming>().is_some() {
+        return seal_stream(&opened.exchange, head, body);
+    }
     let Ok(plain) = to_bytes(body, usize::MAX).await else {
         return Error::Internal("response body".into()).into_response();
     };

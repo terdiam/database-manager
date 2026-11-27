@@ -4,6 +4,7 @@ mod auth;
 mod crypto;
 mod e2ee;
 mod error;
+mod events;
 mod jobs;
 mod keys;
 mod recover;
@@ -58,6 +59,7 @@ pub struct AppState {
     guard: Arc<auth::LoginGuard>,
     transport: Arc<e2ee::Transport>,
     master: Arc<MasterKey>,
+    events: events::Sender,
 }
 
 impl AppState {
@@ -70,7 +72,18 @@ impl AppState {
             guard: Arc::default(),
             transport: Arc::new(transport),
             master: Arc::new(master),
+            events: events::channel(),
         }
+    }
+
+    /// Starts forwarding database changes to open pages. Holds one database connection.
+    pub async fn watch_changes(&self) -> Result<(), sqlx::Error> {
+        events::watch(&self.db, self.events.clone()).await
+    }
+
+    /// Ends the open event streams, so a graceful shutdown does not wait for them.
+    pub fn close_streams(&self) {
+        let _ = self.events.send(events::Signal::Close);
     }
 }
 
@@ -116,6 +129,7 @@ pub fn app(state: AppState) -> Router {
         .route("/jobs/{id}", get(jobs::get))
         .route("/jobs/{id}/cancel", post(jobs::cancel))
         .route("/backup-keys/export", post(keys::export))
+        .route("/events", get(events::stream))
         .layer(middleware::from_fn_with_state(state.clone(), e2ee::layer))
         .layer(middleware::from_fn(csrf));
 

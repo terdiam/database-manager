@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { resolve } from '$app/paths';
+	import { live } from '#lib/events.ts';
 	import { dateTime } from '#lib/format.ts';
 	import { t } from '#lib/i18n/index.svelte.ts';
 	import { isUnread, markAllRead, notices, refresh } from '#lib/notifications.svelte.ts';
@@ -10,13 +11,7 @@
 	let panel: HTMLElement;
 	const unread = $derived(notices.jobs.filter(isUnread).length);
 
-	// Polls until live updates arrive; paused while the tab is hidden.
-	onMount(() => {
-		const tick = () => document.visibilityState === 'visible' && refresh().catch(() => {});
-		tick();
-		const timer = setInterval(tick, 15_000);
-		return () => clearInterval(timer);
-	});
+	onMount(() => live(['jobs'], refresh, { now: true }));
 </script>
 
 <button type="button" class="btn relative min-h-10 px-2.5" popovertarget="{id}-bell" aria-label={t('bell.label', { n: unread })}>

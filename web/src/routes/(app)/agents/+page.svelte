@@ -12,10 +12,12 @@
 	import { errorText } from '#lib/errors.ts';
 	import { dateTime } from '#lib/format.ts';
 	import { t } from '#lib/i18n/index.svelte.ts';
+	import { live } from '#lib/events.ts';
 	import { isAdmin } from '#lib/session.svelte.ts';
 
 	let agents = $state<Agent[]>();
 	let loadError = $state('');
+	let actionError = $state('');
 	let name = $state('');
 	let token = $state('');
 	let formError = $state('');
@@ -37,11 +39,9 @@
 		}
 	}
 
-	// Poll for agent status, paused while the tab is hidden.
 	onMount(() => {
 		load();
-		const timer = setInterval(() => document.visibilityState === 'visible' && load(), 10_000);
-		return () => clearInterval(timer);
+		return live(['agents'], load, { every: 30_000 });
 	});
 
 	function open() {
@@ -74,9 +74,10 @@
 			await request('DELETE', `/agents/${removing!.id}`);
 			toast(t('toast.deleted', { name: removing!.name }));
 		} catch (e) {
-			loadError = errorText(e);
+			actionError = errorText(e);
 			return;
 		}
+		actionError = '';
 		await load();
 	}
 </script>
@@ -85,7 +86,7 @@
 	{#snippet actions()}{#if isAdmin()}<button type="button" class="btn btn-primary" onclick={open}>{t('agents.new')}</button>{/if}{/snippet}
 </PageHeader>
 
-<p class="mb-3 text-sm text-bad empty:hidden" role="alert">{loadError}</p>
+<p class="mb-3 text-sm text-bad empty:hidden" role="alert">{actionError || loadError}</p>
 
 {#if agents?.length === 0}
 	<EmptyState title={t('agents.none')} hint={t('agents.noneHint')} />

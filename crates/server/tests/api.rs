@@ -1105,3 +1105,117 @@ async fn silent_agents_lose_their_jobs_and_pending_jobs_cancel(db: PgPool) {
     let detail = call(&app, "GET", &format!("/api/jobs/{id}"), Some(&cookie), None).await;
     assert_eq!(detail.body["status"], "failed");
 }
+
+fn state_for(db: PgPool, e2ee_required: bool, key: Keypair) -> AppState {
+    let config = Config {
+        cookie_secure: true,
+        trust_proxy: false,
+        turnstile: None,
+        e2ee_required,
+        extra_recipient: None,
+    };
+    let master = MasterKey::parse("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap();
+    AppState::new(db, config, key, master)
+}
+
+/// The next chunk of a response that has not ended, or `None` once it has.
+async fn chunk(body: &mut Body) -> Option<Vec<u8>> {
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), body.frame())
+        .await
+        .expect("a chunk within 5 s")?;
+    Some(frame.unwrap().into_data().unwrap().to_vec())
+}
+
+#[sqlx::test]
+async fn events_announce_changes_to_signed_in_pages(db: PgPool) {
+    let state = state_for(db.clone(), false, Keypair::generate());
+    state.watch_changes().await.unwrap();
+    let app = app(state.clone());
+    assert_eq!(
+        call(&app, "GET", "/api/events", None, None).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+
+    let cookie = admin(&app).await;
+    let viewer =
+        json!({ "name": "V", "email": "v@example.com", "password": PASSWORD, "role": "viewer" });
+    let created = call(&app, "POST", "/api/users", Some(&cookie), Some(viewer)).await;
+    assert!(created.status.is_success());
+    let viewer = login(&app, "v@example.com", PASSWORD).await.cookie.unwrap();
+
+    let open = |cookie: String| {
+        let app = app.clone();
+        async move {
+            let request = Request::get("/api/events")
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = response.into_body();
+            assert_eq!(chunk(&mut body).await.unwrap(), b"*\n");
+            body
+        }
+    };
+    // Changes from before the streams may still be in flight.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let mut as_admin = open(cookie.clone()).await;
+    let mut as_viewer = open(viewer).await;
+
+    // An update that matches nothing is not a change.
+    sqlx::query("UPDATE jobs SET bytes = 1")
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET name = 'Renamed' WHERE email = 'v@example.com'")
+        .execute(&db)
+        .await
+        .unwrap();
+    assert_eq!(chunk(&mut as_admin).await.unwrap(), b"users\n");
+    sqlx::query("INSERT INTO agents (name, token_hash, version) VALUES ('a', '\\x00', '1')")
+        .execute(&db)
+        .await
+        .unwrap();
+    assert_eq!(chunk(&mut as_admin).await.unwrap(), b"agents\n");
+    // The viewer never hears about the users table.
+    assert_eq!(chunk(&mut as_viewer).await.unwrap(), b"agents\n");
+
+    state.close_streams();
+    assert!(chunk(&mut as_admin).await.is_none());
+}
+
+#[sqlx::test]
+async fn events_are_encrypted_chunk_by_chunk(db: PgPool) {
+    let key = Keypair::generate();
+    let plain = app(state_for(db.clone(), false, key.clone()));
+    let cookie = admin(&plain).await;
+    let state = state_for(db, true, key.clone());
+    let app = app(state);
+
+    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
+    let aad = e2ee::request_aad("GET", "/api/events", timestamp);
+    let sealed = e2ee::seal_request(&key.public, &aad, "", b"").unwrap();
+    let header_value = format!(
+        "1.{timestamp}.{}.{}",
+        e2ee::encode(&sealed.exchange.enc),
+        e2ee::encode(&sealed.ciphertext)
+    );
+    let request = Request::get("/api/events")
+        .header(header::COOKIE, cookie)
+        .header(e2ee::HEADER, header_value)
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        e2ee::STREAM_CONTENT_TYPE
+    );
+
+    let mut body = response.into_body();
+    let seed = chunk(&mut body).await.unwrap();
+    let mut cipher = e2ee::StreamCipher::new(&sealed.exchange, &seed);
+    let first = chunk(&mut body).await.unwrap();
+    // Length prefix, two bytes of text and the authentication tag.
+    assert_eq!(first.len(), 4 + 2 + 16);
+    assert_eq!(cipher.open(&first[4..]).unwrap(), b"*\n");
+}

@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 
 pub const HEADER: &str = "x-dbm-e2ee";
 pub const CONTENT_TYPE: &str = "application/dbm-e2ee";
+/// A response that never ends: a 32 byte seed, then length-prefixed sealed chunks.
+pub const STREAM_CONTENT_TYPE: &str = "application/dbm-e2ee-stream";
 /// Accepted clock difference between client and server.
 pub const MAX_SKEW_SECS: i64 = 120;
 pub const KEY_ID: u8 = 1;
@@ -175,12 +177,20 @@ pub fn open_request(
 }
 
 fn response_cipher(exchange: &Exchange, nonce_seed: &[u8]) -> (Aes256Gcm, [u8; 12]) {
+    derive_cipher(exchange, nonce_seed, [b"key", b"nonce"])
+}
+
+fn derive_cipher(
+    exchange: &Exchange,
+    nonce_seed: &[u8],
+    [key_label, nonce_label]: [&[u8]; 2],
+) -> (Aes256Gcm, [u8; 12]) {
     let salt = [exchange.enc.as_slice(), nonce_seed].concat();
     let hkdf = Hkdf::<Sha256>::new(Some(&salt), &exchange.secret);
     let (mut key, mut nonce) = ([0; 32], [0; 12]);
-    hkdf.expand(b"key", &mut key)
+    hkdf.expand(key_label, &mut key)
         .expect("32 bytes is a valid length");
-    hkdf.expand(b"nonce", &mut nonce)
+    hkdf.expand(nonce_label, &mut nonce)
         .expect("12 bytes is a valid length");
     (Aes256Gcm::new(&key.into()), nonce)
 }
@@ -210,6 +220,54 @@ pub fn open_response(exchange: &Exchange, data: &[u8]) -> Result<(u16, Vec<u8>),
         .map_err(|_| CryptoError)?;
     let (status, body) = plain.split_at_checked(2).ok_or(CryptoError)?;
     Ok((u16::from_be_bytes([status[0], status[1]]), body.to_vec()))
+}
+
+/// Seals or opens a long response chunk by chunk. The chunk number is part of the nonce,
+/// so a chunk cannot be dropped, repeated or moved.
+pub struct StreamCipher {
+    cipher: Aes256Gcm,
+    nonce: [u8; 12],
+    counter: u64,
+}
+
+impl StreamCipher {
+    /// `seed` must be fresh random bytes for every stream.
+    pub fn new(exchange: &Exchange, seed: &[u8]) -> Self {
+        let (cipher, nonce) = derive_cipher(exchange, seed, [b"stream key", b"stream nonce"]);
+        Self {
+            cipher,
+            nonce,
+            counter: 0,
+        }
+    }
+
+    fn next_nonce(&mut self) -> [u8; 12] {
+        let mut nonce = self.nonce;
+        for (byte, count) in nonce[4..].iter_mut().zip(self.counter.to_be_bytes()) {
+            *byte ^= count;
+        }
+        self.counter += 1;
+        nonce
+    }
+
+    /// Output is `length (u32, big endian) || ciphertext`.
+    pub fn seal(&mut self, chunk: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        let nonce = self.next_nonce();
+        let sealed = self
+            .cipher
+            .encrypt(&nonce.into(), chunk)
+            .map_err(|_| CryptoError)?;
+        let length = u32::try_from(sealed.len()).map_err(|_| CryptoError)?;
+        Ok([&length.to_be_bytes()[..], &sealed].concat())
+    }
+
+    /// `sealed` is one chunk without its length prefix.
+    pub fn open(&mut self, sealed: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        let nonce = self.next_nonce();
+        self.cipher
+            .decrypt(&nonce.into(), sealed)
+            .map_err(|_| CryptoError)
+    }
 }
 
 /// Everything a sealed secret is tied to, so the server cannot move it elsewhere.
@@ -305,6 +363,27 @@ mod tests {
         let mut bad = reply.clone();
         *bad.last_mut().unwrap() ^= 1;
         assert!(open_response(&sealed.exchange, &bad).is_err());
+    }
+
+    #[test]
+    fn stream_chunks_open_only_in_order() {
+        let server = Keypair::generate();
+        let aad = request_aad("GET", "/api/events", 100);
+        let sealed = seal_request(&server.public, &aad, "", b"").unwrap();
+        let mut writer = StreamCipher::new(&sealed.exchange, b"seed");
+        let chunks = [
+            writer.seal(b"jobs\n").unwrap(),
+            writer.seal(b"jobs\n").unwrap(),
+        ];
+        assert_ne!(chunks[0], chunks[1]);
+
+        let mut reader = StreamCipher::new(&sealed.exchange, b"seed");
+        for chunk in &chunks {
+            assert_eq!(reader.open(&chunk[4..]).unwrap(), b"jobs\n");
+        }
+        // The second chunk is not accepted in the first position.
+        let mut late = StreamCipher::new(&sealed.exchange, b"seed");
+        assert!(late.open(&chunks[1][4..]).is_err());
     }
 
     #[test]

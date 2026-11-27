@@ -34,7 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let url = env::var("DATABASE_URL").map_err(|_| "DATABASE_URL is required")?;
     let pool = PgPoolOptions::new()
-        .max_connections(5)
+        // One of these is held by the change listener.
+        .max_connections(6)
         .connect(&url)
         .await?;
     sqlx::migrate!().run(&pool).await?;
@@ -82,12 +83,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if e2ee_required { "on" } else { "off" }
     );
 
+    let state = AppState::new(pool, config, transport_key, master);
+    state.watch_changes().await?;
+    let streams = state.clone();
     axum::serve(
         listener,
-        app(AppState::new(pool, config, transport_key, master))
-            .into_make_service_with_connect_info::<SocketAddr>(),
+        app(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown())
+    .with_graceful_shutdown(async move {
+        shutdown().await;
+        streams.close_streams();
+    })
     .await?;
     Ok(())
 }

@@ -2,6 +2,8 @@
 // scripts/e2ee.interop.ts can check them against the Rust server from Node.
 export const HEADER = 'x-dbm-e2ee';
 export const CONTENT_TYPE = 'application/dbm-e2ee';
+/** A response that never ends: a 32 byte seed, then length-prefixed sealed chunks. */
+export const STREAM_CONTENT_TYPE = 'application/dbm-e2ee-stream';
 
 const KEY_ID = 1;
 // KEM 0x0020 (X25519), KDF 0x0001 (HKDF-SHA256), AEAD 0x0002 (AES-256-GCM)
@@ -62,6 +64,8 @@ export type Sealed = {
 	/** Present for requests with a body; otherwise the proof is inside the header. */
 	body?: Bytes;
 	open: (reply: ArrayBuffer) => Promise<{ status: number; body: string }>;
+	/** Opens a stream chunk by chunk; call the result with the network pieces as they arrive. */
+	stream: () => (piece: Uint8Array) => Promise<string[]>;
 };
 
 export async function sealRequest(
@@ -80,14 +84,44 @@ export async function sealRequest(
 	const secret = await context.export(text('dbm/v1 response'), 32);
 	const inHeader = method === 'GET';
 
+	async function cipher(seed: Bytes, keyLabel: string, nonceLabel: string) {
+		const salt = concat(enc, seed);
+		const key = await crypto.subtle.importKey('raw', await derive(secret, salt, keyLabel, 32), 'AES-GCM', false, ['decrypt']);
+		return { key, iv: new Uint8Array(await derive(secret, salt, nonceLabel, 12)) as Bytes };
+	}
+
 	return {
 		header: `1.${timestamp}.${encode(enc)}${inHeader ? `.${encode(sealed)}` : ''}`,
 		body: inHeader ? undefined : sealed,
+		stream() {
+			let buffer: Bytes = new Uint8Array(0);
+			let state: Awaited<ReturnType<typeof cipher>> | undefined;
+			let counter = 0;
+			return async (piece) => {
+				buffer = concat(buffer, piece);
+				if (!state) {
+					if (buffer.length < 32) return [];
+					state = await cipher(buffer.slice(0, 32), 'stream key', 'stream nonce');
+					buffer = buffer.slice(32);
+				}
+				const messages: string[] = [];
+				while (buffer.length >= 4) {
+					const end = 4 + new DataView(buffer.buffer, buffer.byteOffset).getUint32(0);
+					if (end > 4096) throw new Error('chunk too large');
+					if (buffer.length < end) break;
+					// The chunk number is part of the nonce, so a missing or moved chunk fails here.
+					const iv = state.iv.slice();
+					const view = new DataView(iv.buffer);
+					view.setUint32(8, (view.getUint32(8) ^ counter++) >>> 0);
+					const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, state.key, buffer.slice(4, end));
+					messages.push(new TextDecoder().decode(plain));
+					buffer = buffer.slice(end);
+				}
+				return messages;
+			};
+		},
 		async open(reply) {
-			const seed = new Uint8Array(reply, 0, 32);
-			const salt = concat(enc, seed);
-			const key = await crypto.subtle.importKey('raw', await derive(secret, salt, 'key', 32), 'AES-GCM', false, ['decrypt']);
-			const iv = await derive(secret, salt, 'nonce', 12);
+			const { key, iv } = await cipher(new Uint8Array(reply.slice(0, 32)), 'key', 'nonce');
 			const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, new Uint8Array(reply, 32));
 			return {
 				status: new DataView(plain).getUint16(0),

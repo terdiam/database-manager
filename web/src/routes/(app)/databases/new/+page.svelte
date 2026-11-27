@@ -13,21 +13,28 @@
 	import { toast } from '#lib/components/toast.svelte.ts';
 	import { errorText } from '#lib/errors.ts';
 	import { t } from '#lib/i18n/index.svelte.ts';
+	import { live } from '#lib/events.ts';
 	import { sealFor } from '#lib/secrets.ts';
 
 	let step = $state(0);
 	let agents = $state<Agent[]>([]);
 	let error = $state('');
+	let loadError = $state('');
 	let form = $state({ name: '', agent: '', host: '', port: 5432, username: 'postgres', password: '', ssl_mode: 'prefer' });
 	const agent = $derived(agents.find((a) => a.id === form.agent));
 
-	onMount(async () => {
+	async function load() {
 		try {
 			agents = (await request<Agent[]>('GET', '/agents')).filter((a) => a.key);
-			form.agent = agents[0]?.id ?? '';
+			if (!agents.some((a) => a.id === form.agent)) form.agent = agents[0]?.id ?? '';
+			loadError = '';
 		} catch (e) {
-			error = errorText(e);
+			loadError = errorText(e);
 		}
+	}
+	onMount(() => {
+		load();
+		return live(['agents'], load);
 	});
 
 	async function save() {
@@ -45,7 +52,7 @@
 </script>
 
 <PageHeader title={t('databases.new')} />
-<p class="mb-3 text-sm text-bad empty:hidden" role="alert">{error}</p>
+<p class="mb-3 text-sm text-bad empty:hidden" role="alert">{error || loadError}</p>
 
 <Wizard bind:step steps={[t('wizard.engine'), t('wizard.connection'), t('wizard.summary')]} finishLabel={t('action.save')} canFinish={!!agent} onfinish={save}>
 	{#if step === 0}

@@ -1,14 +1,15 @@
 <script lang="ts">
 	import { request, type Job, type JobLine } from '#lib/api/http.ts';
 	import { errorText } from '#lib/errors.ts';
+	import { live } from '#lib/events.ts';
 	import { bytes } from '#lib/format.ts';
 	import { t } from '#lib/i18n/index.svelte.ts';
 	import { canOperate } from '#lib/session.svelte.ts';
 	import LogViewer from './LogViewer.svelte';
 	import StatusBadge from './StatusBadge.svelte';
 
-	// Follows one job: polls until it finishes, asking only for new log lines.
-	// Responses go through the same (optionally encrypted) API as everything else.
+	// Follows one job until it finishes: each change event fetches only the new log lines,
+	// through the same (optionally encrypted) API as everything else.
 	let { jobId, onfinish }: { jobId: string; onfinish?: (job: Job) => void } = $props();
 	let job = $state<Job>();
 	let lines = $state<string[]>([]);
@@ -18,34 +19,38 @@
 		const id = jobId;
 		let after = 0;
 		let stopped = false;
-		let timer: ReturnType<typeof setTimeout>;
+		let finished = false;
 		job = undefined;
 		lines = [];
 
-		async function poll() {
+		async function load() {
+			if (finished) return;
 			try {
-				const reply = await request<Job & { logs: JobLine[] }>('GET', `/jobs/${id}?after=${after}`);
-				if (stopped) return;
-				error = '';
-				job = reply;
-				if (reply.logs.length) {
-					after = reply.logs[reply.logs.length - 1].id;
-					lines = [...lines, ...reply.logs.map((l) => `[${l.level}] ${l.message}`)];
-				}
+				let reply: Job & { logs: JobLine[] };
 				// A full page means more lines are waiting.
-				const done = reply.status !== 'pending' && reply.status !== 'running' && reply.logs.length < 500;
-				if (done) onfinish?.(reply);
-				else timer = setTimeout(poll, 1500);
+				do {
+					reply = await request<Job & { logs: JobLine[] }>('GET', `/jobs/${id}?after=${after}`);
+					if (stopped) return;
+					error = '';
+					job = reply;
+					if (reply.logs.length) {
+						after = reply.logs[reply.logs.length - 1].id;
+						lines = [...lines, ...reply.logs.map((l) => `[${l.level}] ${l.message}`)];
+					}
+				} while (reply.logs.length === 500);
+				if (reply.status !== 'pending' && reply.status !== 'running') {
+					finished = true;
+					stop();
+					onfinish?.(reply);
+				}
 			} catch (e) {
-				if (stopped) return;
-				error = errorText(e);
-				timer = setTimeout(poll, 5000);
+				if (!stopped) error = errorText(e);
 			}
 		}
-		poll();
+		const stop = live(['jobs'], load, { every: 15_000, now: true });
 		return () => {
 			stopped = true;
-			clearTimeout(timer);
+			stop();
 		};
 	});
 

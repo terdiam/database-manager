@@ -10,18 +10,30 @@
 	import { toast } from '#lib/components/toast.svelte.ts';
 	import { errorText } from '#lib/errors.ts';
 	import { t } from '#lib/i18n/index.svelte.ts';
+	import { live } from '#lib/events.ts';
 	import { canOperate } from '#lib/session.svelte.ts';
 
 	let servers = $state<DbServer[]>([]);
 	let error = $state('');
+	let loadError = $state('');
 	let query = $state('');
 	let removing = $state<DbServer>();
 	let confirm: ConfirmDialog;
 	let job: JobDialog;
 	const rows = $derived(servers.filter((s) => `${s.name} ${s.host}`.toLowerCase().includes(query.toLowerCase())));
 
-	const load = () => request<DbServer[]>('GET', '/database-servers').then((list) => (servers = list), (e) => (error = errorText(e)));
-	onMount(() => void load());
+	const load = () =>
+		request<DbServer[]>('GET', '/database-servers').then(
+			(list) => {
+				servers = list;
+				loadError = '';
+			},
+			(e) => void (loadError = errorText(e))
+		);
+	onMount(() => {
+		load();
+		return live(['database_servers', 'agents'], load);
+	});
 
 	async function test(server: DbServer) {
 		try {
@@ -47,7 +59,7 @@
 	{#snippet actions()}{#if canOperate()}<a class="btn btn-primary" href={resolve('databases/new')}>{t('databases.new')}</a>{/if}{/snippet}
 </PageHeader>
 
-<p class="mb-3 text-sm text-bad empty:hidden" role="alert">{error}</p>
+<p class="mb-3 text-sm text-bad empty:hidden" role="alert">{error || loadError}</p>
 
 <search class="mb-3 block max-w-xs">
 	<input class="input" type="search" aria-label={t('action.search')} placeholder={t('action.search')} bind:value={query} />
