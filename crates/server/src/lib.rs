@@ -4,7 +4,11 @@ mod auth;
 mod crypto;
 mod e2ee;
 mod error;
+mod jobs;
+mod keys;
 mod recover;
+mod resources;
+mod snapshots;
 mod turnstile;
 mod users;
 mod web;
@@ -23,6 +27,14 @@ use dbm_shared::e2ee::Keypair;
 use sqlx::PgPool;
 
 pub use crypto::{MasterKey, load_transport_key};
+
+/// `None` unless `text` is an age X25519 recipient.
+pub fn parse_recipient(text: &str) -> Option<String> {
+    text.trim()
+        .parse::<age::x25519::Recipient>()
+        .ok()
+        .map(|r| r.to_string())
+}
 pub use error::Error;
 pub use recover::reset_password;
 pub use turnstile::{Turnstile, VERIFY_URL};
@@ -35,6 +47,8 @@ pub struct Config {
     pub turnstile: Option<Turnstile>,
     /// Refuse API requests that are not end-to-end encrypted.
     pub e2ee_required: bool,
+    /// A second age recipient whose private key is kept offline, for disaster recovery.
+    pub extra_recipient: Option<String>,
 }
 
 #[derive(Clone)]
@@ -43,17 +57,19 @@ pub struct AppState {
     config: Arc<Config>,
     guard: Arc<auth::LoginGuard>,
     transport: Arc<e2ee::Transport>,
+    master: Arc<MasterKey>,
 }
 
 impl AppState {
     /// `transport_key` comes from `load_transport_key`.
-    pub fn new(db: PgPool, config: Config, transport_key: Keypair) -> Self {
+    pub fn new(db: PgPool, config: Config, transport_key: Keypair, master: MasterKey) -> Self {
         let transport = e2ee::Transport::new(transport_key, config.e2ee_required);
         Self {
             db,
             config: Arc::new(config),
             guard: Arc::default(),
             transport: Arc::new(transport),
+            master: Arc::new(master),
         }
     }
 }
@@ -72,6 +88,34 @@ pub fn app(state: AppState) -> Router {
         .route("/agents/tokens", post(agents::create_token))
         .route("/agents/{id}", delete(agents::remove))
         .route("/audit", get(audit::list))
+        .route(
+            "/database-servers",
+            get(resources::list_servers).post(resources::create_server),
+        )
+        .route("/database-servers/{id}", delete(resources::delete_server))
+        .route("/database-servers/{id}/test", post(resources::test_server))
+        .route(
+            "/destinations",
+            get(resources::list_destinations).post(resources::create_destination),
+        )
+        .route("/destinations/{id}", delete(resources::delete_destination))
+        .route("/destinations/{id}/test", post(resources::test_destination))
+        .route(
+            "/backups",
+            get(resources::list_backups).post(resources::create_backup),
+        )
+        .route("/backups/{id}", delete(resources::delete_backup))
+        .route("/backups/{id}/run", post(snapshots::run_backup))
+        .route("/snapshots", get(snapshots::list))
+        .route(
+            "/snapshots/{id}",
+            get(snapshots::get).delete(snapshots::delete),
+        )
+        .route("/snapshots/{id}/restore", post(snapshots::restore))
+        .route("/jobs", get(jobs::list))
+        .route("/jobs/{id}", get(jobs::get))
+        .route("/jobs/{id}/cancel", post(jobs::cancel))
+        .route("/backup-keys/export", post(keys::export))
         .layer(middleware::from_fn_with_state(state.clone(), e2ee::layer))
         .layer(middleware::from_fn(csrf));
 
@@ -79,6 +123,9 @@ pub fn app(state: AppState) -> Router {
     let agent = Router::new()
         .route("/agent/enroll", post(agents::enroll))
         .route("/agent/heartbeat", post(agents::heartbeat))
+        .route("/agent/jobs/claim", post(jobs::claim))
+        .route("/agent/jobs/report", post(jobs::report))
+        .route("/agent/jobs/finish", post(jobs::finish))
         .layer(middleware::from_fn_with_state(state.clone(), e2ee::layer));
 
     Router::new()

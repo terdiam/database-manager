@@ -51,6 +51,15 @@ pub struct User {
 }
 
 impl User {
+    /// Admins and operators: anyone who may change things or run backups and restores.
+    pub fn require_operator(&self) -> Result<(), Error> {
+        if self.role == Role::Viewer.as_str() {
+            Err(Error::Forbidden)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn require_admin(&self) -> Result<(), Error> {
         if self.role == Role::Admin.as_str() {
             Ok(())
@@ -449,4 +458,26 @@ pub async fn change_password(
     audit::record(&app.db, Some(&user), "update", "own password", &ip, true).await?;
     let jar = start_session(&app, jar, user.id).await?;
     Ok((jar, StatusCode::NO_CONTENT))
+}
+
+/// Re-checks the password before a sensitive action, with the same lockout as signing in.
+pub async fn confirm_password(
+    app: &AppState,
+    user: &User,
+    ip: &str,
+    password: String,
+) -> Result<(), Error> {
+    let key = format!("{ip}|{}", user.email);
+    if app.guard.locked(&key) {
+        return Err(Error::TooManyAttempts);
+    }
+    let hash: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+        .bind(user.id)
+        .fetch_one(&app.db)
+        .await?;
+    if password.len() > 1024 || !verify_password(app, password, hash).await? {
+        app.guard.fail(key);
+        return Err(Error::Invalid("wrong_password"));
+    }
+    Ok(())
 }

@@ -4,10 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+age = "0.12.1"
+bzip2 = "0.6.1"
 dbm-shared = { version = "0.1.0", path = "../shared" }
+flate2 = "1.1.11"
+futures-util = "0.3.34"
+liblzma = "0.4.9"
+lz4_flex = "0.14.2"
+opendal = { version = "0.59.5", default-features = false, features = ["services-s3", "blocking", "executors-tokio", "http-transport-reqwest"] }
 reqwest = { version = "0.13.5", features = ["json"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-tokio = { version = "1.54.1", features = ["rt", "macros", "signal", "time"] }
+sha2 = "0.11.2"
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["rt", "macros", "signal", "time", "sync", "io-util"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
+uuid = { version = "1.29.3", features = ["v4"] }
+zstd = "0.14.5"

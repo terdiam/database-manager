@@ -25,6 +25,8 @@ services:
       DBM_MASTER_KEY: ${DBM_MASTER_KEY:?set DBM_MASTER_KEY in .env}
       # Encrypt API bodies on top of TLS: on or off.
       DBM_E2EE: ${DBM_E2EE:-on}
+      # Optional second age public key; its private key stays offline.
+      DBM_BACKUP_EXTRA_RECIPIENT: ${DBM_BACKUP_EXTRA_RECIPIENT:-}
       # true only when requests arrive through the proxy below.
       DBM_TRUST_PROXY: ${DBM_TRUST_PROXY:-false}
       DBM_TURNSTILE_SITE_KEY: ${DBM_TURNSTILE_SITE_KEY:-}

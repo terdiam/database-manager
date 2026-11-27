@@ -1,7 +1,6 @@
 <script lang="ts">
 	import { resolve } from '$app/paths';
 	import { page } from '$app/state';
-	import { jobs } from '#lib/api/index.ts';
 	import { isAdmin } from '#lib/session.svelte.ts';
 	import { t } from '#lib/i18n/index.svelte.ts';
 	import Icon from './Icon.svelte';
@@ -10,7 +9,6 @@
 	import UserMenu from './UserMenu.svelte';
 
 	let { collapsed = false, ontour }: { collapsed?: boolean; ontour: () => void } = $props();
-	const failed = jobs.filter((job) => job.status === 'failed' && Date.now() - Date.parse(job.started) < 86_400_000).length;
 	const active = (href: string) => (href === '/' ? page.url.pathname === '/' : page.url.pathname.startsWith(href));
 </script>
 
@@ -28,9 +26,6 @@
 						class="flex min-h-9 items-center gap-2.5 rounded-lg px-2 text-sm {active(item.href) ? 'bg-muted font-semibold text-brand' : 'hover:bg-muted'}">
 						<Icon name={item.icon} />
 						<span class={collapsed ? 'sr-only' : 'flex-1'}>{t(item.label)}</span>
-						{#if item.href === '/jobs' && failed && !collapsed}
-							<span class="rounded-full bg-muted px-1.5 text-xs font-semibold text-bad" title={t('nav.failed', { n: failed })}>{failed}</span>
-						{/if}
 					</a>
 				</li>
 			{/each}

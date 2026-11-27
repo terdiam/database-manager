@@ -25,6 +25,9 @@ pub struct Agent {
     online: bool,
     #[serde(skip)]
     public_key: Option<Vec<u8>>,
+    /// The browser seals secrets to this.
+    #[sqlx(skip)]
+    key: Option<String>,
     /// To compare with the one the agent prints; absent for agents enrolled before keys existed.
     #[sqlx(skip)]
     fingerprint: Option<String>,
@@ -40,6 +43,7 @@ pub async fn list(State(app): State<AppState>, Auth(_): Auth) -> Result<Json<Vec
     .await?;
     for agent in &mut agents {
         agent.fingerprint = agent.public_key.as_deref().map(e2ee::fingerprint);
+        agent.key = agent.public_key.as_deref().map(e2ee::encode);
     }
     Ok(Json(agents))
 }
@@ -174,24 +178,36 @@ pub async fn enroll(
     Ok(Json(EnrollResponse { agent_id, secret }))
 }
 
-pub async fn heartbeat(
-    State(app): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<HeartbeatRequest>,
-) -> Result<StatusCode, Error> {
+/// The agent behind a bearer credential. Every agent route starts here.
+pub async fn authenticate(app: &AppState, headers: &HeaderMap) -> Result<Uuid, Error> {
     let secret = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or(Error::Unauthorized)?;
-    let updated =
-        sqlx::query("UPDATE agents SET last_seen_at = now(), version = $1 WHERE token_hash = $2")
-            .bind(clipped(&body.version))
-            .bind(token_hash(secret))
-            .execute(&app.db)
-            .await?;
-    if updated.rows_affected() == 0 {
-        return Err(Error::Unauthorized);
-    }
+    let id: Uuid = sqlx::query_scalar("SELECT id FROM agents WHERE token_hash = $1")
+        .bind(token_hash(secret))
+        .fetch_optional(&app.db)
+        .await?
+        .ok_or(Error::Unauthorized)?;
+    // Any call proves the agent is alive; written at most every 20 seconds.
+    sqlx::query("UPDATE agents SET last_seen_at = now() WHERE id = $1 AND last_seen_at < now() - interval '20 seconds'")
+        .bind(id)
+        .execute(&app.db)
+        .await?;
+    Ok(id)
+}
+
+pub async fn heartbeat(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<HeartbeatRequest>,
+) -> Result<StatusCode, Error> {
+    let id = authenticate(&app, &headers).await?;
+    sqlx::query("UPDATE agents SET last_seen_at = now(), version = $1 WHERE id = $2")
+        .bind(clipped(&body.version))
+        .bind(id)
+        .execute(&app.db)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }

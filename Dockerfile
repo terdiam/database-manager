@@ -24,9 +24,14 @@ ENV DBM_LISTEN=0.0.0.0:8080
 EXPOSE 8080
 CMD ["dbm-server"]
 
-FROM base AS agent
+# The agent needs the PostgreSQL client tools: pg_dump must be at least as new as the
+# databases it backs up.
+FROM postgres:19-bookworm AS agent
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN useradd --system --uid 10001 dbm
 COPY --from=build /app/target/release/dbm-agent /usr/local/bin/
 RUN mkdir /data && chown dbm /data
 USER dbm
 ENV DBM_STATE_FILE=/data/agent-state
+ENTRYPOINT []
 CMD ["dbm-agent"]

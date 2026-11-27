@@ -1,93 +1,90 @@
 <script lang="ts">
-	import SplitTitle from '#lib/components/SplitTitle.svelte';
-	import { goto } from '$app/navigation';
-	import { resolve } from '$app/paths';
 	import { page } from '$app/state';
-	import { agents, engines, servers, snapshots } from '#lib/api/index.ts';
-	import ChainTimeline from '#lib/components/ChainTimeline.svelte';
+	import { request, type DbServer, type Queued, type Snapshot } from '#lib/api/http.ts';
 	import ConfirmDialog from '#lib/components/ConfirmDialog.svelte';
 	import EmptyState from '#lib/components/EmptyState.svelte';
+	import FormField from '#lib/components/FormField.svelte';
+	import JobDialog from '#lib/components/JobDialog.svelte';
 	import PageHeader from '#lib/components/PageHeader.svelte';
 	import Select from '#lib/components/Select.svelte';
-	import StatusBadge from '#lib/components/StatusBadge.svelte';
-	import { toast } from '#lib/components/toast.svelte.ts';
-	import { bytes, date, dateTime } from '#lib/format.ts';
+	import SplitTitle from '#lib/components/SplitTitle.svelte';
+	import { errorText } from '#lib/errors.ts';
+	import { bytes, dateTime } from '#lib/format.ts';
 	import { t } from '#lib/i18n/index.svelte.ts';
+	import { canOperate, isAdmin } from '#lib/session.svelte.ts';
 
-	const snapshot = $derived(snapshots.find((s) => s.id === page.params.id));
-	const chain = $derived(snapshots.filter((s) => s.chain === snapshot?.chain));
-	const points = $derived(chain.filter((s) => s.status === 'completed'));
-	// PostgreSQL incremental chains are physical: restore writes a data directory, not a database.
-	const physical = $derived(snapshot?.engine === 'postgresql' && chain.some((s) => s.type === 'incremental'));
-	const targets = $derived(physical ? agents : servers.filter((s) => s.engine === snapshot?.engine));
-
-	// Writable derived: follows the URL, user can pick another point.
-	let point = $derived<string | undefined>(points.some((p) => p.id === page.params.id) ? page.params.id : points[0]?.id);
+	let snapshot = $state<Snapshot>();
+	let servers = $state<DbServer[]>([]);
+	let missing = $state(false);
+	let error = $state('');
 	let target = $state('');
 	let database = $state('');
-	let confirm = $state<ConfirmDialog>();
+	let restoreConfirm = $state<ConfirmDialog>();
+	let deleteConfirm = $state<ConfirmDialog>();
+	let job: JobDialog;
 
-	function submit(event: SubmitEvent) {
-		event.preventDefault();
-		confirm?.open();
+	// Restores run on the agent that can open the destination's credentials.
+	const targets = $derived(servers.filter((s) => s.agent_id === snapshot?.agent_id));
+	const targetName = $derived(servers.find((s) => s.id === target)?.name ?? '');
+
+	$effect(() => {
+		const id = page.params.id;
+		Promise.all([request<Snapshot>('GET', `/snapshots/${id}`), request<DbServer[]>('GET', '/database-servers')]).then(
+			([s, list]) => {
+				snapshot = s;
+				servers = list;
+				database = `${s.database_name}_restore`;
+			},
+			(e) => {
+				missing = true;
+				error = errorText(e);
+			}
+		);
+	});
+
+	async function queue(method: string, path: string, body?: unknown) {
+		try {
+			job.show((await request<Queued>(method, path, body)).job_id);
+			error = '';
+		} catch (e) {
+			error = errorText(e);
+		}
 	}
 </script>
 
-{#if !snapshot}
-	<EmptyState title={t('snapshots.missing')} />
-{:else}
-	<PageHeader title="Snapshot {snapshot.id}" description="{snapshot.server} · {engines[snapshot.engine].label} · {snapshot.database}">
-		{#snippet actions()}<button type="button" class="btn" disabled={snapshot.status !== 'completed'} onclick={() => toast(t('toast.download'))}>{t('action.download')}</button>{/snippet}
+{#if missing}
+	<EmptyState title={t('snapshots.missing')} hint={error} />
+{:else if snapshot}
+	<PageHeader title="{snapshot.server_name} / {snapshot.database_name}" description={dateTime(snapshot.created_at)}>
+		{#snippet actions()}{#if isAdmin()}<button type="button" class="btn btn-danger" onclick={() => deleteConfirm?.open()}>{t('action.delete')}</button>{/if}{/snippet}
 	</PageHeader>
+	<p class="mb-3 text-sm text-bad empty:hidden" role="alert">{error}</p>
 
-	<div class="grid gap-3">
-		<section class="card">
-			<SplitTitle text={t('snapshots.detail')} class="mb-3 font-semibold" />
-			<dl class="grid grid-cols-[9rem_1fr] gap-2 text-sm">
-				<dt class="text-dim">{t('col.status')}</dt><dd><StatusBadge status={snapshot.status} /></dd>
-				<dt class="text-dim">{t('col.type')}</dt><dd>{t(`type.${snapshot.type}`)}</dd>
-				<dt class="text-dim">{t('col.size')}</dt><dd>{bytes(snapshot.size)}</dd>
-				<dt class="text-dim">{t('col.created')}</dt><dd>{dateTime(snapshot.created)}</dd>
-				<dt class="text-dim">{t('col.expires')}</dt><dd>{date(snapshot.expires)}</dd>
-				<dt class="text-dim">{t('col.destination')}</dt><dd>{snapshot.destinations.join(', ')}</dd>
-				<dt class="text-dim">Checksum</dt><dd><code class="text-xs break-all">{snapshot.checksum}</code></dd>
-			</dl>
-		</section>
-		<section class="card">
-			<SplitTitle text={t('snapshots.chain')} class="mb-3 font-semibold" />
-			<ChainTimeline items={chain} current={snapshot.id} />
-		</section>
-	</div>
-
-	<section class="card mt-3">
-		<SplitTitle text={t('restore.title')} class="mb-1 font-semibold" />
-		{#if points.length === 0}
-			<p class="text-sm text-bad">{t('restore.unavailable')}</p>
-		{:else}
-			<form onsubmit={submit}>
-				<label class="mt-3 block text-sm">{t('restore.point')}
-					<Select class="mt-1" bind:value={point} options={points.map((p) => ({ value: p.id, label: dateTime(p.created), icon: 'clock' as const, description: `${t(`type.${p.type}`)} · ${bytes(p.size)}` }))} />
-				</label>
-				{#if physical}
-					<p class="mt-3 rounded-lg bg-muted p-3 text-sm">{t('restore.pgPhysical')}</p>
-				{/if}
-				<label class="mt-3 block text-sm">{t(physical ? 'restore.agent' : 'restore.server')}
-					<Select class="mt-1" required bind:value={target} placeholder={t('restore.choose')} options={targets.map((s) => ({ value: s.name, label: s.name, brand: 'engine' in s ? s.engine : undefined, icon: 'engine' in s ? undefined : ('server' as const), description: t(`status.${s.status}`) }))} />
-				</label>
-				<label class="mt-3 block text-sm">{t(physical ? 'restore.folder' : 'restore.database')}
-					<input class="input mt-1" required bind:value={database} placeholder={physical ? '/var/lib/postgresql/restore' : `${snapshot.database}_restore`} />
-				</label>
-				<button type="submit" class="btn btn-primary mt-4">{t('restore.start')}</button>
-			</form>
-		{/if}
+	<section class="card">
+		<SplitTitle text={t('snapshots.detail')} class="mb-3 font-semibold" />
+		<dl class="grid grid-cols-[9rem_1fr] gap-2 text-sm">
+			<dt class="text-dim">{t('col.size')}</dt><dd>{bytes(snapshot.size)}</dd>
+			<dt class="text-dim">{t('col.destination')}</dt><dd>{snapshot.destination}</dd>
+			<dt class="text-dim">{t('snapshots.file')}</dt><dd><code class="text-xs break-all">{snapshot.object_key}</code></dd>
+			<dt class="text-dim">{t('wizard.compression')}</dt><dd>{snapshot.compression} · age</dd>
+			<dt class="text-dim">SHA-256</dt><dd><code class="text-xs break-all">{snapshot.sha256}</code></dd>
+		</dl>
 	</section>
 
-	<ConfirmDialog
-		bind:this={confirm}
-		title={t('restore.title')}
-		message={t(physical ? 'restore.folderWarning' : 'restore.warning', { database, server: target })}
-		confirmLabel={t('restore.start')}
-		expect={database}
-		onconfirm={() => { toast(t('toast.restore', { name: database })); goto(resolve('jobs')); }}
-	/>
+	{#if canOperate()}
+		<section class="card mt-3">
+			<SplitTitle text={t('restore.title')} class="mb-1 font-semibold" />
+			<form onsubmit={(e) => { e.preventDefault(); restoreConfirm?.open(); }}>
+				<FormField label={t('restore.server')}>{#snippet children(a)}<Select {...a} required bind:value={target} placeholder={t('restore.choose')} options={targets.map((s) => ({ value: s.id, label: s.name, brand: s.engine, description: `${s.host}:${s.port}` }))} />{/snippet}</FormField>
+				<FormField label={t('restore.database')} help={t('restore.createHint')}>{#snippet children(a)}<input {...a} class="input min-h-11" maxlength="63" pattern={'[A-Za-z0-9_][A-Za-z0-9_\\-]*'} required bind:value={database} />{/snippet}</FormField>
+				<button type="submit" class="btn btn-primary">{t('restore.start')}</button>
+			</form>
+		</section>
+	{/if}
+
+	<ConfirmDialog bind:this={restoreConfirm} title={t('restore.title')} message={t('restore.warning', { database, server: targetName })} confirmLabel={t('restore.start')} expect={database}
+		onconfirm={() => queue('POST', `/snapshots/${snapshot!.id}/restore`, { server_id: target, database_name: database })} />
+	<ConfirmDialog bind:this={deleteConfirm} title={t('action.delete')} message={t('snapshots.confirmDelete')} confirmLabel={t('action.delete')} onconfirm={() => queue('DELETE', `/snapshots/${snapshot!.id}`)} />
 {/if}
+
+<JobDialog bind:this={job} title={t('action.log')} />

@@ -12,7 +12,8 @@
 		running: ['spin', 'text-brand'],
 		pending: ['clock', 'text-warn'],
 		failed: ['alert', 'text-bad'],
-		offline: ['alert', 'text-bad']
+		offline: ['alert', 'text-bad'],
+		cancelled: ['close', 'text-dim']
 	};
 </script>
 

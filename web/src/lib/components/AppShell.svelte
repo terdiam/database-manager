@@ -16,7 +16,7 @@
 	let tour: Tour;
 	let palette: CommandPalette;
 	// Pages already backed by the server; the rest still show sample data until their phase.
-	const live = ['/agents', '/users', '/audit', '/profile', '/help'];
+	const live = ['/agents', '/users', '/audit', '/profile', '/help', '/databases', '/destinations', '/backups', '/snapshots', '/jobs', '/settings'];
 	const sample = $derived(!live.some((path) => page.url.pathname.startsWith(path)));
 
 	function startTour() {

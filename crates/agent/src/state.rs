@@ -4,11 +4,13 @@ use std::{fs, io::Write, os::unix::fs::OpenOptionsExt, path::Path};
 
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 pub struct State {
     pub version: u32,
+    /// Sealed secrets are bound to it.
+    pub agent_id: String,
     pub secret: String,
     /// X25519 keypair, base64url. Secrets sealed to it are lost with this file.
     pub private_key: String,

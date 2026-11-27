@@ -25,3 +25,17 @@ export function inDate(iso: string, v: DateValue, now = new Date()): boolean {
 	const d = day(new Date(iso));
 	return (!from || d >= from) && (!to || d <= to);
 }
+
+/** Query parameters for the API: local midnight instants, `to` exclusive. */
+export function dateParams(v: DateValue): URLSearchParams {
+	const [from, to] = bounds(v);
+	const params = new URLSearchParams();
+	const instant = (d: string, plusDays: number) => {
+		const date = new Date(`${d}T00:00:00`);
+		date.setDate(date.getDate() + plusDays);
+		return date.toISOString();
+	};
+	if (from) params.set('from', instant(from, 0));
+	if (to) params.set('to', instant(to, 1));
+	return params;
+}

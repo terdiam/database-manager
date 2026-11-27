@@ -3,7 +3,7 @@
 Self-hosted database backup and restore with a web dashboard.
 Rust (server and agent), PostgreSQL and SvelteKit.
 
-Work in progress: accounts and agents work, backups are not built yet. Pages marked "sample data" show dummy content.
+Work in progress: PostgreSQL backup and restore to S3 work. Pages marked "sample data" show dummy content.
 
 ## Features
 
@@ -12,22 +12,23 @@ Done:
 - [x] Login with roles (admin, operator, viewer)
 - [x] Audit log
 - [x] Agents with one-time enrollment
+- [x] PostgreSQL backup and restore to S3 or MinIO
+- [x] Compressed and encrypted backup files
+- [x] Live job logs
 - [x] Encrypted API payloads, can be turned off
 - [x] Encryption for sensitive data in the database
 - [x] Optional Cloudflare Turnstile on login
 - [x] HTTPS with Hanoey
 - [x] Indonesian and English UI, dark mode
-- [x] Dashboard and backup screens (UI only)
+- [x] Dashboard (sample data)
 
 Planned:
 
-- [ ] Backup and restore for PostgreSQL to S3/MinIO
 - [ ] Schedules and retention
-- [ ] Live monitoring and Telegram/Mattermost alerts
+- [ ] Live dashboard and Telegram/Mattermost alerts
 - [ ] MySQL, MariaDB, MongoDB, SQLite
 - [ ] SSH tunnel; SFTP, FTP, Samba and Google Drive storage
 - [ ] Redis, Elasticsearch, OpenSearch
-- [ ] Compressed and encrypted backup files
 - [ ] Incremental backups
 
 ## Run
@@ -51,8 +52,20 @@ Keep a copy of `DBM_MASTER_KEY`. Encrypted data cannot be recovered without it.
 Create a token on the Agents page, then:
 
 ```bash
-DBM_ENROLL_TOKEN=<token> docker compose --profile agent up -d agent
+DBM_ENROLL_TOKEN=<token> docker compose --profile agent up -d --build agent
 ```
+
+The agent connects to your database and storage, so use addresses it can reach
+(`host.docker.internal` for something running on the Docker host).
+
+## Backups
+
+Add a database and an S3 destination, create a backup, then run it. Passwords are
+encrypted in the browser for the agent, which needs `https` or `localhost`.
+
+Backup files are encrypted with [age](https://age-encryption.org). Download the keys from
+Settings and keep them somewhere else: without them the files cannot be opened if the
+server is lost.
 
 ## HTTPS
 

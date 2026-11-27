@@ -1,7 +1,8 @@
 use std::{env, net::SocketAddr};
 
 use dbm_server::{
-    AppState, Config, MasterKey, Turnstile, VERIFY_URL, app, load_transport_key, reset_password,
+    AppState, Config, MasterKey, Turnstile, VERIFY_URL, app, load_transport_key, parse_recipient,
+    reset_password,
 };
 use sqlx::postgres::PgPoolOptions;
 
@@ -63,6 +64,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         trust_proxy: flag("DBM_TRUST_PROXY", false),
         turnstile: turnstile()?,
         e2ee_required,
+        extra_recipient: match env::var("DBM_BACKUP_EXTRA_RECIPIENT")
+            .ok()
+            .filter(|v| !v.is_empty())
+        {
+            None => None,
+            Some(text) => Some(
+                parse_recipient(&text)
+                    .ok_or("DBM_BACKUP_EXTRA_RECIPIENT must be an age recipient (age1...)")?,
+            ),
+        },
     };
     let listen = env::var("DBM_LISTEN").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let listener = tokio::net::TcpListener::bind(&listen).await?;
@@ -73,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     axum::serve(
         listener,
-        app(AppState::new(pool, config, transport_key))
+        app(AppState::new(pool, config, transport_key, master))
             .into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown())

@@ -1,6 +1,7 @@
 //! Wire types shared by the server and the agent.
 
 pub mod e2ee;
+pub mod jobs;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

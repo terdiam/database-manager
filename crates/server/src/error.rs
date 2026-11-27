@@ -37,6 +37,14 @@ impl IntoResponse for Error {
 
 impl From<sqlx::Error> for Error {
     fn from(error: sqlx::Error) -> Self {
+        if let sqlx::Error::Database(db) = &error {
+            if db.is_foreign_key_violation() {
+                return Error::Conflict("in_use");
+            }
+            if db.is_unique_violation() {
+                return Error::Conflict("duplicate");
+            }
+        }
         Error::Internal(error.to_string())
     }
 }

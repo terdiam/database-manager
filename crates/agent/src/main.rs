@@ -1,17 +1,31 @@
 mod api;
+mod pipeline;
+mod postgres;
+mod progress;
+mod runner;
 mod state;
+mod storage;
 
-use std::{env, error::Error, path::Path, time::Duration};
+use std::{
+    env,
+    error::Error,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use api::Api;
 use dbm_shared::{
     ENROLL_PATH, EnrollRequest, EnrollResponse, HEARTBEAT_PATH, HEARTBEAT_SECS, HeartbeatRequest,
     e2ee::{self, Keypair},
+    jobs::{CLAIM_PATH, Claim, FINISH_PATH, Finish, Job, REPORT_PATH, Report, ReportReply},
 };
+use progress::Progress;
 use reqwest::Url;
 use state::State;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// How often an idle agent asks for work and a busy one reports.
+const POLL: Duration = Duration::from_secs(3);
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -69,6 +83,7 @@ async fn enroll(api: &Api, expected: Option<&str>, path: &Path) -> Result<State>
     let response: EnrollResponse = serde_json::from_slice(&reply.body)?;
     let state = State {
         version: state::VERSION,
+        agent_id: response.agent_id.to_string(),
         secret: response.secret,
         private_key: e2ee::encode(&keys.private),
         public_key,
@@ -99,42 +114,166 @@ async fn run() -> Result<()> {
         e2ee::fingerprint(&e2ee::decode(&state.public_key)?)
     );
 
-    let mut tick = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
+    serve(&api, expected, path, &mut state).await
+}
+
+/// Heartbeat, then ask for work; one job at a time.
+async fn serve(api: &Api, expected: Option<&str>, path: &Path, state: &mut State) -> Result<()> {
+    let mut tick = tokio::time::interval(POLL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut beaten: Option<Instant> = None;
     loop {
         tick.tick().await;
-        let pinned = state.server_key.as_deref().map(e2ee::decode).transpose()?;
-        let beat = HeartbeatRequest {
-            version: VERSION.into(),
-        };
-        let sent = api
-            .post(
-                HEARTBEAT_PATH,
-                pinned.as_deref(),
-                Some(&state.secret),
-                &beat,
-            )
-            .await;
-        match sent {
-            Ok(r) if r.status == 401 => {
+        let due = beaten.is_none_or(|at| at.elapsed() >= Duration::from_secs(HEARTBEAT_SECS));
+        let outcome = async {
+            if due {
+                let beat = HeartbeatRequest {
+                    version: VERSION.into(),
+                };
+                call(api, state, HEARTBEAT_PATH, &beat).await?;
+            }
+            let reply = call(api, state, CLAIM_PATH, &serde_json::json!({})).await?;
+            Ok::<Claim, Failure>(serde_json::from_slice(&reply.body)?)
+        }
+        .await;
+        match outcome {
+            Ok(claim) => {
+                if due {
+                    beaten = Some(Instant::now());
+                }
+                if let Some(job) = claim.job {
+                    execute(api, state, job).await;
+                    tick.reset_immediately();
+                }
+            }
+            Err(Failure::Revoked) => {
                 return Err("credential rejected: this agent was removed from the server".into());
             }
-            Ok(r) if (200..300).contains(&r.status) => tracing::debug!("heartbeat ok"),
             // Encryption was switched on after this agent enrolled: pin the key now.
-            Ok(r) if pinned.is_none() && r.error_code().as_deref() == Some("e2ee_required") => {
-                state.server_key = server_key(&api, expected).await?.map(|k| e2ee::encode(&k));
-                state::save(path, &state)?;
+            Err(Failure::Encryption) if state.server_key.is_none() => {
+                state.server_key = server_key(api, expected).await?.map(|k| e2ee::encode(&k));
+                state::save(path, state)?;
                 tracing::info!("server now requires encryption; key pinned");
-                tick.reset_immediately();
             }
-            Ok(r) => tracing::warn!(
-                "heartbeat failed: HTTP {} {}",
-                r.status,
-                r.error_code().unwrap_or_default()
-            ),
             // A network blip must not kill the agent; the next tick retries.
-            Err(e) => tracing::warn!("heartbeat failed: {e}"),
+            Err(error) => tracing::warn!("server call failed: {error}"),
         }
+    }
+}
+
+enum Failure {
+    Revoked,
+    Encryption,
+    Other(String),
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failure::Revoked => f.write_str("credential rejected"),
+            Failure::Encryption => f.write_str("the server requires encryption"),
+            Failure::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<Box<dyn Error>> for Failure {
+    fn from(error: Box<dyn Error>) -> Self {
+        Failure::Other(error.to_string())
+    }
+}
+
+impl From<serde_json::Error> for Failure {
+    fn from(error: serde_json::Error) -> Self {
+        Failure::Other(error.to_string())
+    }
+}
+
+impl From<e2ee::CryptoError> for Failure {
+    fn from(error: e2ee::CryptoError) -> Self {
+        Failure::Other(error.to_string())
+    }
+}
+
+async fn call(
+    api: &Api,
+    state: &State,
+    path: &str,
+    body: &impl serde::Serialize,
+) -> std::result::Result<api::Reply, Failure> {
+    let pinned = state.server_key.as_deref().map(e2ee::decode).transpose()?;
+    let reply = api
+        .post(path, pinned.as_deref(), Some(&state.secret), body)
+        .await?;
+    match reply.status {
+        200..300 => Ok(reply),
+        401 => Err(Failure::Revoked),
+        status => match reply.error_code() {
+            Some(code) if code == "e2ee_required" => Err(Failure::Encryption),
+            code => Err(Failure::Other(format!(
+                "HTTP {status} {}",
+                code.unwrap_or_default()
+            ))),
+        },
+    }
+}
+
+/// Runs a job while reporting progress; the report's answer can cancel it.
+async fn execute(api: &Api, state: &State, job: Job) {
+    let (id, lease) = (job.id, job.lease);
+    tracing::info!("job {id} started");
+    let progress = Progress::default();
+    let work = runner::run(state, job, progress.clone());
+    tokio::pin!(work);
+    let mut tick = tokio::time::interval(POLL);
+    let result = loop {
+        tokio::select! {
+            result = &mut work => break result,
+            _ = tick.tick() => {
+                let report = Report { id, lease, bytes: progress.bytes(), logs: progress.take_logs() };
+                match call(api, state, REPORT_PATH, &report).await {
+                    Ok(reply) => {
+                        if serde_json::from_slice::<ReportReply>(&reply.body).is_ok_and(|r| r.cancel) {
+                            progress.cancel();
+                        }
+                    }
+                    // The server gave this job up: stop working on it.
+                    Err(Failure::Other(message)) if message.contains("lease_lost") => progress.cancel(),
+                    Err(error) => tracing::warn!("report failed: {error}"),
+                }
+            }
+        }
+    };
+    let (error, sha256) = match result {
+        Ok(sha256) => (None, sha256),
+        Err(error) => {
+            progress.log("error", error.to_string());
+            (Some(error.to_string()), None)
+        }
+    };
+    tracing::info!(
+        "job {id} {}",
+        if error.is_none() {
+            "completed"
+        } else {
+            "failed"
+        }
+    );
+    let finish = Finish {
+        id,
+        lease,
+        bytes: progress.bytes(),
+        logs: progress.take_logs(),
+        error,
+        sha256,
+    };
+    // Losing this message would leave the job to expire, so try a few times.
+    for attempt in 1..=5 {
+        match call(api, state, FINISH_PATH, &finish).await {
+            Ok(_) => return,
+            Err(error) => tracing::warn!("could not report the result (try {attempt}): {error}"),
+        }
+        tokio::time::sleep(Duration::from_secs(attempt * 2)).await;
     }
 }
 
@@ -143,6 +282,8 @@ async fn main() -> std::process::ExitCode {
     use tokio::signal::unix::{SignalKind, signal};
 
     tracing_subscriber::fmt().init();
+    // OpenDAL does not pick an HTTP client by itself when built without its defaults.
+    opendal::install_default();
     let mut term = signal(SignalKind::terminate()).expect("signal handler");
     let result = tokio::select! {
         result = run() => result,

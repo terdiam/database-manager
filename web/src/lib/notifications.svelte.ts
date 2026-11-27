@@ -1,18 +1,32 @@
-import { jobs, type Job } from './api/index.ts';
+import { request, type Job, type Page } from './api/http.ts';
 
-export type Notice = { id: string; job: Job; read: boolean };
+const KEY = 'seen-jobs';
 
-const finished = (job: Job) => job.status === 'completed' || job.status === 'failed';
-const notice = (job: Job, read: boolean): Notice => ({ id: job.id, job, read });
-
-// Sample data: the newest finished jobs, the last few unread.
-export const notices = $state(jobs.filter(finished).slice(0, 6).map((job, i) => notice(job, i > 2)));
-
-/** One job "finishes" while the app is open, to show the live behaviour. */
-export function simulateArrival() {
-	if (notices.some((n) => n.id === 'j-2041')) return;
-	const running = jobs.find((j) => j.id === 'j-2041')!;
-	notices.unshift(notice({ ...running, status: 'completed', progress: 100 }, false));
+function seen(): number {
+	try {
+		return Number(localStorage.getItem(KEY)) || 0;
+	} catch {
+		return 0;
+	}
 }
 
-export const markAllRead = () => notices.forEach((n) => (n.read = true));
+/** Finished backups and restores, newest first. Read state is per browser. */
+export const notices = $state<{ jobs: Job[]; seenAt: number }>({ jobs: [], seenAt: seen() });
+
+export const isUnread = (job: Job) => Date.parse(job.finished_at ?? job.created_at) > notices.seenAt;
+
+export async function refresh() {
+	const page = await request<Page<Job>>('GET', '/jobs');
+	notices.jobs = page.items
+		.filter((j) => (j.kind === 'backup' || j.kind === 'restore') && (j.status === 'completed' || j.status === 'failed'))
+		.slice(0, 10);
+}
+
+export function markAllRead() {
+	notices.seenAt = Date.now();
+	try {
+		localStorage.setItem(KEY, String(notices.seenAt));
+	} catch {
+		/* storage blocked: read state lasts for this tab */
+	}
+}

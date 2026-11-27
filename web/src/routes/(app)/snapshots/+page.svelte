@@ -1,40 +1,61 @@
 <script lang="ts">
 	import { resolve } from '$app/paths';
-	import { engines, servers, snapshots } from '#lib/api/index.ts';
-	import BrandIcon from '#lib/components/BrandIcon.svelte';
-	import DateFilter from '#lib/components/DateFilter.svelte';
-	import { emptyDate, inDate } from '#lib/daterange.ts';
+	import { request, type DbServer, type Page, type Snapshot } from '#lib/api/http.ts';
 	import DataTable from '#lib/components/DataTable.svelte';
+	import DateFilter from '#lib/components/DateFilter.svelte';
 	import PageHeader from '#lib/components/PageHeader.svelte';
 	import Select from '#lib/components/Select.svelte';
-	import StatusBadge from '#lib/components/StatusBadge.svelte';
-	import { bytes, date, dateTime } from '#lib/format.ts';
+	import { dateParams, emptyDate } from '#lib/daterange.ts';
+	import { errorText } from '#lib/errors.ts';
+	import { bytes, dateTime } from '#lib/format.ts';
 	import { t } from '#lib/i18n/index.svelte.ts';
 
-	let server = $state('');
-	let type = $state('');
 	let period = $state(emptyDate());
-	const rows = $derived(snapshots.filter((s) => (!server || s.server === server) && (!type || s.type === type) && inDate(s.created, period)));
+	let server = $state('');
+	let servers = $state<DbServer[]>([]);
+	let rows = $state<Snapshot[]>([]);
+	let next = $state<string | null>(null);
+	let error = $state('');
+
+	request<DbServer[]>('GET', '/database-servers').then((list) => (servers = list), (e) => (error = errorText(e)));
+
+	const filter = $derived.by(() => {
+		const params = dateParams(period);
+		if (server) params.set('server', server);
+		return params.toString();
+	});
+
+	async function load(query: string, before: string | null) {
+		try {
+			const page = await request<Page<Snapshot>>('GET', `/snapshots?${query}${before ? `&before=${before}` : ''}`);
+			if (query !== filter) return;
+			rows = before ? [...rows, ...page.items] : page.items;
+			next = page.next;
+			error = '';
+		} catch (e) {
+			error = errorText(e);
+		}
+	}
+	$effect(() => void load(filter, null));
 </script>
 
 <PageHeader title={t('nav.snapshots')} description={t('snapshots.desc')} />
+<p class="mb-3 text-sm text-bad empty:hidden" role="alert">{error}</p>
 
 <search class="mb-3 flex flex-wrap items-center gap-2">
 	<DateFilter bind:value={period} />
 	<Select class="w-56" aria-label={t('nav.databases')} bind:value={server} options={[{ value: '', label: t('filter.allServers'), icon: 'database' as const }, ...servers.map((s) => ({ value: s.name, label: s.name, brand: s.engine }))]} />
-	<Select class="w-48" aria-label={t('col.type')} bind:value={type} options={[{ value: '', label: t('filter.allTypes') }, { value: 'full', label: t('type.full') }, { value: 'incremental', label: t('type.incremental') }]} />
 </search>
 
-<p class="mb-2 text-xs text-dim" role="status">{t('filter.count', { n: rows.length, total: snapshots.length })}</p>
-
-<DataTable label={t('nav.snapshots')} columns={['ID', t('col.source'), t('col.type'), t('col.size'), t('col.created'), t('col.expires'), t('col.status')]} {rows}>
-	{#snippet cell(item, i)}
-		{#if i === 0}<a class="font-medium text-brand underline" href={resolve(`snapshots/${item.id}`)}>{item.id}</a>
-		{:else if i === 1}<span class="inline-flex items-center gap-2"><BrandIcon name={item.engine} /><span>{item.server}<br /><span class="text-xs text-dim">{engines[item.engine].label} · {item.database}</span></span></span>
-		{:else if i === 2}{t(`type.${item.type}`)}
-		{:else if i === 3}{bytes(item.size)}
-		{:else if i === 4}{dateTime(item.created)}
-		{:else if i === 5}{date(item.expires)}
-		{:else}<StatusBadge status={item.status} />{/if}
+<DataTable label={t('nav.snapshots')} columns={[t('col.created'), t('col.source'), t('col.destination'), t('col.size'), t('wizard.compression'), t('col.actions')]} {rows}>
+	{#snippet cell(s, i)}
+		{#if i === 0}<span class="whitespace-nowrap">{dateTime(s.created_at)}</span>
+		{:else if i === 1}<strong>{s.server_name}</strong> / {s.database_name}
+		{:else if i === 2}{s.destination}
+		{:else if i === 3}{bytes(s.size)}
+		{:else if i === 4}{s.compression}
+		{:else}<a class="btn" href={resolve(`snapshots/${s.id}`)}>{t('snapshots.open')}</a>{/if}
 	{/snippet}
 </DataTable>
+
+{#if next}<button type="button" class="btn mt-3" onclick={() => load(filter, next)}>{t('action.more')}</button>{/if}

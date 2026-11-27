@@ -1,6 +1,6 @@
 // Sample data for the pages that have no backend yet.
 export type Engine = 'postgresql' | 'mysql' | 'mariadb' | 'mongodb' | 'sqlite' | 'redis' | 'opensearch' | 'elasticsearch';
-export type Status = 'completed' | 'running' | 'failed' | 'pending' | 'online' | 'offline';
+export type Status = 'completed' | 'running' | 'failed' | 'pending' | 'cancelled' | 'online' | 'offline';
 
 export const engines: Record<Engine, { label: string; port: number; incremental: boolean }> = {
 	postgresql: { label: 'PostgreSQL', port: 5432, incremental: true },
@@ -41,61 +41,6 @@ export const destinations = [
 	{ id: 't2', name: 'nas-kantor', type: 'Samba', target: '//nas/backup', used: 96 * GB, status: 'online' as Status },
 	{ id: 't3', name: 'offsite-sftp', type: 'SFTP / SSH', target: 'sftp://offsite.example.com/db', used: 188 * GB, status: 'online' as Status },
 	{ id: 't4', name: 'arsip-drive', type: 'Google Drive', target: 'My Drive/db-archive', used: 12 * GB, status: 'offline' as Status }
-];
-
-export type BackupType = 'full' | 'incremental';
-
-/** One entry = one type with one schedule. An incremental entry points at its full backup through `base`. */
-export type Backup = {
-	id: string; name: string; type: BackupType; base?: string; method?: 'logical' | 'physical';
-	server: string; databases: string; destinations: string[];
-	schedule: 'hours' | 'daily' | 'weekly' | 'monthly' | 'yearly' | 'cron';
-	retention: { amount: number; unit: 'days' | 'months' }; compression: string; next: string;
-};
-
-const pg = { server: 'prod-pg', databases: 'all', destinations: ['minio-utama', 'offsite-sftp'], retention: { amount: 3, unit: 'months' as const }, compression: 'zstd' };
-const shop = { server: 'prod-mysql', databases: 'shop, billing', destinations: ['minio-utama'], retention: { amount: 30, unit: 'days' as const }, compression: 'zstd' };
-
-export const backups: Backup[] = [
-	{ id: 'b1', name: 'prod-pg full bulanan', type: 'full', method: 'physical', schedule: 'monthly', next: ago(-90), ...pg },
-	{ id: 'b2', name: 'prod-pg incremental', type: 'incremental', base: 'b1', schedule: 'hours', next: ago(-2), ...pg },
-	{ id: 'b3', name: 'toko full mingguan', type: 'full', schedule: 'weekly', next: ago(-60), ...shop },
-	{ id: 'b4', name: 'toko incremental', type: 'incremental', base: 'b3', schedule: 'hours', next: ago(-5), ...shop },
-	{ id: 'b5', name: 'crm full mingguan', type: 'full', schedule: 'weekly', server: 'crm-mongo', databases: 'all', destinations: ['nas-kantor'], retention: { amount: 6, unit: 'months' }, compression: 'gzip', next: ago(-60) },
-	{ id: 'b6', name: 'redis harian', type: 'full', schedule: 'daily', server: 'cache-redis', databases: 'all', destinations: ['nas-kantor'], retention: { amount: 7, unit: 'days' }, compression: 'lz4', next: ago(-11) }
-];
-
-/** PostgreSQL needs a physical full backup; MongoDB's oplog needs a whole-instance one. */
-export function canBeBase(b: Backup): boolean {
-	const engine = servers.find((s) => s.name === b.server)?.engine;
-	if (b.type !== 'full' || !engine || !engines[engine].incremental) return false;
-	if (engine === 'postgresql') return b.method === 'physical';
-	return engine !== 'mongodb' || b.databases === 'all';
-}
-
-export type Snapshot = {
-	id: string; chain: string; type: 'full' | 'incremental'; server: string; engine: Engine; database: string;
-	size: number; created: string; expires: string; status: Status; destinations: string[]; checksum: string;
-};
-
-const snap = (id: string, chain: string, type: Snapshot['type'], server: string, engine: Engine, database: string, size: number, hoursAgo: number, status: Status = 'completed'): Snapshot => ({
-	id, chain, type, server, engine, database, size, status,
-	created: ago(hoursAgo), expires: ago(hoursAgo - 24 * 90), destinations: ['minio-utama'],
-	checksum: 'sha256:9f2c4b7e0a1d'
-});
-
-export const snapshots: Snapshot[] = [
-	snap('sn-108', 'c1', 'incremental', 'prod-pg', 'postgresql', 'cluster', 0.09 * GB, 2),
-	snap('sn-107', 'c1', 'incremental', 'prod-pg', 'postgresql', 'cluster', 0.14 * GB, 8),
-	snap('sn-106', 'c2', 'incremental', 'prod-mysql', 'mysql', 'shop', 0, 9, 'failed'),
-	snap('sn-105', 'c1', 'incremental', 'prod-pg', 'postgresql', 'cluster', 0.11 * GB, 14),
-	snap('sn-104', 'c3', 'full', 'cache-redis', 'redis', 'all', 0.6 * GB, 20),
-	snap('sn-103', 'c1', 'full', 'prod-pg', 'postgresql', 'cluster', 18.4 * GB, 26),
-	snap('sn-102', 'c2', 'full', 'prod-mysql', 'mysql', 'shop', 4.2 * GB, 33),
-	snap('sn-101', 'c4', 'full', 'crm-mongo', 'mongodb', 'all', 7.9 * GB, 80),
-	snap('sn-100', 'c5', 'full', 'prod-pg', 'postgresql', 'cluster', 17.9 * GB, 24 * 9),
-	snap('sn-099', 'c6', 'full', 'prod-mysql', 'mysql', 'shop', 4.0 * GB, 24 * 21),
-	snap('sn-098', 'c7', 'full', 'crm-mongo', 'mongodb', 'all', 7.1 * GB, 24 * 45)
 ];
 
 export type Job = {
