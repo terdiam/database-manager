@@ -1,9 +1,12 @@
 mod api;
 mod engines;
+mod helper;
 mod manifest;
 mod pipeline;
 mod progress;
+mod redis;
 mod runner;
+mod search;
 mod ssh;
 mod state;
 mod storage;
@@ -281,14 +284,23 @@ async fn execute(api: &Api, state: &State, job: Job) {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> std::process::ExitCode {
-    use tokio::signal::unix::{SignalKind, signal};
-
+fn main() -> std::process::ExitCode {
+    // Two TLS backends are compiled in, so one has to be named. Fails only if already set.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     // ssh runs this binary to ask for a password or passphrase.
     if ssh::answer_askpass() {
         return std::process::ExitCode::SUCCESS;
     }
+    // The pipeline runs this binary for the engines without a dump or restore tool.
+    if let Some(code) = helper::run() {
+        return code;
+    }
+    agent()
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn agent() -> std::process::ExitCode {
+    use tokio::signal::unix::{SignalKind, signal};
 
     tracing_subscriber::fmt().init();
     // OpenDAL does not pick an HTTP client by itself when built without its defaults.

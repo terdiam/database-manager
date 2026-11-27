@@ -1964,6 +1964,54 @@ async fn a_backup_only_restores_into_its_own_engine(db: PgPool) {
 // ---------------------------------------------------------------- SSH tunnels and storage kinds
 
 #[sqlx::test]
+async fn redis_and_search_engines_name_what_they_back_up(db: PgPool) {
+    let app = router(db.clone());
+    let cookie = admin(&app).await;
+    let agent = enroll(&app, &cookie, "a1").await;
+    let (_, destination, _) = add_resources(&app, &cookie, &agent).await;
+    for (engine, good, bad) in [
+        ("redis", "all", "0"),
+        ("elasticsearch", "_all", ".security"),
+        ("opensearch", "logs-2026.11", "a/_search"),
+    ] {
+        let id = uuid::Uuid::new_v4().to_string();
+        let body = json!({ "id": id, "name": engine, "engine": engine, "agent_id": agent.id, "host": "db", "port": 1,
+            "username": "", "ssl_mode": "require", "secret": sealed_for(&agent, &id, "database", "{}") });
+        let reply = call(
+            &app,
+            "POST",
+            "/api/database-servers",
+            Some(&cookie),
+            Some(body),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::CREATED, "{engine}");
+        let entry = |database: &str| {
+            json!({ "name": format!("{engine}-b"), "server_id": id, "database_name": database,
+                "destination_id": destination, "compression": "gzip", "level": 3 })
+        };
+        let reply = call(
+            &app,
+            "POST",
+            "/api/backups",
+            Some(&cookie),
+            Some(entry(bad)),
+        )
+        .await;
+        assert_eq!(reply.body["error"], "database_name", "{engine} {bad}");
+        let reply = call(
+            &app,
+            "POST",
+            "/api/backups",
+            Some(&cookie),
+            Some(entry(good)),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::CREATED, "{engine} {good}");
+    }
+}
+
+#[sqlx::test]
 async fn tunnels_belong_to_their_agent_and_go_with_the_job(db: PgPool) {
     let app = router(db.clone());
     let cookie = admin(&app).await;

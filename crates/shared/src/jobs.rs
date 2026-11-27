@@ -23,27 +23,57 @@ pub fn extension(compression: &str) -> &'static str {
     }
 }
 
-pub const ENGINES: [&str; 5] = ["postgresql", "mysql", "mariadb", "mongodb", "sqlite"];
+pub const ENGINES: [&str; 8] = [
+    "postgresql",
+    "mysql",
+    "mariadb",
+    "mongodb",
+    "sqlite",
+    "redis",
+    "elasticsearch",
+    "opensearch",
+];
+
+/// Redis has no named databases: a backup is the whole instance.
+pub const REDIS_ALL: &str = "all";
+/// Every index; Elasticsearch and OpenSearch reserve the name, so no index can have it.
+pub const SEARCH_ALL: &str = "_all";
 
 /// What a dump of `engine` is, before compression and encryption.
 pub fn dump_extension(engine: &str) -> &'static str {
     match engine {
         "mysql" | "mariadb" | "sqlite" => ".sql",
         "mongodb" => ".archive",
+        "redis" => ".rdb",
+        "elasticsearch" | "opensearch" => ".ndjson",
         _ => ".dump",
     }
 }
 
-/// A database name, or for SQLite a file name: it may carry an extension but no path.
+/// What a job may name: a database, for SQLite a file name without a path, for Redis the
+/// whole instance, for the search engines an index or all of them.
 pub fn valid_target(engine: &str, name: &str) -> bool {
-    if engine != "sqlite" {
-        return valid_database_name(name);
+    match engine {
+        "sqlite" => {}
+        "redis" => return name == REDIS_ALL,
+        "elasticsearch" | "opensearch" => return name == SEARCH_ALL || valid_index_name(name),
+        _ => return valid_database_name(name),
     }
     (1..=63).contains(&name.len())
         && !name.starts_with(['-', '.'])
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+/// An index name goes into URL paths: nothing that could change the path or the query,
+/// and no hidden or system indices.
+pub fn valid_index_name(name: &str) -> bool {
+    (1..=63).contains(&name.len())
+        && !name.starts_with(['-', '_', '.'])
+        && name.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-' | b'.')
+        })
 }
 
 /// Deliberately narrow: names reach `pg_restore -d`, which would read `a=b` or a URL
@@ -243,6 +273,28 @@ mod tests {
         assert!(!valid_target("mysql", "app.db"));
         for bad in ["", ".env", "..", "a/b.db", "../x", "-readonly", "a b"] {
             assert!(!valid_target("sqlite", bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn redis_and_search_targets_cannot_reshape_a_request() {
+        assert!(valid_target("redis", "all") && !valid_target("redis", "0"));
+        for good in ["_all", "orders", "logs-2026.11"] {
+            assert!(valid_target("elasticsearch", good), "{good}");
+        }
+        for bad in [
+            "",
+            "*",
+            "a,b",
+            "a/b",
+            "a?x=1",
+            "..",
+            ".security",
+            "_cat",
+            "Orders",
+            "-x",
+        ] {
+            assert!(!valid_target("opensearch", bad), "{bad}");
         }
     }
 

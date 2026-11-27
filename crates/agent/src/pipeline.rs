@@ -57,6 +57,15 @@ impl Running {
             .take()
             .and_then(|t| t.join().ok())
             .unwrap_or_default();
+        // These report their progress on stderr; for the other tools it means trouble.
+        let usual = if matches!(
+            self.name,
+            "redis dump" | "redis restore" | "index dump" | "index restore"
+        ) {
+            "info"
+        } else {
+            "warn"
+        };
         for line in said
             .lines()
             .rev()
@@ -65,7 +74,7 @@ impl Running {
             .into_iter()
             .rev()
         {
-            progress.log(if status.success() { "warn" } else { "error" }, line);
+            progress.log(if status.success() { usual } else { "error" }, line);
         }
         if !status.success() {
             let last = said.lines().last().unwrap_or("no message");

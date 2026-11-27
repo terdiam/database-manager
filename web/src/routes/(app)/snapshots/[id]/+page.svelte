@@ -9,7 +9,7 @@
 	import PageHeader from '#lib/components/PageHeader.svelte';
 	import Select from '#lib/components/Select.svelte';
 	import SplitTitle from '#lib/components/SplitTitle.svelte';
-	import { namePattern } from '#lib/api/index.ts';
+	import { namePattern, targetField } from '#lib/api/index.ts';
 	import { errorText } from '#lib/errors.ts';
 	import { bytes, dateTime } from '#lib/format.ts';
 	import { t } from '#lib/i18n/index.svelte.ts';
@@ -55,7 +55,11 @@
 				missing = false;
 				snapshot = s;
 				servers = list;
-				database = s.engine === 'sqlite' ? `restore-${s.database_name}`.slice(0, 63) : `${s.database_name}_restore`;
+				database =
+					// A whole instance or all indices go back under their own names.
+					s.engine === 'redis' || s.database_name === '_all' ? s.database_name
+					: s.engine === 'sqlite' ? `restore-${s.database_name}`.slice(0, 63)
+					: `${s.database_name}_restore`.slice(0, 63);
 			},
 			(e) => {
 				missing = true;
@@ -123,13 +127,13 @@
 			<SplitTitle text={t('restore.title')} class="mb-1 font-semibold" />
 			<form onsubmit={(e) => { e.preventDefault(); restoreConfirm?.open(); }}>
 				<FormField label={t('restore.server')}>{#snippet children(a)}<Select {...a} required bind:value={target} placeholder={t('restore.choose')} options={targets.map((s) => ({ value: s.id, label: s.name, brand: s.engine, description: s.engine === 'sqlite' ? `/${s.host}` : `${s.host}:${s.port}` }))} />{/snippet}</FormField>
-				<FormField label={t('restore.database')} help={t('restore.createHint')}>{#snippet children(a)}<input {...a} class="input min-h-11" maxlength="63" pattern={namePattern(snapshot?.engine)} required bind:value={database} />{/snippet}</FormField>
+				<FormField label={t(snapshot.engine === 'redis' || snapshot.engine === 'elasticsearch' || snapshot.engine === 'opensearch' ? targetField(snapshot.engine).label : 'restore.database')} help={t(snapshot.engine === 'redis' ? 'restore.redisHint' : snapshot.database_name === '_all' ? 'restore.allHint' : 'restore.createHint')}>{#snippet children(a)}<input {...a} class="input min-h-11" maxlength="63" pattern={namePattern(snapshot?.engine)} readonly={snapshot?.engine === 'redis' || snapshot?.database_name === '_all'} required bind:value={database} />{/snippet}</FormField>
 				<button type="submit" class="btn btn-primary">{t('restore.start')}</button>
 			</form>
 		</section>
 	{/if}
 
-	<ConfirmDialog bind:this={restoreConfirm} title={t('restore.title')} message={t('restore.warning', { database, server: targetName })} confirmLabel={t('restore.start')} expect={database}
+	<ConfirmDialog bind:this={restoreConfirm} title={t('restore.title')} message={t(snapshot?.engine === 'redis' ? 'restore.redisWarning' : database === '_all' ? 'restore.allWarning' : 'restore.warning', { database, server: targetName })} confirmLabel={t('restore.start')} expect={database}
 		onconfirm={() => queue('POST', `/snapshots/${snapshot!.id}/restore`, { server_id: target, database_name: database })} />
 	<ConfirmDialog bind:this={deleteConfirm} title={t('action.delete')} message={t('snapshots.confirmDelete')} confirmLabel={t('action.delete')} onconfirm={() => queue('DELETE', `/snapshots/${snapshot!.id}`)} />
 {/if}

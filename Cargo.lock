@@ -169,6 +169,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcstr"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03918c3dbd7701a85c6b9887732e2921175f26c350b4563841d0958c21d57e6d"
+
+[[package]]
 name = "argon2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -866,8 +872,10 @@ dependencies = [
  "liblzma",
  "lz4_flex",
  "opendal",
+ "redis",
  "reqwest",
  "russh-sftp",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.2",
@@ -2880,6 +2888,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "redis"
+version = "1.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c85db9332bbc47e826283f0a6058d747c478ed2278976279cefd22154d541b98"
+dependencies = [
+ "arcstr",
+ "combine",
+ "itoa",
+ "percent-encoding",
+ "rustls",
+ "rustls-native-certs",
+ "ryu",
+ "socket2",
+ "url",
+ "webpki-roots",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4435,6 +4462,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "webpki-roots"
+version = "1.0.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7265c9301c16a8711c992c2d8da90ee77ef54b1ed51482d6dfeb00dc756b1297"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
 name = "whoami"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4635,6 +4671,12 @@ dependencies = [
  "rand_core 0.10.1",
  "zeroize",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40de123dbb523ebcc00d61ec01840ad192578afc378d859f3429caa38308fad5"
 
 [[package]]
 name = "yoke"

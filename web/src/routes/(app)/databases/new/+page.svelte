@@ -2,7 +2,7 @@
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
-	import { connectionOf, engines, supported, type Engine } from '#lib/api/index.ts';
+	import { connectionOf, engines, type Engine } from '#lib/api/index.ts';
 	import { request, type Agent, type SshConfig } from '#lib/api/http.ts';
 	import BrandIcon from '#lib/components/BrandIcon.svelte';
 	import ConnectionFields from '#lib/components/ConnectionFields.svelte';
@@ -44,8 +44,9 @@
 	// Each engine has its own usual port, account and TLS default.
 	function pick(next: Engine) {
 		engine = next;
-		const username = { postgresql: 'postgres', mysql: 'root', mariadb: 'root', mongodb: 'root' }[next as 'mysql'] ?? '';
-		Object.assign(form, { host: '', port: engines[next].port, username, password: '', ssl_mode: next === 'mongodb' ? 'disable' : 'prefer', ssh_config_id: '' });
+		const username = { postgresql: 'postgres', mysql: 'root', mariadb: 'root', mongodb: 'root', elasticsearch: 'elastic', opensearch: 'admin' }[next as 'mysql'] ?? '';
+		const ssl_mode = { mongodb: 'disable', redis: 'disable', elasticsearch: 'require', opensearch: 'require' }[next as 'redis'] ?? 'prefer';
+		Object.assign(form, { host: '', port: engines[next].port, username, password: '', ssl_mode, ssh_config_id: '' });
 	}
 
 	async function save() {
@@ -75,11 +76,10 @@
 			<legend class="mb-3 text-sm font-semibold">{t('wizard.engine')}</legend>
 			<div class="grid grid-cols-2 gap-2 sm:grid-cols-4">
 				{#each Object.entries(engines) as [key, info]}
-					<label class="rounded-lg border border-line p-3 text-center text-sm font-medium has-checked:border-brand has-checked:bg-muted has-disabled:opacity-50">
-						<input type="radio" name="engine" class="mb-1 block w-full" checked={engine === key} disabled={!supported.includes(key as Engine)} onchange={() => pick(key as Engine)} />
+					<label class="rounded-lg border border-line p-3 text-center text-sm font-medium has-checked:border-brand has-checked:bg-muted">
+						<input type="radio" name="engine" class="mb-1 block w-full" checked={engine === key} onchange={() => pick(key as Engine)} />
 						<span class="mx-auto my-1 block w-fit"><BrandIcon name={key} size={28} /></span>
 						{info.label}
-						{#if !supported.includes(key as Engine)}<span class="block text-xs font-normal text-dim">{t('soon')}</span>{/if}
 					</label>
 				{/each}
 			</div>

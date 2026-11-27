@@ -3,7 +3,7 @@
 Self-hosted database backup and restore with a web dashboard.
 Rust (server and agent), PostgreSQL and SvelteKit.
 
-Work in progress: PostgreSQL, MySQL, MariaDB, MongoDB and SQLite backup and restore to S3 work, by hand or on a schedule. Pages marked "sample data" show dummy content.
+Work in progress: backup and restore work by hand or on a schedule. Pages marked "sample data" show dummy content.
 
 ## Features
 
@@ -27,11 +27,11 @@ Done:
 - [x] Edit databases, storage, backups, alerts, users and agent names
 - [x] SSH tunnels to databases
 - [x] SFTP, FTP/FTPS and Samba storage
+- [x] Redis, Elasticsearch and OpenSearch
 
 Planned:
 
 - [ ] Google Drive storage
-- [ ] Redis, Elasticsearch, OpenSearch
 - [ ] Incremental backups
 
 ## Run
@@ -73,6 +73,14 @@ The agent only touches files inside its `DBM_SQLITE_ROOT` (`/sqlite` in Docker).
 `DBM_SQLITE_DIR` to a host folder writable by uid 10001, or use the Docker volume. Add the
 database with the folder below that root, then use the file name as the database name.
 Stop the application that uses a file before restoring over it.
+
+## Redis, Elasticsearch, OpenSearch
+
+A Redis backup is the whole instance. Restoring replaces keys of the same name and leaves
+the others; functions are not included, and the target should not be older than the source.
+
+For Elasticsearch and OpenSearch use one index name, or `_all`. Restoring deletes and
+recreates the index. Data streams, templates and users are not included.
 
 ## Backups
 

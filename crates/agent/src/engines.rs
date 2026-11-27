@@ -7,10 +7,10 @@ use std::{
     process::{Command, Stdio},
 };
 
-use dbm_shared::jobs::{DatabaseSecret, valid_target};
+use dbm_shared::jobs::{DatabaseSecret, SEARCH_ALL, valid_target};
 use tempfile::{NamedTempFile, TempPath};
 
-use crate::Result;
+use crate::{Result, helper, redis, search};
 
 /// A command ready to run, and what has to live or happen around it.
 pub struct Tool {
@@ -249,6 +249,33 @@ fn sqlite(path: &Path) -> Command {
     command
 }
 
+// ---------------------------------------------------------------- Redis, Elasticsearch, OpenSearch
+
+/// Redis has no dump tool that restores over the network, and the search engines have none
+/// at all, so the agent runs itself for those. The login travels in the environment.
+fn helper(
+    task: &'static str,
+    secret: &DatabaseSecret,
+    name: &str,
+    source: &str,
+) -> Result<Command> {
+    let mut command = quiet(
+        std::env::current_exe()?
+            .to_str()
+            .ok_or("unreadable program path")?,
+    );
+    command
+        .env(helper::TASK, task)
+        .env(helper::SECRET, serde_json::to_string(secret)?)
+        .env(helper::NAME, name)
+        .env(helper::SOURCE, source);
+    // The temporary Redis server and its files go where the agent's own temporaries go.
+    if let Some(folder) = std::env::var_os("TMPDIR") {
+        command.env("TMPDIR", folder);
+    }
+    Ok(command)
+}
+
 // ---------------------------------------------------------------- what jobs ask for
 
 /// Connects and says what answered.
@@ -277,6 +304,8 @@ pub fn test(secret: &DatabaseSecret) -> Result<String> {
             }
             Ok(format!("SQLite folder {}", folder.display()))
         }
+        "redis" => redis::test(secret),
+        "elasticsearch" | "opensearch" => search::test(secret),
         _ => Err("unknown engine".into()),
     }
 }
@@ -330,6 +359,14 @@ pub fn dump(secret: &DatabaseSecret, name: &str) -> Result<Tool> {
             command.arg(".dump");
             Tool::new(command, "sqlite3")
         }
+        "redis" => Tool::new(
+            helper(helper::REDIS_DUMP, secret, name, name)?,
+            "redis dump",
+        ),
+        "elasticsearch" | "opensearch" => Tool::new(
+            helper(helper::SEARCH_DUMP, secret, name, name)?,
+            "index dump",
+        ),
         _ => return Err("unknown engine".into()),
     })
 }
@@ -407,6 +444,24 @@ pub fn restore(secret: &DatabaseSecret, name: &str, source: &str) -> Result<(Too
             };
             (tool, created)
         }
+        "redis" => {
+            let command = helper(helper::REDIS_RESTORE, secret, name, source)?;
+            (Tool::new(command, "redis restore"), false)
+        }
+        "elasticsearch" | "opensearch" => {
+            if !valid_target(&secret.engine, source) {
+                return Err("the source index name is missing".into());
+            }
+            // One index may be restored under another name; a set of them keeps its names.
+            if (name == SEARCH_ALL) != (source == SEARCH_ALL) {
+                return Err(format!(
+                    "restore a backup of all indices to {SEARCH_ALL}, one index to an index name"
+                )
+                .into());
+            }
+            let command = helper(helper::SEARCH_RESTORE, secret, name, source)?;
+            (Tool::new(command, "index restore"), false)
+        }
         _ => return Err("unknown engine".into()),
     };
     tool.command.stdin(Stdio::piped()).stdout(Stdio::null());
@@ -430,8 +485,16 @@ mod tests {
 
     #[test]
     fn passwords_never_reach_the_command_line() {
-        for engine in ["postgresql", "mysql", "mariadb", "mongodb"] {
-            let tool = dump(&secret(engine), "shop").unwrap();
+        for (engine, name) in [
+            ("postgresql", "shop"),
+            ("mysql", "shop"),
+            ("mariadb", "shop"),
+            ("mongodb", "shop"),
+            ("redis", "all"),
+            ("elasticsearch", "shop"),
+            ("opensearch", "_all"),
+        ] {
+            let tool = dump(&secret(engine), name).unwrap();
             let args: Vec<_> = tool.command.get_args().collect();
             assert!(
                 !args.iter().any(|a| a.to_string_lossy().contains("hunter2")),
