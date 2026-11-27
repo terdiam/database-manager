@@ -238,6 +238,7 @@ mod tests {
             access_key: "a".into(),
             secret_key: "s".into(),
             virtual_host: false,
+            public_endpoint: String::new(),
         };
         let error = crate::storage::open(&secret)
             .unwrap()

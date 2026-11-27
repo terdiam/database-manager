@@ -2,13 +2,17 @@ mod agents;
 mod audit;
 mod auth;
 mod crypto;
+mod dashboard;
 mod e2ee;
 mod error;
 mod events;
 mod jobs;
 mod keys;
+mod notify;
 mod recover;
 mod resources;
+mod schedule;
+mod scheduler;
 mod snapshots;
 mod turnstile;
 mod users;
@@ -22,7 +26,7 @@ use axum::{
     http::{HeaderValue, Method, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use dbm_shared::e2ee::Keypair;
 use sqlx::PgPool;
@@ -50,7 +54,11 @@ pub struct Config {
     pub e2ee_required: bool,
     /// A second age recipient whose private key is kept offline, for disaster recovery.
     pub extra_recipient: Option<String>,
+    /// Base address of the Telegram Bot API; tests point it elsewhere.
+    pub telegram_api: String,
 }
+
+pub const TELEGRAM_API: &str = "https://api.telegram.org";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -79,6 +87,16 @@ impl AppState {
     /// Starts forwarding database changes to open pages. Holds one database connection.
     pub async fn watch_changes(&self) -> Result<(), sqlx::Error> {
         events::watch(&self.db, self.events.clone()).await
+    }
+
+    /// Runs due backups, retention and alerts every few seconds, forever.
+    pub async fn run_scheduler(self) {
+        scheduler::run(self).await;
+    }
+
+    /// One pass of the scheduler.
+    pub async fn schedule_once(&self) {
+        scheduler::round(self).await;
     }
 
     /// Ends the open event streams, so a graceful shutdown does not wait for them.
@@ -117,7 +135,10 @@ pub fn app(state: AppState) -> Router {
             "/backups",
             get(resources::list_backups).post(resources::create_backup),
         )
-        .route("/backups/{id}", delete(resources::delete_backup))
+        .route(
+            "/backups/{id}",
+            put(resources::update_backup).delete(resources::delete_backup),
+        )
         .route("/backups/{id}/run", post(snapshots::run_backup))
         .route("/snapshots", get(snapshots::list))
         .route(
@@ -125,6 +146,16 @@ pub fn app(state: AppState) -> Router {
             get(snapshots::get).delete(snapshots::delete),
         )
         .route("/snapshots/{id}/restore", post(snapshots::restore))
+        .route("/snapshots/{id}/download", post(snapshots::download))
+        .route("/downloads/{job}", get(snapshots::download_link))
+        .route("/schedule/preview", get(schedule::preview))
+        .route("/dashboard", get(dashboard::get))
+        .route(
+            "/notification-channels",
+            get(notify::list).post(notify::create),
+        )
+        .route("/notification-channels/{id}", delete(notify::delete))
+        .route("/notification-channels/{id}/test", post(notify::test))
         .route("/jobs", get(jobs::list))
         .route("/jobs/{id}", get(jobs::get))
         .route("/jobs/{id}/cancel", post(jobs::cancel))

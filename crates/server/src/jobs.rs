@@ -85,7 +85,7 @@ pub async fn enqueue(db: &PgPool, job: NewJob) -> Result<Uuid, Error> {
 }
 
 /// Jobs of agents that went silent. They are not retried: a half-done restore must be looked at.
-async fn expire_stale(db: &PgPool) -> Result<(), Error> {
+pub async fn expire_stale(db: &PgPool) -> Result<(), Error> {
     sqlx::query(
         "UPDATE jobs SET status = 'failed', error = 'the agent stopped responding', finished_at = now(), lease = NULL
          WHERE status = 'running' AND lease_expires_at < now()",
@@ -295,18 +295,21 @@ async fn task(app: &AppState, agent: Uuid, job: &Claimed) -> Result<Task, Error>
             object_key: job.object_key.clone().ok_or_else(missing)?,
         },
         "restore" => {
-            let (sha256, compression, key_id): (String, String, i32) =
-                sqlx::query_as("SELECT sha256, compression, key_id FROM snapshots WHERE id = $1")
-                    .bind(job.snapshot_id.ok_or_else(missing)?)
-                    .fetch_optional(&app.db)
-                    .await?
-                    .ok_or_else(missing)?;
+            let (sha256, compression, key_id, manifest): (String, String, i32, Option<String>) =
+                sqlx::query_as(
+                    "SELECT sha256, compression, key_id, manifest FROM snapshots WHERE id = $1",
+                )
+                .bind(job.snapshot_id.ok_or_else(missing)?)
+                .fetch_optional(&app.db)
+                .await?
+                .ok_or_else(missing)?;
             Task::Restore {
                 database: database().await?,
                 destination: destination().await?,
                 identity: keys::seal_identity(app, key_id, agent, job.id).await?,
                 object_key: job.object_key.clone().ok_or_else(missing)?,
                 sha256,
+                manifest,
                 compression,
                 name: job.database_name.clone().ok_or_else(missing)?,
             }
@@ -318,6 +321,10 @@ async fn task(app: &AppState, agent: Uuid, job: &Claimed) -> Result<Task, Error>
             destination: destination().await?,
         },
         "delete_snapshot" => Task::DeleteSnapshot {
+            destination: destination().await?,
+            object_key: job.object_key.clone().ok_or_else(missing)?,
+        },
+        "presign_snapshot" => Task::PresignSnapshot {
             destination: destination().await?,
             object_key: job.object_key.clone().ok_or_else(missing)?,
         },
@@ -438,16 +445,40 @@ pub async fn finish(
 
     if !failed && kind == "backup" {
         let sha256 = sha256.ok_or(Error::Invalid("sha256"))?;
+        let manifest = body.manifest.as_deref().filter(|m| m.len() <= 128);
         sqlx::query(
             "INSERT INTO snapshots (job_id, backup_config_id, server_name, database_name, destination_id,
-                                    object_key, size, sha256, compression, key_id)
-             SELECT id, backup_config_id, target, database_name, destination_id, object_key, bytes, $2,
-                    compression, key_id FROM jobs WHERE id = $1",
+                                    object_key, size, sha256, compression, key_id, manifest, expires_at)
+             SELECT j.id, j.backup_config_id, j.target, j.database_name, j.destination_id, j.object_key,
+                    j.bytes, $2, j.compression, j.key_id, $3,
+                    CASE c.retention_unit
+                        WHEN 'days' THEN now() + make_interval(days => c.retention_value)
+                        WHEN 'months' THEN now() + make_interval(months => c.retention_value)
+                    END
+             FROM jobs j LEFT JOIN backup_configs c ON c.id = j.backup_config_id WHERE j.id = $1",
         )
         .bind(body.id)
         .bind(sha256)
+        .bind(manifest)
         .execute(&mut *tx)
         .await?;
+    }
+    if !failed && !cancelled && kind == "presign_snapshot" {
+        // The link grants access to the file, so it is stored encrypted and only briefly.
+        let url = body
+            .result
+            .as_deref()
+            .filter(|u| u.len() <= 4096 && (u.starts_with("https://") || u.starts_with("http://")))
+            .ok_or(Error::Invalid("result"))?;
+        let sealed = app
+            .master
+            .seal("jobs", "result", &body.id.to_string(), url.as_bytes())
+            .map_err(Error::Internal)?;
+        sqlx::query("UPDATE jobs SET result = $2 WHERE id = $1")
+            .bind(body.id)
+            .bind(sealed)
+            .execute(&mut *tx)
+            .await?;
     }
     if !failed && !cancelled && kind == "delete_snapshot" {
         sqlx::query("DELETE FROM snapshots WHERE id = $1")

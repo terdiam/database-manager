@@ -17,7 +17,7 @@
 	import { sealFor } from '#lib/secrets.ts';
 	import { canOperate } from '#lib/session.svelte.ts';
 
-	const blank = () => ({ name: '', agent: '', endpoint: '', region: '', bucket: '', prefix: '', access_key: '', secret_key: '', virtual_host: false });
+	const blank = () => ({ name: '', agent: '', endpoint: '', region: '', bucket: '', prefix: '', access_key: '', secret_key: '', virtual_host: false, public_endpoint: '' });
 	let destinations = $state<Destination[]>([]);
 	let agents = $state<Agent[]>([]);
 	let error = $state('');
@@ -58,9 +58,9 @@
 		event.preventDefault();
 		const element = event.currentTarget;
 		const id = crypto.randomUUID();
-		const { name, agent, endpoint, region, bucket, prefix, access_key, secret_key, virtual_host } = form;
+		const { name, agent, endpoint, region, bucket, prefix, access_key, secret_key, virtual_host, public_endpoint } = form;
 		try {
-			const secret = await sealFor(agents.find((a) => a.id === agent), 'destination', id, { endpoint: endpoint.trim(), region: region.trim(), bucket: bucket.trim(), prefix: prefix.trim(), access_key, secret_key, virtual_host });
+			const secret = await sealFor(agents.find((a) => a.id === agent), 'destination', id, { endpoint: endpoint.trim(), region: region.trim(), bucket: bucket.trim(), prefix: prefix.trim(), access_key, secret_key, virtual_host, public_endpoint: public_endpoint.trim() });
 			await request('POST', '/destinations', { id, name, agent_id: agent, endpoint, bucket, prefix, secret });
 			close();
 			element.reset();
@@ -117,6 +117,7 @@
 			<FormField label={t('col.name')}>{#snippet children(a)}<input {...a} class="input" maxlength="64" required bind:value={form.name} />{/snippet}</FormField>
 			<FormField label={t('field.agent')} help={t('help.destinationAgent')}>{#snippet children(a)}<Select {...a} required bind:value={form.agent} options={agents.map((x) => ({ value: x.id, label: x.name, icon: 'server' as const }))} />{/snippet}</FormField>
 			<FormField label="Endpoint" help={t('help.endpoint')}>{#snippet children(a)}<input {...a} class="input" type="url" maxlength="255" placeholder="http://minio:9000" bind:value={form.endpoint} />{/snippet}</FormField>
+			<FormField label={t('field.publicEndpoint')} help={t('help.publicEndpoint')}>{#snippet children(a)}<input {...a} class="input" type="url" maxlength="255" bind:value={form.public_endpoint} />{/snippet}</FormField>
 			<div class="grid gap-x-3 sm:grid-cols-2">
 				<FormField label="Bucket">{#snippet children(a)}<input {...a} class="input" maxlength="255" required bind:value={form.bucket} />{/snippet}</FormField>
 				<FormField label="Region">{#snippet children(a)}<input {...a} class="input" maxlength="64" placeholder="us-east-1" bind:value={form.region} />{/snippet}</FormField>

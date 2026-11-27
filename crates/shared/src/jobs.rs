@@ -54,6 +54,9 @@ pub struct S3Secret {
     pub secret_key: String,
     #[serde(default)]
     pub virtual_host: bool,
+    /// Address browsers use to download, when `endpoint` is only reachable by the agent.
+    #[serde(default)]
+    pub public_endpoint: String,
 }
 
 /// A value only this agent can open (HPKE, base64url) and what it is bound to.
@@ -84,6 +87,8 @@ pub enum Task {
         identity: Sealed,
         object_key: String,
         sha256: String,
+        /// The agent's own MAC over the record; absent for snapshots made before it existed.
+        manifest: Option<String>,
         compression: String,
         name: String,
     },
@@ -94,6 +99,11 @@ pub enum Task {
         destination: Sealed,
     },
     DeleteSnapshot {
+        destination: Sealed,
+        object_key: String,
+    },
+    /// Make a short-lived download link for a stored file.
+    PresignSnapshot {
         destination: Sealed,
         object_key: String,
     },
@@ -141,6 +151,12 @@ pub struct Finish {
     pub error: Option<String>,
     /// SHA-256 (hex) of the stored file, for successful backups.
     pub sha256: Option<String>,
+    /// MAC over the stored file's record, for successful backups.
+    #[serde(default)]
+    pub manifest: Option<String>,
+    /// The download link, for presign jobs.
+    #[serde(default)]
+    pub result: Option<String>,
 }
 
 #[cfg(test)]

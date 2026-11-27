@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { page } from '$app/state';
-	import { ApiError, request, type DbServer, type Queued, type Snapshot } from '#lib/api/http.ts';
+	import { ApiError, request, type DbServer, type Job, type Queued, type Snapshot } from '#lib/api/http.ts';
 	import ConfirmDialog from '#lib/components/ConfirmDialog.svelte';
 	import EmptyState from '#lib/components/EmptyState.svelte';
 	import FormField from '#lib/components/FormField.svelte';
@@ -24,6 +24,24 @@
 	let restoreConfirm = $state<ConfirmDialog>();
 	let deleteConfirm = $state<ConfirmDialog>();
 	let job: JobDialog;
+	let link = $state('');
+
+	async function download() {
+		link = '';
+		await queue('POST', `/snapshots/${snapshot!.id}/download`);
+	}
+
+	// The link can be fetched once, right after the agent made it.
+	async function finished(done: Job) {
+		if (done.kind !== 'presign_snapshot' || done.status !== 'completed') return;
+		try {
+			const { url } = await request<{ url: string }>('GET', `/downloads/${done.id}`);
+			if (/^https?:/.test(url)) link = url;
+			job.close(); // the button to save the file is behind the dialog
+		} catch (e) {
+			error = errorText(e);
+		}
+	}
 
 	// Restores run on the agent that can open the destination's credentials.
 	const targets = $derived(servers.filter((s) => s.agent_id === snapshot?.agent_id));
@@ -88,7 +106,15 @@
 			<dt class="text-dim">{t('snapshots.file')}</dt><dd><code class="text-xs break-all">{snapshot.object_key}</code></dd>
 			<dt class="text-dim">{t('wizard.compression')}</dt><dd>{snapshot.compression} · age</dd>
 			<dt class="text-dim">SHA-256</dt><dd><code class="text-xs break-all">{snapshot.sha256}</code></dd>
+			<dt class="text-dim">{t('col.expires')}</dt><dd>{snapshot.expires_at ? dateTime(snapshot.expires_at) : '-'}</dd>
 		</dl>
+		{#if canOperate()}
+			<div class="mt-4 flex flex-wrap items-center gap-2">
+				<button type="button" class="btn" onclick={download}>{t('action.download')}</button>
+				<span role="status">{#if link}<a class="btn btn-primary" href={link} target="_blank" rel="noopener noreferrer external">{t('snapshots.saveFile')}</a>{/if}</span>
+				<p class="w-full text-xs text-dim">{t('snapshots.downloadHint')}</p>
+			</div>
+		{/if}
 	</section>
 
 	{#if canOperate()}
@@ -107,4 +133,4 @@
 	<ConfirmDialog bind:this={deleteConfirm} title={t('action.delete')} message={t('snapshots.confirmDelete')} confirmLabel={t('action.delete')} onconfirm={() => queue('DELETE', `/snapshots/${snapshot!.id}`)} />
 {/if}
 
-<JobDialog bind:this={job} title={t('action.log')} />
+<JobDialog bind:this={job} title={t('action.log')} onfinish={finished} />

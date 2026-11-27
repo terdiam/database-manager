@@ -1,4 +1,5 @@
 mod api;
+mod manifest;
 mod pipeline;
 mod postgres;
 mod progress;
@@ -244,11 +245,11 @@ async fn execute(api: &Api, state: &State, job: Job) {
             }
         }
     };
-    let (error, sha256) = match result {
-        Ok(sha256) => (None, sha256),
+    let (error, output) = match result {
+        Ok(output) => (None, output),
         Err(error) => {
             progress.log("error", error.to_string());
-            (Some(error.to_string()), None)
+            (Some(error.to_string()), runner::Output::default())
         }
     };
     tracing::info!(
@@ -265,7 +266,9 @@ async fn execute(api: &Api, state: &State, job: Job) {
         bytes: progress.bytes(),
         logs: progress.take_logs(),
         error,
-        sha256,
+        sha256: output.sha256,
+        manifest: output.manifest,
+        result: output.result,
     };
     // Losing this message would leave the job to expire, so try a few times.
     for attempt in 1..=5 {

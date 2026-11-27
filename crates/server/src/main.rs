@@ -1,8 +1,8 @@
 use std::{env, net::SocketAddr};
 
 use dbm_server::{
-    AppState, Config, MasterKey, Turnstile, VERIFY_URL, app, load_transport_key, parse_recipient,
-    reset_password,
+    AppState, Config, MasterKey, TELEGRAM_API, Turnstile, VERIFY_URL, app, load_transport_key,
+    parse_recipient, reset_password,
 };
 use sqlx::postgres::PgPoolOptions;
 
@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let url = env::var("DATABASE_URL").map_err(|_| "DATABASE_URL is required")?;
     let pool = PgPoolOptions::new()
         // One of these is held by the change listener.
-        .max_connections(6)
+        .max_connections(8)
         .connect(&url)
         .await?;
     sqlx::migrate!().run(&pool).await?;
@@ -65,6 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         trust_proxy: flag("DBM_TRUST_PROXY", false),
         turnstile: turnstile()?,
         e2ee_required,
+        telegram_api: TELEGRAM_API.into(),
         extra_recipient: match env::var("DBM_BACKUP_EXTRA_RECIPIENT")
             .ok()
             .filter(|v| !v.is_empty())
@@ -85,6 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = AppState::new(pool, config, transport_key, master);
     state.watch_changes().await?;
+    tokio::spawn(state.clone().run_scheduler());
     let streams = state.clone();
     axum::serve(
         listener,

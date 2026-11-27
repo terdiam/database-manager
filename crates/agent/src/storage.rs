@@ -13,6 +13,10 @@ use crate::{Result, progress::Progress};
 const PART: usize = 16 * 1024 * 1024;
 
 pub fn open(secret: &S3Secret) -> Result<Operator> {
+    open_at(secret, &secret.endpoint)
+}
+
+fn open_at(secret: &S3Secret, endpoint: &str) -> Result<Operator> {
     let mut builder = S3::default()
         .bucket(&secret.bucket)
         .root(&secret.prefix)
@@ -26,13 +30,27 @@ pub fn open(secret: &S3Secret) -> Result<Operator> {
         // Only the credentials given here, never ones lying around on the host.
         .disable_config_load()
         .disable_ec2_metadata();
-    if !secret.endpoint.is_empty() {
-        builder = builder.endpoint(&secret.endpoint);
+    if !endpoint.is_empty() {
+        builder = builder.endpoint(endpoint);
     }
     if secret.virtual_host {
         builder = builder.enable_virtual_host_style();
     }
     Ok(Operator::new(builder)?)
+}
+
+/// A link a browser can use for five minutes. The file stays age-encrypted.
+pub async fn link(secret: &S3Secret, key: &str) -> Result<String> {
+    // The signature covers the host, so it must be made for the address the browser uses.
+    let operator = if secret.public_endpoint.is_empty() {
+        open(secret)?
+    } else {
+        open_at(secret, &secret.public_endpoint)?
+    };
+    let request = operator
+        .presign_read(key, std::time::Duration::from_secs(300))
+        .await?;
+    Ok(request.uri().to_string())
 }
 
 /// Write, read back and delete a small object.

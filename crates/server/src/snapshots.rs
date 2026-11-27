@@ -40,6 +40,13 @@ pub async fn run_backup(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Queued>, Error> {
     me.require_operator()?;
+    let (job_id, name) = queue_backup(&app, id, &me.name).await?;
+    audit::record(&app.db, Some(&me), "backup", &name, &ip, true).await?;
+    Ok(Json(Queued { job_id }))
+}
+
+/// Queues one run of a backup entry; returns the job and the entry's name.
+pub async fn queue_backup(app: &AppState, id: Uuid, by: &str) -> Result<(Uuid, String), Error> {
     let (name, server_id, server, agent, database, destination_id, compression, level): (
         String, Uuid, String, Uuid, String, Uuid, String, i32,
     ) = sqlx::query_as(
@@ -75,17 +82,15 @@ pub async fn run_backup(
         object_key: Some(object_key),
         compression: Some(compression),
         level: Some(level),
-        key_id: Some(keys::current(&app).await?),
+        key_id: Some(keys::current(app).await?),
         // The server's name: it becomes the snapshot's source.
-        ..NewJob::new("backup", agent, server, &me.name)
+        ..NewJob::new("backup", agent, server, by)
     };
-    let job_id = match enqueue(&app.db, job).await {
-        Ok(id) => id,
-        Err(Error::Conflict("duplicate")) => return Err(Error::Conflict("already_running")),
-        Err(other) => return Err(other),
-    };
-    audit::record(&app.db, Some(&me), "backup", &name, &ip, true).await?;
-    Ok(Json(Queued { job_id }))
+    match enqueue(&app.db, job).await {
+        Ok(job_id) => Ok((job_id, name)),
+        Err(Error::Conflict("duplicate")) => Err(Error::Conflict("already_running")),
+        Err(other) => Err(other),
+    }
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -101,10 +106,13 @@ pub struct Snapshot {
     compression: String,
     #[serde(with = "time::serde::rfc3339")]
     created_at: OffsetDateTime,
+    /// `None` when kept until rotated or removed by hand.
+    #[serde(with = "time::serde::rfc3339::option")]
+    expires_at: Option<OffsetDateTime>,
 }
 
 const SELECT: &str = "SELECT s.id, s.server_name, s.database_name, d.name AS destination, d.agent_id, s.object_key,
-    s.size, s.sha256, s.compression, s.created_at FROM snapshots s JOIN destinations d ON d.id = s.destination_id";
+    s.size, s.sha256, s.compression, s.created_at, s.expires_at FROM snapshots s JOIN destinations d ON d.id = s.destination_id";
 
 #[derive(Deserialize)]
 pub struct Filter {
@@ -221,14 +229,8 @@ pub async fn restore(
     Ok(Json(Queued { job_id }))
 }
 
-/// The agent removes the file; the record goes once it confirms.
-pub async fn delete(
-    State(app): State<AppState>,
-    Auth(me): Auth,
-    Ip(ip): Ip,
-    Path(id): Path<Uuid>,
-) -> Result<Json<Queued>, Error> {
-    me.require_admin()?;
+/// Asks the agent to remove the file; returns the job and the object key.
+pub async fn queue_delete(app: &AppState, id: Uuid, by: &str) -> Result<(Uuid, String), Error> {
     let (server, destination_id, agent, object_key): (String, Uuid, Uuid, String) = sqlx::query_as(
         "SELECT s.server_name, s.destination_id, d.agent_id, s.object_key
          FROM snapshots s JOIN destinations d ON d.id = s.destination_id WHERE s.id = $1",
@@ -241,17 +243,79 @@ pub async fn delete(
         destination_id: Some(destination_id),
         snapshot_id: Some(id),
         object_key: Some(object_key.clone()),
-        ..NewJob::new("delete_snapshot", agent, server, &me.name)
+        ..NewJob::new("delete_snapshot", agent, server, by)
+    };
+    Ok((enqueue(&app.db, job).await?, object_key))
+}
+
+/// The agent removes the file; the record goes once it confirms.
+pub async fn delete(
+    State(app): State<AppState>,
+    Auth(me): Auth,
+    Ip(ip): Ip,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Queued>, Error> {
+    me.require_admin()?;
+    let (job_id, object_key) = queue_delete(&app, id, &me.name).await?;
+    let target = format!("snapshot {object_key}");
+    audit::record(&app.db, Some(&me), "delete", &target, &ip, true).await?;
+    Ok(Json(Queued { job_id }))
+}
+
+/// The agent makes a short-lived link to the (still encrypted) file in the storage.
+pub async fn download(
+    State(app): State<AppState>,
+    Auth(me): Auth,
+    Ip(ip): Ip,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Queued>, Error> {
+    me.require_operator()?;
+    let (server, destination_id, agent, object_key): (String, Uuid, Uuid, String) = sqlx::query_as(
+        "SELECT s.server_name, s.destination_id, d.agent_id, s.object_key
+         FROM snapshots s JOIN destinations d ON d.id = s.destination_id WHERE s.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&app.db)
+    .await?
+    .ok_or(Error::NotFound)?;
+    let job = NewJob {
+        destination_id: Some(destination_id),
+        snapshot_id: Some(id),
+        object_key: Some(object_key.clone()),
+        ..NewJob::new("presign_snapshot", agent, server, &me.name)
     };
     let job_id = enqueue(&app.db, job).await?;
-    audit::record(
-        &app.db,
-        Some(&me),
-        "delete",
-        &format!("snapshot {object_key}"),
-        &ip,
-        true,
-    )
-    .await?;
+    let target = format!("snapshot {object_key}");
+    audit::record(&app.db, Some(&me), "download", &target, &ip, true).await?;
     Ok(Json(Queued { job_id }))
+}
+
+#[derive(Serialize)]
+pub struct Link {
+    url: String,
+}
+
+/// Hands the link out once.
+pub async fn download_link(
+    State(app): State<AppState>,
+    Auth(me): Auth,
+    Path(job): Path<Uuid>,
+) -> Result<Json<Link>, Error> {
+    me.require_operator()?;
+    let sealed: Vec<u8> = sqlx::query_scalar(
+        "UPDATE jobs j SET result = NULL
+         FROM (SELECT id, result FROM jobs WHERE id = $1 AND created_by = $2 FOR UPDATE) old
+         WHERE j.id = old.id AND old.result IS NOT NULL RETURNING old.result",
+    )
+    .bind(job)
+    .bind(&me.name)
+    .fetch_optional(&app.db)
+    .await?
+    .ok_or(Error::NotFound)?;
+    let url = app
+        .master
+        .open("jobs", "result", &job.to_string(), &sealed)
+        .map_err(Error::Internal)?;
+    let url = String::from_utf8(url).map_err(|e| Error::Internal(e.to_string()))?;
+    Ok(Json(Link { url }))
 }

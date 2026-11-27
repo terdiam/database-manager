@@ -15,9 +15,8 @@
 	let collapsed = $state(false);
 	let tour: Tour;
 	let palette: CommandPalette;
-	// Pages already backed by the server; the rest still show sample data until their phase.
-	const live = ['/agents', '/users', '/audit', '/profile', '/help', '/databases', '/destinations', '/backups', '/snapshots', '/jobs', '/settings'];
-	const sample = $derived(!live.some((path) => page.url.pathname.startsWith(path)));
+	// Still shows sample data until its phase.
+	const sample = $derived(page.url.pathname.startsWith('/ssh'));
 
 	function startTour() {
 		drawer.close();

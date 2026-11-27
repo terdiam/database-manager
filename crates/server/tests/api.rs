@@ -28,6 +28,7 @@ fn build(db: PgPool, turnstile: Option<Turnstile>, e2ee_required: bool, key: Key
         turnstile,
         e2ee_required,
         extra_recipient: None,
+        telegram_api: "http://127.0.0.1:9".into(),
     };
     let master = MasterKey::parse("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap();
     app(AppState::new(db, config, key, master)).layer(MockConnectInfo(std::net::SocketAddr::from(
@@ -1113,6 +1114,7 @@ fn state_for(db: PgPool, e2ee_required: bool, key: Keypair) -> AppState {
         turnstile: None,
         e2ee_required,
         extra_recipient: None,
+        telegram_api: "http://127.0.0.1:9".into(),
     };
     let master = MasterKey::parse("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap();
     AppState::new(db, config, key, master)
@@ -1218,4 +1220,377 @@ async fn events_are_encrypted_chunk_by_chunk(db: PgPool) {
     // Length prefix, two bytes of text and the authentication tag.
     assert_eq!(first.len(), 4 + 2 + 16);
     assert_eq!(cipher.open(&first[4..]).unwrap(), b"*\n");
+}
+
+// ---------------------------------------------------------------- schedules, retention, alerts
+
+/// Claims the next job of `agent` and reports it done.
+async fn finish_next(app: &Router, agent: &Agent, extra: Value) -> Value {
+    let claimed = as_agent(app, agent, "/api/agent/jobs/claim", json!({})).await;
+    let job = claimed.body["job"].clone();
+    assert!(!job.is_null(), "a job is waiting");
+    let mut done = json!({ "id": job["id"], "lease": job["lease"], "bytes": 10, "logs": [], "error": null,
+        "sha256": "a".repeat(64) });
+    for (key, value) in extra.as_object().unwrap() {
+        done[key] = value.clone();
+    }
+    let reply = as_agent(app, agent, "/api/agent/jobs/finish", done).await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    job
+}
+
+async fn count(db: &PgPool, sql: &'static str) -> i64 {
+    sqlx::query_scalar(sql).fetch_one(db).await.unwrap()
+}
+
+#[sqlx::test]
+async fn schedules_run_when_due(db: PgPool) {
+    let state = state_for(db.clone(), false, Keypair::generate());
+    let app = app(state.clone());
+    let cookie = admin(&app).await;
+    let agent = enroll(&app, &cookie, "a1").await;
+    let (_, _, backup) = add_resources(&app, &cookie, &agent).await;
+    let path = format!("/api/backups/{backup}");
+
+    for bad in [
+        json!({ "schedule": "every day" }),
+        json!({ "schedule": "0 1 * * *", "timezone": "Nowhere" }),
+        json!({ "retention_unit": "days", "retention_value": 0 }),
+        json!({ "retention_unit": "gfs" }),
+        json!({ "retention_unit": "forever" }),
+    ] {
+        let reply = call(&app, "PUT", &path, Some(&cookie), Some(bad.clone())).await;
+        assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY, "{bad}");
+    }
+    let plan = json!({ "schedule": "0 1 * * *", "timezone": "Asia/Jakarta", "retention_unit": "days", "retention_value": 7 });
+    let reply = call(&app, "PUT", &path, Some(&cookie), Some(plan)).await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    let list = call(&app, "GET", "/api/backups", Some(&cookie), None).await;
+    assert!(list.body[0]["next_run_at"].is_string());
+
+    state.schedule_once().await;
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM jobs").await,
+        0,
+        "not due yet"
+    );
+
+    sqlx::query("UPDATE backup_configs SET next_run_at = now() - interval '3 days'")
+        .execute(&db)
+        .await
+        .unwrap();
+    state.schedule_once().await;
+    state.schedule_once().await;
+    // Missed runs are made up once, and the next one is in the future.
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) FROM jobs WHERE created_by = 'schedule'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) FROM backup_configs WHERE next_run_at > now()"
+        )
+        .await,
+        1
+    );
+
+    finish_next(&app, &agent, json!({ "manifest": "tag" })).await;
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) FROM snapshots WHERE manifest = 'tag'
+                    AND expires_at BETWEEN now() + interval '6 days' AND now() + interval '8 days'"
+        )
+        .await,
+        1
+    );
+}
+
+/// Snapshots of one backup entry, `age` days old each.
+async fn old_snapshots(db: &PgPool, ages: &[i32]) {
+    for age in ages {
+        sqlx::query(
+            "INSERT INTO snapshots (job_id, backup_config_id, server_name, database_name, destination_id,
+                 object_key, size, sha256, compression, key_id, created_at, expires_at)
+             SELECT gen_random_uuid(), c.id, 'Prod PG', 'shop', c.destination_id, 'k' || $1, 1, 'x', 'none',
+                 (SELECT max(id) FROM backup_keys), now() - make_interval(days => $1),
+                 CASE c.retention_unit WHEN 'days' THEN now() - make_interval(days => $1 - c.retention_value) END
+             FROM backup_configs c",
+        )
+        .bind(age)
+        .execute(db)
+        .await
+        .unwrap();
+    }
+}
+
+async fn queued_deletes(db: &PgPool) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT object_key FROM jobs WHERE kind = 'delete_snapshot' ORDER BY object_key",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap()
+}
+
+#[sqlx::test]
+async fn retention_deletes_the_old_but_never_the_last(db: PgPool) {
+    let state = state_for(db.clone(), false, Keypair::generate());
+    let app = app(state.clone());
+    let cookie = admin(&app).await;
+    let agent = enroll(&app, &cookie, "a1").await;
+    let (_, _, backup) = add_resources(&app, &cookie, &agent).await;
+    sqlx::query("INSERT INTO backup_keys (recipient, secret) VALUES ('age1', '\\x00')")
+        .execute(&db)
+        .await
+        .unwrap();
+    let path = format!("/api/backups/{backup}");
+    let plan = json!({ "retention_unit": "days", "retention_value": 7 });
+    call(&app, "PUT", &path, Some(&cookie), Some(plan)).await;
+
+    // All expired: the newest one stays anyway.
+    old_snapshots(&db, &[30, 20, 10]).await;
+    state.schedule_once().await;
+    state.schedule_once().await;
+    assert_eq!(queued_deletes(&db).await, ["k20", "k30"]);
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) FROM audit_logs WHERE action = 'delete' AND ip = 'system'"
+        )
+        .await,
+        2
+    );
+}
+
+#[sqlx::test]
+async fn gfs_keeps_the_newest_of_each_period(db: PgPool) {
+    let state = state_for(db.clone(), false, Keypair::generate());
+    let app = app(state.clone());
+    let cookie = admin(&app).await;
+    let agent = enroll(&app, &cookie, "a1").await;
+    add_resources(&app, &cookie, &agent).await;
+    sqlx::query("INSERT INTO backup_keys (recipient, secret) VALUES ('age1', '\\x00')")
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE backup_configs SET retention_unit = 'gfs', keep_daily = 2, keep_weekly = 0,
+                 keep_monthly = 0, retention_since = now() - interval '1 year'",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    old_snapshots(&db, &[0, 1, 2, 3]).await;
+    state.schedule_once().await;
+    assert_eq!(queued_deletes(&db).await, ["k2", "k3"]);
+
+    // Older than the last change of the retention: left alone.
+    sqlx::query("DELETE FROM jobs").execute(&db).await.unwrap();
+    sqlx::query("UPDATE backup_configs SET retention_since = now()")
+        .execute(&db)
+        .await
+        .unwrap();
+    state.schedule_once().await;
+    assert!(queued_deletes(&db).await.is_empty());
+}
+
+/// Stands in for Telegram and Mattermost; records what arrives.
+async fn fake_chat() -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+) {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let server = Router::new().fallback(
+        move |uri: axum::http::Uri, axum::Json(body): axum::Json<Value>| {
+            let log = log.clone();
+            async move {
+                let text = body["text"].as_str().unwrap_or_default().to_owned();
+                log.lock().unwrap().push((uri.path().to_owned(), text));
+                StatusCode::OK
+            }
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+    (url, seen)
+}
+
+#[sqlx::test]
+async fn failures_and_silent_agents_raise_alerts(db: PgPool) {
+    let (chat, seen) = fake_chat().await;
+    let config = Config {
+        cookie_secure: true,
+        trust_proxy: false,
+        turnstile: None,
+        e2ee_required: false,
+        extra_recipient: None,
+        telegram_api: chat.clone(),
+    };
+    let master = MasterKey::parse("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap();
+    let state = AppState::new(db.clone(), config, Keypair::generate(), master);
+    let app = app(state.clone());
+    let cookie = admin(&app).await;
+    let agent = enroll(&app, &cookie, "a1").await;
+    let (_, _, backup) = add_resources(&app, &cookie, &agent).await;
+    let channels = "/api/notification-channels";
+
+    let telegram = json!({ "name": "dba", "events": ["backup_failed"],
+        "secret": { "kind": "telegram", "bot_token": "123:very-secret-token", "chat_id": "-100" } });
+    let hook = format!("{chat}/hooks/very-secret-hook");
+    let mattermost = json!({ "name": "ops", "events": ["agent_offline"],
+        "secret": { "kind": "mattermost", "webhook_url": hook } });
+    for body in [telegram, mattermost] {
+        let reply = call(&app, "POST", channels, Some(&cookie), Some(body)).await;
+        assert_eq!(reply.status, StatusCode::CREATED);
+    }
+    for bad in [
+        json!({ "name": "x", "events": [], "secret": { "kind": "mattermost", "webhook_url": hook } }),
+        json!({ "name": "x", "events": ["agent_offline"], "secret": { "kind": "mattermost", "webhook_url": "file:///etc/passwd" } }),
+        json!({ "name": "x", "events": ["agent_offline"], "secret": { "kind": "telegram", "bot_token": "1:../..", "chat_id": "1" } }),
+    ] {
+        let reply = call(&app, "POST", channels, Some(&cookie), Some(bad)).await;
+        assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // Secrets are neither listed nor stored readable.
+    let list = call(&app, "GET", channels, Some(&cookie), None).await;
+    assert!(!list.body.to_string().contains("very-secret"));
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM notification_channels WHERE encode(secret, 'escape') LIKE '%very-secret%'").await,
+        0
+    );
+    let viewer =
+        json!({ "name": "V", "email": "v@example.com", "password": PASSWORD, "role": "operator" });
+    call(&app, "POST", "/api/users", Some(&cookie), Some(viewer)).await;
+    let operator = login(&app, "v@example.com", PASSWORD).await.cookie.unwrap();
+    let reply = call(&app, "GET", channels, Some(&operator), None).await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+
+    let run = format!("/api/backups/{backup}/run");
+    call(&app, "POST", &run, Some(&cookie), None).await;
+    finish_next(
+        &app,
+        &agent,
+        json!({ "error": "disk full", "sha256": null }),
+    )
+    .await;
+    state.schedule_once().await;
+    sqlx::query("UPDATE agents SET last_seen_at = now() - interval '1 hour'")
+        .execute(&db)
+        .await
+        .unwrap();
+    state.schedule_once().await;
+    state.schedule_once().await;
+
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2, "one alert per event: {seen:?}");
+    assert_eq!(seen[0].0, "/bot123:very-secret-token/sendMessage");
+    assert!(seen[0].1.contains("Backup gagal") && seen[0].1.contains("disk full"));
+    assert_eq!(seen[1].0, "/hooks/very-secret-hook");
+    assert!(seen[1].1.contains("Agent offline: a1"));
+
+    // An unreachable service is reported without leaking the address.
+    sqlx::query("UPDATE notification_channels SET name = name")
+        .execute(&db)
+        .await
+        .unwrap();
+    let id = list.body[0]["id"].as_str().unwrap();
+    let reply = call(
+        &app,
+        "POST",
+        &format!("{channels}/{id}/test"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert!(reply.body["error"].is_null());
+}
+
+#[sqlx::test]
+async fn download_links_are_handed_out_once(db: PgPool) {
+    let app = router(db.clone());
+    let cookie = admin(&app).await;
+    let agent = enroll(&app, &cookie, "a1").await;
+    let (_, _, backup) = add_resources(&app, &cookie, &agent).await;
+    call(
+        &app,
+        "POST",
+        &format!("/api/backups/{backup}/run"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    finish_next(&app, &agent, json!({})).await;
+    let snapshots = call(&app, "GET", "/api/snapshots", Some(&cookie), None).await;
+    let snapshot = snapshots.body["items"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let queued = call(
+        &app,
+        "POST",
+        &format!("/api/snapshots/{snapshot}/download"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    let job = queued.body["job_id"].as_str().unwrap().to_owned();
+    let link = format!("/api/downloads/{job}");
+    let early = call(&app, "GET", &link, Some(&cookie), None).await;
+    assert_eq!(early.status, StatusCode::NOT_FOUND);
+
+    let url = "https://s3.example/file?X-Amz-Signature=very-secret";
+    let claimed = finish_next(&app, &agent, json!({ "result": url, "sha256": null })).await;
+    assert_eq!(claimed["task"]["kind"], "presign_snapshot");
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) FROM jobs WHERE encode(result, 'escape') LIKE '%very-secret%'"
+        )
+        .await,
+        0
+    );
+    let first = call(&app, "GET", &link, Some(&cookie), None).await;
+    assert_eq!(first.body["url"], url);
+    let second = call(&app, "GET", &link, Some(&cookie), None).await;
+    assert_eq!(second.status, StatusCode::NOT_FOUND);
+
+    let dashboard = call(
+        &app,
+        "GET",
+        "/api/dashboard?timezone=Asia/Jakarta",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(dashboard.body["completed_24h"], 1);
+    assert_eq!(dashboard.body["activity"].as_array().unwrap().len(), 14);
+    assert_eq!(dashboard.body["volumes"][0]["bytes"], 10);
+    let bad = call(
+        &app,
+        "GET",
+        "/api/dashboard?timezone=x",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let preview = call(
+        &app,
+        "GET",
+        "/api/schedule/preview?schedule=0+1+*+*+*&timezone=UTC",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(preview.body["runs"].as_array().unwrap().len(), 3);
 }

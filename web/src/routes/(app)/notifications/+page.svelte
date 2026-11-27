@@ -1,36 +1,146 @@
 <script lang="ts">
-	import { channels } from '#lib/api/index.ts';
-	import ResourcePage from '#lib/components/ResourcePage.svelte';
+	import { onMount } from 'svelte';
+	import { request, type Channel } from '#lib/api/http.ts';
+	import BrandIcon from '#lib/components/BrandIcon.svelte';
+	import ConfirmDialog from '#lib/components/ConfirmDialog.svelte';
+	import DataTable from '#lib/components/DataTable.svelte';
+	import FormField from '#lib/components/FormField.svelte';
+	import Modal from '#lib/components/Modal.svelte';
+	import PageHeader from '#lib/components/PageHeader.svelte';
+	import PasswordInput from '#lib/components/PasswordInput.svelte';
 	import Select from '#lib/components/Select.svelte';
+	import { toast } from '#lib/components/toast.svelte.ts';
+	import { errorText } from '#lib/errors.ts';
+	import { live } from '#lib/events.ts';
+	import { dateTime } from '#lib/format.ts';
 	import { t } from '#lib/i18n/index.svelte.ts';
+	import { isAdmin } from '#lib/session.svelte.ts';
 
-	let type = $state('Telegram');
+	const events = ['backup_failed', 'restore_failed', 'agent_offline'] as const;
+	const names = { telegram: 'Telegram', mattermost: 'Mattermost' };
+	const blank = () => ({ name: '', kind: 'telegram' as string, bot_token: '', chat_id: '', webhook_url: '', events: [...events] as string[] });
+
+	let channels = $state<Channel[]>([]);
+	let error = $state('');
+	let loadError = $state('');
+	let formError = $state('');
+	let form = $state(blank());
+	let removing = $state<Channel>();
+	let modal: Modal;
+	let confirm: ConfirmDialog;
+
+	async function load() {
+		if (!isAdmin()) return;
+		try {
+			channels = await request<Channel[]>('GET', '/notification-channels');
+			loadError = '';
+		} catch (e) {
+			loadError = errorText(e);
+		}
+	}
+	onMount(() => {
+		load();
+		return live(['notification_channels'], load);
+	});
+
+	function open() {
+		form = blank();
+		formError = '';
+		modal.open();
+	}
+
+	async function create(close: () => void) {
+		const { name, kind, bot_token, chat_id, webhook_url } = form;
+		if (!form.events.length) {
+			formError = t('error.events');
+			return;
+		}
+		const secret = kind === 'telegram' ? { kind, bot_token: bot_token.trim(), chat_id: chat_id.trim() } : { kind, webhook_url: webhook_url.trim() };
+		try {
+			await request('POST', '/notification-channels', { name, events: form.events, secret });
+			close();
+			form = blank();
+			toast(t('toast.created', { name }));
+			await load();
+		} catch (e) {
+			formError = errorText(e);
+		}
+	}
+
+	async function test(channel: Channel) {
+		try {
+			const result = await request<{ error: string | null }>('POST', `/notification-channels/${channel.id}/test`);
+			error = result.error ? t('notifications.testFailed', { name: channel.name, error: result.error }) : '';
+			if (!result.error) toast(t('toast.test', { name: channel.name }));
+			await load();
+		} catch (e) {
+			error = errorText(e);
+		}
+	}
+
+	async function remove() {
+		try {
+			await request('DELETE', `/notification-channels/${removing!.id}`);
+			toast(t('toast.deleted', { name: removing!.name }));
+			error = '';
+			await load();
+		} catch (e) {
+			error = errorText(e);
+		}
+	}
 </script>
 
-<ResourcePage
-	brandColumn={1}
-	title={t('nav.notifications')}
-	description={t('notifications.desc')}
-	addLabel={t('notifications.new')}
-	columns={[t('col.name'), t('col.type'), t('col.target'), t('col.events')]}
-	rows={channels.map((c) => ({ id: c.id, cells: [c.name, c.type, c.target, String(c.events)] }))}
-	testLabel={t('notifications.test')}
-	fields={[
-		{ label: t('col.name') },
-		...(type === 'Telegram'
-			? [{ label: 'Bot token', type: 'password' as const, help: t('help.secret') }, { label: 'Chat ID' }]
-			: [{ label: 'Incoming webhook URL', type: 'url' as const, help: t('help.secret') }])
-	]}
->
-	{#snippet before()}
-		<label class="mb-3 block text-sm font-medium">{t('col.type')}
-			<Select class="mt-1" bind:value={type} options={['Telegram', 'Mattermost'].map((v) => ({ value: v, label: v, brand: v }))} />
-		</label>
-		<fieldset class="mb-3 text-sm">
-			<legend class="mb-1 font-medium">{t('col.events')}</legend>
-			{#each ['event.backup', 'event.restore', 'event.agent', 'event.chain'] as const as event}
-				<label class="flex gap-2"><input type="checkbox" checked />{t(event)}</label>
-			{/each}
-		</fieldset>
+<PageHeader title={t('nav.notifications')} description={t('notifications.desc')}>
+	{#snippet actions()}{#if isAdmin()}<button type="button" class="btn btn-primary" onclick={open}>{t('notifications.new')}</button>{/if}{/snippet}
+</PageHeader>
+
+{#if !isAdmin()}
+	<p class="card text-sm">{t('error.forbidden')}</p>
+{:else}
+	<p class="mb-3 text-sm text-bad empty:hidden" role="alert">{error || loadError}</p>
+
+	<DataTable label={t('nav.notifications')} columns={[t('col.name'), t('col.type'), t('col.target'), t('col.events'), t('col.status'), t('col.actions')]} rows={channels}>
+		{#snippet cell(c, i)}
+			{#if i === 0}<strong>{c.name}</strong>
+			{:else if i === 1}<span class="inline-flex items-center gap-2"><BrandIcon name={names[c.kind]} />{names[c.kind]}</span>
+			{:else if i === 2}<code class="text-xs break-all">{c.target}</code>
+			{:else if i === 3}{c.events.map((e) => t(`event.${e as (typeof events)[number]}`)).join(', ')}
+			{:else if i === 4}
+				{#if c.last_error}<span class="text-bad">✕ {c.last_error}</span>
+				{:else if c.last_sent_at}<span class="text-ok">✓ {dateTime(c.last_sent_at)}</span>
+				{:else}<span class="text-dim">{t('notifications.never')}</span>{/if}
+			{:else}<span class="flex flex-wrap justify-end gap-1">
+				<button type="button" class="btn" onclick={() => test(c)}>{t('notifications.test')}</button>
+				<button type="button" class="btn btn-danger" onclick={() => { removing = c; confirm.open(); }}>{t('action.delete')}</button>
+			</span>{/if}
+		{/snippet}
+	</DataTable>
+{/if}
+
+<Modal bind:this={modal} title={t('notifications.new')}>
+	{#snippet children(close)}
+		<form onsubmit={(e) => { e.preventDefault(); create(close); }}>
+			<FormField label={t('col.name')}>{#snippet children(a)}<input {...a} class="input" maxlength="64" required bind:value={form.name} />{/snippet}</FormField>
+			<FormField label={t('col.type')}>{#snippet children(a)}<Select {...a} bind:value={form.kind} options={Object.entries(names).map(([value, label]) => ({ value, label, brand: label }))} />{/snippet}</FormField>
+			{#if form.kind === 'telegram'}
+				<FormField label="Bot token" help={t('help.secret')}>{#snippet children(a)}<PasswordInput {...a} autocomplete="new-password" required bind:value={form.bot_token} />{/snippet}</FormField>
+				<FormField label="Chat ID" help={t('help.chatId')}>{#snippet children(a)}<input {...a} class="input" maxlength="64" autocomplete="off" required bind:value={form.chat_id} />{/snippet}</FormField>
+			{:else}
+				<FormField label="Incoming webhook URL" help={t('help.secret')}>{#snippet children(a)}<PasswordInput {...a} autocomplete="new-password" required bind:value={form.webhook_url} />{/snippet}</FormField>
+			{/if}
+			<fieldset class="mb-3 text-sm">
+				<legend class="mb-1 font-medium">{t('col.events')}</legend>
+				{#each events as event}
+					<label class="flex items-center gap-2 py-1"><input type="checkbox" value={event} bind:group={form.events} />{t(`event.${event}`)}</label>
+				{/each}
+			</fieldset>
+			<p class="text-sm text-bad empty:hidden" role="alert">{formError}</p>
+			<div class="mt-4 flex justify-end gap-2">
+				<button type="button" class="btn" onclick={close}>{t('action.cancel')}</button>
+				<button type="submit" class="btn btn-primary">{t('action.save')}</button>
+			</div>
+		</form>
 	{/snippet}
-</ResourcePage>
+</Modal>
+
+<ConfirmDialog bind:this={confirm} title={t('action.delete')} message={t('confirm.delete', { name: removing?.name ?? '' })} confirmLabel={t('action.delete')} onconfirm={remove} />

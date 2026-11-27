@@ -8,7 +8,7 @@
 	let dialog: HTMLDialogElement;
 
 	export const open = () => dialog.showModal();
-	const close = () => dialog.close();
+	export const close = () => dialog.close();
 </script>
 
 <dialog bind:this={dialog} class="modal" aria-labelledby={id} {...{ closedby: 'closerequest' }}>

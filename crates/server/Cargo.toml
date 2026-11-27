@@ -9,6 +9,9 @@ argon2 = "0.6.0"
 axum = "0.8.9"
 axum-extra = { version = "0.12.6", features = ["cookie"] }
 chacha20poly1305 = "0.11.0"
+chrono = { version = "0.4", default-features = false }
+chrono-tz = "0.10"
+croner = "5"
 dbm-shared = { version = "0.1.0", path = "../shared" }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 getrandom = "0.4"

@@ -1,18 +1,39 @@
 <script lang="ts">
+	import { request } from '#lib/api/http.ts';
 	import { dateTime } from '#lib/format.ts';
 	import { locale, t } from '#lib/i18n/index.svelte.ts';
-	import { nextRuns, type Schedule } from '#lib/schedule.ts';
+	import { toCron, type Schedule } from '#lib/schedule.ts';
 
-	let { legend, value = $bindable() }: { legend: string; value: Schedule } = $props();
+	let { legend, value = $bindable(), timezone = $bindable() }: { legend: string; value: Schedule; timezone: string } = $props();
 	const id = $props.id();
-	const kinds: Schedule['kind'][] = ['hours', 'daily', 'weekly', 'monthly', 'yearly', 'cron'];
+	const kinds: Schedule['kind'][] = ['manual', 'hours', 'daily', 'weekly', 'monthly', 'yearly', 'cron'];
+	const zones = ['UTC', ...Intl.supportedValuesOf('timeZone')];
 	const names = (unit: 'weekday' | 'month') =>
 		Array.from({ length: unit === 'weekday' ? 7 : 12 }, (_, i) =>
-			new Intl.DateTimeFormat(locale.current, { [unit]: 'long' }).format(
-				unit === 'weekday' ? new Date(2026, 1, 1 + i) : new Date(2026, i, 1)
-			)
+			new Intl.DateTimeFormat(locale.current, { [unit]: 'long' }).format(unit === 'weekday' ? new Date(2026, 1, 1 + i) : new Date(2026, i, 1))
 		);
-	const preview = $derived(nextRuns(value));
+
+	// The server computes the preview, so it matches what will really run.
+	let runs = $state<string[]>([]);
+	let invalid = $state(false);
+	$effect(() => {
+		const pattern = toCron(value);
+		const query = pattern ? new URLSearchParams({ schedule: pattern, timezone }).toString() : '';
+		runs = [];
+		invalid = false;
+		if (!query) return;
+		let stale = false;
+		const timer = setTimeout(() => {
+			request<{ runs: string[] }>('GET', `/schedule/preview?${query}`).then(
+				(reply) => !stale && (runs = reply.runs),
+				() => !stale && (invalid = true)
+			);
+		}, 300);
+		return () => {
+			stale = true;
+			clearTimeout(timer);
+		};
+	});
 </script>
 
 <fieldset class="mb-4 rounded-lg border border-line p-3">
@@ -55,12 +76,19 @@
 		{/if}
 		{#if value.kind === 'cron'}
 			<label class="text-sm sm:col-span-2">{t('schedule.cron')}
-				<input class="input mt-1 font-mono" required bind:value={value.cron} aria-describedby="{id}-cron" />
+				<input class="input mt-1 font-mono" required autocapitalize="none" spellcheck="false" bind:value={value.cron} aria-describedby="{id}-cron" />
 				<span id="{id}-cron" class="text-xs text-dim">{t('schedule.cronHelp')}</span>
 			</label>
 		{/if}
+		{#if value.kind !== 'manual'}
+			<label class="text-sm">{t('schedule.timezone')}
+				<select class="input mt-1" bind:value={timezone}>
+					{#each zones as zone}<option value={zone}>{zone}</option>{/each}
+				</select>
+			</label>
+		{/if}
 	</div>
-	{#if preview.length}
-		<p class="mt-2 text-xs text-dim">{t('schedule.next')}: {preview.map((d) => dateTime(d.toISOString())).join(' · ')}</p>
-	{/if}
+	<p class="mt-2 text-xs text-dim empty:hidden" role="status">
+		{#if invalid}<span class="text-bad">{t('error.schedule')}</span>{:else if runs.length}{t('schedule.next')}: {runs.map(dateTime).join(' · ')}{/if}
+	</p>
 </fieldset>

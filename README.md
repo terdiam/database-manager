@@ -3,7 +3,7 @@
 Self-hosted database backup and restore with a web dashboard.
 Rust (server and agent), PostgreSQL and SvelteKit.
 
-Work in progress: PostgreSQL backup and restore to S3 work. Pages marked "sample data" show dummy content.
+Work in progress: PostgreSQL backup and restore to S3 work, by hand or on a schedule. Pages marked "sample data" show dummy content.
 
 ## Features
 
@@ -20,12 +20,13 @@ Done:
 - [x] Optional Cloudflare Turnstile on login
 - [x] HTTPS with Hanoey
 - [x] Indonesian and English UI, dark mode
-- [x] Dashboard (sample data)
+- [x] Schedules, and retention by days, months or GFS
+- [x] Live dashboard
+- [x] Telegram and Mattermost alerts
+- [x] Download backup files
 
 Planned:
 
-- [ ] Schedules and retention
-- [ ] Live dashboard and Telegram/Mattermost alerts
 - [ ] MySQL, MariaDB, MongoDB, SQLite
 - [ ] SSH tunnel; SFTP, FTP, Samba and Google Drive storage
 - [ ] Redis, Elasticsearch, OpenSearch
@@ -60,7 +61,8 @@ The agent connects to your database and storage, so use addresses it can reach
 
 ## Backups
 
-Add a database and an S3 destination, create a backup, then run it. Passwords are
+Add a database and an S3 destination, then create a backup with a schedule or run it by hand.
+A new retention setting applies to backups made after it. Passwords are
 encrypted in the browser for the agent, which needs `https` or `localhost`.
 
 Backup files are encrypted with [age](https://age-encryption.org). Download the keys from
@@ -93,6 +95,7 @@ All settings are in `.env`, see [.env.example](.env.example).
 | `DBM_TURNSTILE_SITE_KEY`, `DBM_TURNSTILE_SECRET_KEY` | Turnstile keys, leave empty to disable |
 | `DBM_TURNSTILE_HOSTNAMES` | Allowed hostnames, for example `localhost` |
 | `DBM_COOKIE_SECURE` | `false` only for plain HTTP on a trusted machine |
+| `DBM_ALLOW_UNSIGNED_RESTORE` | Agent: `true` to restore backups made before signing existed |
 
 ## Reset password
 

@@ -53,13 +53,13 @@
 	<Select class="w-56" aria-label={t('nav.databases')} bind:value={server} options={[{ value: '', label: t('filter.allServers'), icon: 'database' as const }, ...servers.map((s) => ({ value: s.name, label: s.name, brand: s.engine }))]} />
 </search>
 
-<DataTable label={t('nav.snapshots')} columns={[t('col.created'), t('col.source'), t('col.destination'), t('col.size'), t('wizard.compression'), t('col.actions')]} {rows}>
+<DataTable label={t('nav.snapshots')} columns={[t('col.created'), t('col.source'), t('col.destination'), t('col.size'), t('col.expires'), t('col.actions')]} {rows}>
 	{#snippet cell(s, i)}
 		{#if i === 0}<span class="whitespace-nowrap">{dateTime(s.created_at)}</span>
 		{:else if i === 1}<strong>{s.server_name}</strong> / {s.database_name}
 		{:else if i === 2}{s.destination}
 		{:else if i === 3}{bytes(s.size)}
-		{:else if i === 4}{s.compression}
+		{:else if i === 4}{s.expires_at ? dateTime(s.expires_at) : '-'}
 		{:else}<a class="btn" href={resolve(`snapshots/${s.id}`)}>{t('snapshots.open')}</a>{/if}
 	{/snippet}
 </DataTable>

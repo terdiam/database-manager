@@ -35,6 +35,18 @@ impl IntoResponse for Error {
     }
 }
 
+impl Error {
+    /// For the server's own logs.
+    pub fn detail(&self) -> &str {
+        match self {
+            Error::Invalid(code) | Error::Conflict(code) => code,
+            Error::Internal(detail) => detail,
+            Error::NotFound => "not found",
+            _ => "refused",
+        }
+    }
+}
+
 impl From<sqlx::Error> for Error {
     fn from(error: sqlx::Error) -> Self {
         if let sqlx::Error::Database(db) = &error {

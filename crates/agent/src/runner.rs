@@ -9,7 +9,7 @@ use dbm_shared::{
 use serde::de::DeserializeOwned;
 use tokio::{runtime::Handle, task};
 
-use crate::{Result, pipeline, postgres, progress::Progress, state::State, storage};
+use crate::{Result, manifest, pipeline, postgres, progress::Progress, state::State, storage};
 
 /// Opens a secret sealed to this agent. A server cannot read it, and cannot move it
 /// to another record without the check failing.
@@ -40,20 +40,32 @@ fn text(error: Box<dyn std::error::Error>) -> String {
     error.to_string()
 }
 
-/// Returns the SHA-256 of the stored file for backups.
-pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Option<String>> {
+/// What a successful job hands back to the server.
+#[derive(Default)]
+pub struct Output {
+    pub sha256: Option<String>,
+    pub manifest: Option<String>,
+    pub result: Option<String>,
+}
+
+/// Old snapshots carry no signature; restoring one has to be allowed on the agent itself.
+fn unsigned_allowed() -> bool {
+    std::env::var("DBM_ALLOW_UNSIGNED_RESTORE").is_ok_and(|v| v == "true" || v == "1")
+}
+
+pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> {
     match job.task {
         Task::TestDatabase { database } => {
             let secret: DatabaseSecret = open_json(state, &database, "database")?;
             let version = blocking(move || postgres::server_version(&secret).map_err(text)).await?;
             progress.log("ok", format!("connected, PostgreSQL {version}"));
-            Ok(None)
+            Ok(Output::default())
         }
         Task::TestDestination { destination } => {
             let secret: S3Secret = open_json(state, &destination, "destination")?;
             storage::test(&storage::open(&secret)?).await?;
             progress.log("ok", "wrote, read and deleted a test file");
-            Ok(None)
+            Ok(Output::default())
         }
         Task::Backup {
             database,
@@ -68,6 +80,7 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Option<S
             let destination: S3Secret = open_json(state, &destination, "destination")?;
             let operator = storage::open(&destination)?;
             progress.log("info", format!("dumping {name}, compression {compression}"));
+            let method = compression.clone();
 
             let mut writer = storage::Upload::start(&operator, &object_key).await?;
             let handle = Handle::current();
@@ -92,7 +105,11 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Option<S
             match result {
                 Ok(sha256) => {
                     progress.log("ok", format!("stored {object_key}"));
-                    Ok(Some(sha256))
+                    Ok(Output {
+                        manifest: Some(manifest::sign(state, &object_key, &sha256, &method)?),
+                        sha256: Some(sha256),
+                        result: None,
+                    })
                 }
                 Err(error) => {
                     let mut writer = writer;
@@ -112,9 +129,23 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Option<S
             identity,
             object_key,
             sha256,
+            manifest,
             compression,
             name,
         } => {
+            // Checked before anything is downloaded or touched.
+            match &manifest {
+                Some(tag) => {
+                    manifest::verify(state, &object_key, &sha256, &compression, tag)?;
+                    progress.log("ok", "backup signature verified");
+                }
+                None if unsigned_allowed() => {
+                    progress.log("warn", "restoring a backup without a signature");
+                }
+                None => {
+                    return Err("this backup has no signature: set DBM_ALLOW_UNSIGNED_RESTORE=true on the agent to restore it".into());
+                }
+            }
             let database: DatabaseSecret = open_json(state, &database, "database")?;
             let destination: S3Secret = open_json(state, &destination, "destination")?;
             let identity = String::from_utf8(open(state, &identity, "backup-key")?)?;
@@ -142,7 +173,7 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Option<S
             })
             .await?;
             progress.log("ok", "restore completed");
-            Ok(None)
+            Ok(Output::default())
         }
         Task::DeleteSnapshot {
             destination,
@@ -151,7 +182,19 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Option<S
             let secret: S3Secret = open_json(state, &destination, "destination")?;
             storage::open(&secret)?.delete(&object_key).await?;
             progress.log("ok", format!("deleted {object_key}"));
-            Ok(None)
+            Ok(Output::default())
+        }
+        Task::PresignSnapshot {
+            destination,
+            object_key,
+        } => {
+            let secret: S3Secret = open_json(state, &destination, "destination")?;
+            let link = storage::link(&secret, &object_key).await?;
+            progress.log("ok", "download link created, valid for 5 minutes");
+            Ok(Output {
+                result: Some(link),
+                ..Output::default()
+            })
         }
     }
 }

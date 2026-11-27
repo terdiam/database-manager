@@ -1,6 +1,7 @@
 import { goto } from '$app/navigation';
 import { resolve } from '$app/paths';
 import { CONTENT_TYPE, HEADER, STREAM_CONTENT_TYPE, sealRequest, type Sealed } from '../e2ee.ts';
+import type { Plan } from '../schedule.ts';
 
 /** `code` matches the server's error codes and is translated as `error.<code>`. */
 export class ApiError extends Error {
@@ -138,11 +139,21 @@ export type AuditPage = { items: AuditEntry[]; next: number | null };
 
 export type DbServer = { id: string; name: string; engine: 'postgresql'; agent_id: string; agent: string; host: string; port: number; username: string };
 export type Destination = { id: string; name: string; kind: 's3'; agent_id: string; agent: string; endpoint: string; bucket: string; prefix: string };
-export type Backup = { id: string; name: string; server_id: string; server: string; database_name: string; destination_id: string; destination: string; compression: string; level: number };
-export type Snapshot = { id: string; server_name: string; database_name: string; destination: string; agent_id: string; object_key: string; size: number; sha256: string; compression: string; created_at: string };
-export type JobKind = 'backup' | 'restore' | 'test_database' | 'test_destination' | 'delete_snapshot';
+export type Channel = { id: string; name: string; kind: 'telegram' | 'mattermost'; target: string; events: string[]; last_error: string | null; last_sent_at: string | null };
+export type Backup = Plan & { id: string; name: string; server_id: string; server: string; database_name: string; destination_id: string; destination: string; compression: string; level: number; next_run_at: string | null };
+export type Snapshot = { id: string; server_name: string; database_name: string; destination: string; agent_id: string; object_key: string; size: number; sha256: string; compression: string; created_at: string; expires_at: string | null };
+export type JobKind = 'backup' | 'restore' | 'test_database' | 'test_destination' | 'delete_snapshot' | 'presign_snapshot';
 export type JobStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
 export type Job = { id: string; kind: JobKind; status: JobStatus; target: string; agent: string; bytes: number; error: string | null; created_by: string; cancel_requested: boolean; created_at: string; started_at: string | null; finished_at: string | null };
 export type JobLine = { id: number; level: string; message: string };
 export type Page<T> = { items: T[]; next: string | null };
 export type Queued = { job_id: string };
+export type Dashboard = {
+	completed_24h: number;
+	failed_24h: number;
+	activity: { day: string; completed: number; failed: number }[];
+	volumes: { name: string; bytes: number }[];
+	agents: { name: string; online: boolean }[];
+	jobs: { id: string; kind: JobKind; status: JobStatus; target: string; bytes: number; created_at: string }[];
+	failing: { name: string; error: string | null }[];
+};

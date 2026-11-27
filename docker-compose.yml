@@ -47,6 +47,7 @@ services:
       DBM_ALLOW_INSECURE: "true" # private compose network only
       DBM_ENROLL_TOKEN: ${DBM_ENROLL_TOKEN:-}
       DBM_SERVER_FINGERPRINT: ${DBM_SERVER_FINGERPRINT:-}
+      DBM_ALLOW_UNSIGNED_RESTORE: ${DBM_ALLOW_UNSIGNED_RESTORE:-false}
     volumes:
       - agent:/data
     depends_on: [server]

@@ -1,27 +1,32 @@
 <script lang="ts">
 	import SplitTitle from '#lib/components/SplitTitle.svelte';
 	import { resolve } from '$app/paths';
-	import { jobHistory, type Status } from '#lib/api/index.ts';
+	import type { Status } from '#lib/api/index.ts';
+	import type { Dashboard } from '#lib/api/http.ts';
 	import { dateTime } from '#lib/format.ts';
 	import { t } from '#lib/i18n/index.svelte.ts';
+
+	/** Oldest first. */
+	let { jobs }: { jobs: Dashboard['jobs'] } = $props();
 
 	// Symbol + color: status never depends on color alone.
 	const look: Partial<Record<Status, [string, string]>> = {
 		completed: ['bg-ok', ''],
 		failed: ['bg-bad', '✕'],
 		running: ['bg-brand', '▶'],
-		pending: ['bg-warn', '…']
+		pending: ['bg-warn', '…'],
+		cancelled: ['bg-dim', '–']
 	};
 	const statuses = Object.keys(look) as Status[];
-	const count = (status: Status) => jobHistory.filter((j) => j.status === status).length;
+	const count = (status: Status) => jobs.filter((j) => j.status === status).length;
 </script>
 
 <section class="card">
 	<SplitTitle text={t('dashboard.jobStatus')} class="font-semibold" />
-	<p class="mb-3 text-xs text-dim">{t('dashboard.jobStatusHint', { n: jobHistory.length })}</p>
+	<p class="mb-3 text-xs text-dim">{t('dashboard.jobStatusHint', { n: jobs.length })}</p>
 	<ul class="grid grid-cols-[repeat(auto-fill,minmax(1.5rem,1fr))] gap-0.5">
-		{#each jobHistory as job (job.id)}
-			{@const label = `${job.id} · ${job.target} · ${t(`status.${job.status}`)} · ${dateTime(job.started)}`}
+		{#each jobs as job (job.id)}
+			{@const label = `${t(`job.${job.kind}`)} · ${job.target} · ${t(`status.${job.status}`)} · ${dateTime(job.created_at)}`}
 			<li>
 				<a href={resolve('jobs')} title={label} aria-label={label} class="grid aspect-square min-h-6 place-items-center rounded text-[0.65rem] font-bold text-surface hover:ring-2 hover:ring-ink {look[job.status]![0]}">
 					<span aria-hidden="true">{look[job.status]![1]}</span>
