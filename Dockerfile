@@ -24,13 +24,25 @@ ENV DBM_LISTEN=0.0.0.0:8080
 EXPOSE 8080
 CMD ["dbm-server"]
 
-# The agent needs the PostgreSQL client tools: pg_dump must be at least as new as the
+# Client tools come from each vendor's own image.
+FROM mysql:8.4 AS mysql-tools
+FROM mongo:8.0 AS mongo-tools
+
+# The agent needs the database client tools: a dump tool must be at least as new as the
 # databases it backs up.
 FROM postgres:19-bookworm AS agent
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates mariadb-client sqlite3 libncurses6 libgssapi-krb5-2 \
+    && rm -rf /var/lib/apt/lists/*
+# MySQL's own tools in /usr/local/bin come before MariaDB's compatibility names.
+COPY --from=mysql-tools /usr/bin/mysql /usr/bin/mysqldump /usr/local/bin/
+COPY --from=mongo-tools /usr/bin/mongodump /usr/bin/mongorestore /usr/local/bin/
+# Fails the build if a copied tool cannot start here.
+RUN mysql --version && mysqldump --version && mongodump --version && mongorestore --version \
+    && mariadb-dump --version && sqlite3 --version
 RUN useradd --system --uid 10001 dbm
 COPY --from=build /app/target/release/dbm-agent /usr/local/bin/
-RUN mkdir /data && chown dbm /data
+RUN mkdir /data /sqlite && chown dbm /data /sqlite
 USER dbm
 ENV DBM_STATE_FILE=/data/agent-state
 ENTRYPOINT []

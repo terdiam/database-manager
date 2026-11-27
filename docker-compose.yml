@@ -48,8 +48,11 @@ services:
       DBM_ENROLL_TOKEN: ${DBM_ENROLL_TOKEN:-}
       DBM_SERVER_FINGERPRINT: ${DBM_SERVER_FINGERPRINT:-}
       DBM_ALLOW_UNSIGNED_RESTORE: ${DBM_ALLOW_UNSIGNED_RESTORE:-false}
+      DBM_SQLITE_ROOT: /sqlite
     volumes:
       - agent:/data
+      # SQLite files the agent may back up and restore; a host folder or the named volume.
+      - ${DBM_SQLITE_DIR:-sqlite}:/sqlite
     depends_on: [server]
     restart: on-failure
 
@@ -76,4 +79,5 @@ services:
 volumes:
   db:
   agent:
+  sqlite:
   hanoey:

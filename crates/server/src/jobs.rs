@@ -295,9 +295,10 @@ async fn task(app: &AppState, agent: Uuid, job: &Claimed) -> Result<Task, Error>
             object_key: job.object_key.clone().ok_or_else(missing)?,
         },
         "restore" => {
-            let (sha256, compression, key_id, manifest): (String, String, i32, Option<String>) =
-                sqlx::query_as(
-                    "SELECT sha256, compression, key_id, manifest FROM snapshots WHERE id = $1",
+            let (sha256, compression, key_id, manifest, source): (
+                String, String, i32, Option<String>, String,
+            ) = sqlx::query_as(
+                    "SELECT sha256, compression, key_id, manifest, database_name FROM snapshots WHERE id = $1",
                 )
                 .bind(job.snapshot_id.ok_or_else(missing)?)
                 .fetch_optional(&app.db)
@@ -312,6 +313,7 @@ async fn task(app: &AppState, agent: Uuid, job: &Claimed) -> Result<Task, Error>
                 manifest,
                 compression,
                 name: job.database_name.clone().ok_or_else(missing)?,
+                source,
             }
         }
         "test_database" => Task::TestDatabase {
@@ -448,14 +450,16 @@ pub async fn finish(
         let manifest = body.manifest.as_deref().filter(|m| m.len() <= 128);
         sqlx::query(
             "INSERT INTO snapshots (job_id, backup_config_id, server_name, database_name, destination_id,
-                                    object_key, size, sha256, compression, key_id, manifest, expires_at)
+                                    object_key, size, sha256, compression, key_id, manifest, expires_at, engine)
              SELECT j.id, j.backup_config_id, j.target, j.database_name, j.destination_id, j.object_key,
                     j.bytes, $2, j.compression, j.key_id, $3,
                     CASE c.retention_unit
                         WHEN 'days' THEN now() + make_interval(days => c.retention_value)
                         WHEN 'months' THEN now() + make_interval(months => c.retention_value)
-                    END
-             FROM jobs j LEFT JOIN backup_configs c ON c.id = j.backup_config_id WHERE j.id = $1",
+                    END,
+                    coalesce(s.engine, 'postgresql')
+             FROM jobs j LEFT JOIN backup_configs c ON c.id = j.backup_config_id
+             LEFT JOIN database_servers s ON s.id = j.server_id WHERE j.id = $1",
         )
         .bind(body.id)
         .bind(sha256)

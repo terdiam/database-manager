@@ -3,7 +3,7 @@
 Self-hosted database backup and restore with a web dashboard.
 Rust (server and agent), PostgreSQL and SvelteKit.
 
-Work in progress: PostgreSQL backup and restore to S3 work, by hand or on a schedule. Pages marked "sample data" show dummy content.
+Work in progress: PostgreSQL, MySQL, MariaDB, MongoDB and SQLite backup and restore to S3 work, by hand or on a schedule. Pages marked "sample data" show dummy content.
 
 ## Features
 
@@ -12,7 +12,7 @@ Done:
 - [x] Login with roles (admin, operator, viewer)
 - [x] Audit log
 - [x] Agents with one-time enrollment
-- [x] PostgreSQL backup and restore to S3 or MinIO
+- [x] PostgreSQL, MySQL, MariaDB, MongoDB and SQLite backup and restore to S3 or MinIO
 - [x] Compressed and encrypted backup files
 - [x] Live job logs
 - [x] Encrypted API payloads, can be turned off
@@ -28,7 +28,6 @@ Done:
 
 Planned:
 
-- [ ] MySQL, MariaDB, MongoDB, SQLite
 - [ ] SSH tunnel; SFTP, FTP, Samba and Google Drive storage
 - [ ] Redis, Elasticsearch, OpenSearch
 - [ ] Incremental backups
@@ -59,6 +58,13 @@ DBM_ENROLL_TOKEN=<token> docker compose --profile agent up -d --build agent
 
 The agent connects to your database and storage, so use addresses it can reach
 (`host.docker.internal` for something running on the Docker host).
+
+## SQLite
+
+The agent only touches files inside its `DBM_SQLITE_ROOT` (`/sqlite` in Docker). Set
+`DBM_SQLITE_DIR` to a host folder writable by uid 10001, or use the Docker volume. Add the
+database with the folder below that root, then use the file name as the database name.
+Stop the application that uses a file before restoring over it.
 
 ## Backups
 
@@ -96,6 +102,7 @@ All settings are in `.env`, see [.env.example](.env.example).
 | `DBM_TURNSTILE_SITE_KEY`, `DBM_TURNSTILE_SECRET_KEY` | Turnstile keys, leave empty to disable |
 | `DBM_TURNSTILE_HOSTNAMES` | Allowed hostnames, for example `localhost` |
 | `DBM_COOKIE_SECURE` | `false` only for plain HTTP on a trusted machine |
+| `DBM_SQLITE_DIR` | Host folder with SQLite files for the agent |
 | `DBM_ALLOW_UNSIGNED_RESTORE` | Agent: `true` to restore backups made before signing existed |
 
 ## Reset password

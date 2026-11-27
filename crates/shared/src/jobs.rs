@@ -23,6 +23,29 @@ pub fn extension(compression: &str) -> &'static str {
     }
 }
 
+pub const ENGINES: [&str; 5] = ["postgresql", "mysql", "mariadb", "mongodb", "sqlite"];
+
+/// What a dump of `engine` is, before compression and encryption.
+pub fn dump_extension(engine: &str) -> &'static str {
+    match engine {
+        "mysql" | "mariadb" | "sqlite" => ".sql",
+        "mongodb" => ".archive",
+        _ => ".dump",
+    }
+}
+
+/// A database name, or for SQLite a file name: it may carry an extension but no path.
+pub fn valid_target(engine: &str, name: &str) -> bool {
+    if engine != "sqlite" {
+        return valid_database_name(name);
+    }
+    (1..=63).contains(&name.len())
+        && !name.starts_with(['-', '.'])
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
 /// Deliberately narrow: names reach `pg_restore -d`, which would read `a=b` or a URL
 /// as a connection string.
 pub fn valid_database_name(name: &str) -> bool {
@@ -34,13 +57,21 @@ pub fn valid_database_name(name: &str) -> bool {
 }
 
 /// Plaintext of a sealed database secret. The browser builds the same JSON.
+/// For SQLite, `host` is a folder below the agent's `DBM_SQLITE_ROOT`.
 #[derive(Serialize, Deserialize)]
 pub struct DatabaseSecret {
+    /// Sealed with the rest, so the server cannot make the agent treat it as another engine.
+    #[serde(default = "postgresql")]
+    pub engine: String,
     pub host: String,
     pub port: u16,
     pub username: String,
     pub password: String,
     pub ssl_mode: String,
+}
+
+fn postgresql() -> String {
+    "postgresql".into()
 }
 
 /// Plaintext of a sealed S3 destination secret.
@@ -91,6 +122,9 @@ pub enum Task {
         manifest: Option<String>,
         compression: String,
         name: String,
+        /// The database the backup was taken from.
+        #[serde(default)]
+        source: String,
     },
     TestDatabase {
         database: Sealed,
@@ -161,7 +195,16 @@ pub struct Finish {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_database_name;
+    use super::{valid_database_name, valid_target};
+
+    #[test]
+    fn sqlite_targets_are_file_names_only() {
+        assert!(valid_target("sqlite", "app.db"));
+        assert!(!valid_target("mysql", "app.db"));
+        for bad in ["", ".env", "..", "a/b.db", "../x", "-readonly", "a b"] {
+            assert!(!valid_target("sqlite", bad), "{bad}");
+        }
+    }
 
     #[test]
     fn database_names_cannot_smuggle_options_or_connection_strings() {

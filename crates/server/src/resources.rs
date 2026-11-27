@@ -5,7 +5,10 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
 };
-use dbm_shared::{e2ee, jobs::COMPRESSIONS, jobs::valid_database_name};
+use dbm_shared::{
+    e2ee,
+    jobs::{COMPRESSIONS, ENGINES, valid_target},
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -85,12 +88,18 @@ pub struct NewServer {
     id: Uuid,
     name: String,
     agent_id: Uuid,
+    #[serde(default = "postgresql")]
+    engine: String,
     host: String,
     port: u16,
     username: String,
     #[serde(default)]
     ssl_mode: Option<String>,
     secret: String,
+}
+
+fn postgresql() -> String {
+    "postgresql".into()
 }
 
 pub async fn create_server(
@@ -103,11 +112,14 @@ pub async fn create_server(
     let name = named(&body.name, "name")?;
     field(&body.host, "host")?;
     field(&body.username, "username")?;
+    if !ENGINES.contains(&body.engine.as_str()) {
+        return Err(Error::Invalid("engine"));
+    }
     let secret = sealed_bytes(&body.secret)?;
     require_agent_key(&app, body.agent_id).await?;
     sqlx::query(
         "INSERT INTO database_servers (id, name, engine, agent_id, host, port, username, secret, ssl_mode)
-         VALUES ($1, $2, 'postgresql', $3, $4, $5, $6, $7, $8)",
+         VALUES ($1, $2, $9, $3, $4, $5, $6, $7, $8)",
     )
     .bind(body.id)
     .bind(&name)
@@ -117,6 +129,7 @@ pub async fn create_server(
     .bind(body.username.trim())
     .bind(secret)
     .bind(ssl_mode(body.ssl_mode.as_deref())?)
+    .bind(&body.engine)
     .execute(&app.db)
     .await?;
     audit::record(
@@ -600,7 +613,12 @@ pub struct NewBackup {
 /// The rules a backup entry must meet, new or edited.
 async fn check_backup(app: &AppState, body: &NewBackup) -> Result<(String, Planned), Error> {
     let name = named(&body.name, "name")?;
-    if !valid_database_name(&body.database_name) {
+    let engine: String = sqlx::query_scalar("SELECT engine FROM database_servers WHERE id = $1")
+        .bind(body.server_id)
+        .fetch_optional(&app.db)
+        .await?
+        .ok_or(Error::NotFound)?;
+    if !valid_target(&engine, &body.database_name) {
         return Err(Error::Invalid("database_name"));
     }
     let max_level = if body.compression == "zstd" { 19 } else { 9 };

@@ -3,13 +3,13 @@
 	import { onMount } from 'svelte';
 	import { resolve } from '$app/paths';
 	import { request, type Agent, type DbServer, type Queued } from '#lib/api/http.ts';
+	import { connectionOf, engines } from '#lib/api/index.ts';
 	import BrandIcon from '#lib/components/BrandIcon.svelte';
 	import ConfirmDialog from '#lib/components/ConfirmDialog.svelte';
+	import ConnectionFields from '#lib/components/ConnectionFields.svelte';
 	import DataTable from '#lib/components/DataTable.svelte';
 	import FormField from '#lib/components/FormField.svelte';
 	import Modal from '#lib/components/Modal.svelte';
-	import PasswordInput from '#lib/components/PasswordInput.svelte';
-	import Select from '#lib/components/Select.svelte';
 	import JobDialog from '#lib/components/JobDialog.svelte';
 	import PageHeader from '#lib/components/PageHeader.svelte';
 	import { toast } from '#lib/components/toast.svelte.ts';
@@ -46,11 +46,17 @@
 	}
 
 	async function save(close: () => void) {
-		const { name, reconnect, host, port, username, password, ssl_mode } = form;
-		const id = editing!.id;
+		const { name, reconnect } = form;
+		const { id, engine } = editing!;
 		try {
 			// Sealed to the same record id: host, user and password travel together.
-			const connection = reconnect ? { host, port, username, ssl_mode, secret: await sealFor(agent, 'database', id, { host: host.trim(), port, username, password, ssl_mode }) } : undefined;
+			let connection;
+			if (reconnect) {
+				const values = connectionOf(engine, form);
+				const secret = await sealFor(agent, 'database', id, { engine, ...values });
+				const { host, port, username, ssl_mode } = values;
+				connection = { host, port, username, ssl_mode, secret };
+			}
 			await request('PUT', `/database-servers/${id}`, { name, connection });
 			close();
 			form.password = '';
@@ -108,8 +114,8 @@
 <DataTable label={t('nav.databases')} columns={[t('col.name'), t('col.engine'), t('col.address'), 'User', t('col.via'), ...(canOperate() ? [t('col.actions')] : [])]} {rows}>
 	{#snippet cell(server, i)}
 		{#if i === 0}<strong>{server.name}</strong>
-		{:else if i === 1}<span class="inline-flex items-center gap-2"><BrandIcon name={server.engine} />PostgreSQL</span>
-		{:else if i === 2}<code class="text-xs">{server.host}:{server.port}</code>
+		{:else if i === 1}<span class="inline-flex items-center gap-2"><BrandIcon name={server.engine} />{engines[server.engine].label}</span>
+		{:else if i === 2}<code class="text-xs">{server.engine === 'sqlite' ? `/${server.host}` : `${server.host}:${server.port}`}</code>
 		{:else if i === 3}{server.username}
 		{:else if i === 4}{server.agent}
 		{:else}<span class="flex flex-wrap justify-end gap-1">
@@ -126,17 +132,7 @@
 			<FormField label={t('col.name')}>{#snippet children(a)}<input {...a} class="input" maxlength="64" required bind:value={form.name} />{/snippet}</FormField>
 			<label class="mb-1 flex items-center gap-2 text-sm font-medium"><input type="checkbox" bind:checked={form.reconnect} />{t('field.changeConnection')}</label>
 			<p class="mb-3 text-xs text-dim">{t('help.changeConnection', { agent: editing?.agent ?? '' })}</p>
-			{#if form.reconnect}
-				<div class="grid gap-x-3 sm:grid-cols-[1fr_8rem]">
-					<FormField label="Host" help={t('help.host')}>{#snippet children(a)}<input {...a} class="input" maxlength="255" required bind:value={form.host} />{/snippet}</FormField>
-					<FormField label="Port">{#snippet children(a)}<input {...a} class="input" type="number" min="1" max="65535" required bind:value={form.port} />{/snippet}</FormField>
-				</div>
-				<div class="grid gap-x-3 sm:grid-cols-2">
-					<FormField label="Username">{#snippet children(a)}<input {...a} class="input" maxlength="255" autocomplete="off" required bind:value={form.username} />{/snippet}</FormField>
-					<FormField label="Password" help={t('help.sealed')}>{#snippet children(a)}<PasswordInput {...a} autocomplete="new-password" bind:value={form.password} />{/snippet}</FormField>
-				</div>
-				<FormField label="SSL mode">{#snippet children(a)}<Select {...a} required placeholder={t('field.choose')} bind:value={form.ssl_mode} options={['disable', 'prefer', 'require', 'verify-full'].map((v) => ({ value: v, label: v }))} />{/snippet}</FormField>
-			{/if}
+			{#if form.reconnect && editing}<ConnectionFields engine={editing.engine} bind:form />{/if}
 			<p class="text-sm text-bad empty:hidden" role="alert">{formError}</p>
 			<div class="mt-4 flex justify-end gap-2">
 				<button type="button" class="btn" onclick={close}>{t('action.cancel')}</button>

@@ -1846,3 +1846,117 @@ async fn everything_configured_can_be_edited_by_the_right_role(db: PgPool) {
         10
     );
 }
+
+// ---------------------------------------------------------------- engines
+
+#[sqlx::test]
+async fn a_backup_only_restores_into_its_own_engine(db: PgPool) {
+    let app = router(db.clone());
+    let cookie = admin(&app).await;
+    let agent = enroll(&app, &cookie, "a1").await;
+    let (pg, destination, _) = add_resources(&app, &cookie, &agent).await;
+    let add = |name: &str, engine: &str| {
+        let id = uuid::Uuid::new_v4().to_string();
+        let body = json!({ "id": id, "name": name, "engine": engine, "agent_id": agent.id, "host": "", "port": 0,
+            "username": "", "secret": sealed_for(&agent, &id, "database", "{}") });
+        (id, body)
+    };
+    let (_, bad) = add("x", "oracle");
+    let reply = call(
+        &app,
+        "POST",
+        "/api/database-servers",
+        Some(&cookie),
+        Some(bad),
+    )
+    .await;
+    assert_eq!(reply.body["error"], "engine");
+    let (lite, body) = add("files", "sqlite");
+    let reply = call(
+        &app,
+        "POST",
+        "/api/database-servers",
+        Some(&cookie),
+        Some(body),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::CREATED);
+
+    // A file name may carry an extension; a database name may not.
+    let entry = |name: &str, server: &str, database: &str| {
+        json!({ "name": name, "server_id": server, "database_name": database, "destination_id": destination,
+            "compression": "gzip", "level": 3 })
+    };
+    let reply = call(
+        &app,
+        "POST",
+        "/api/backups",
+        Some(&cookie),
+        Some(entry("p", &pg, "app.db")),
+    )
+    .await;
+    assert_eq!(reply.body["error"], "database_name");
+    for escaping in ["../app.db", ".env"] {
+        let reply = call(
+            &app,
+            "POST",
+            "/api/backups",
+            Some(&cookie),
+            Some(entry("e", &lite, escaping)),
+        )
+        .await;
+        assert_eq!(reply.body["error"], "database_name", "{escaping}");
+    }
+    let reply = call(
+        &app,
+        "POST",
+        "/api/backups",
+        Some(&cookie),
+        Some(entry("l", &lite, "app.db")),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::CREATED);
+
+    let backups = call(&app, "GET", "/api/backups", Some(&cookie), None).await;
+    let id = backups
+        .body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["name"] == "l")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    call(
+        &app,
+        "POST",
+        &format!("/api/backups/{id}/run"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    let job = finish_next(&app, &agent, json!({})).await;
+    assert!(
+        job["task"]["object_key"]
+            .as_str()
+            .unwrap()
+            .ends_with(".sql.gz.age")
+    );
+    let snapshots = call(&app, "GET", "/api/snapshots", Some(&cookie), None).await;
+    let snapshot = &snapshots.body["items"][0];
+    assert_eq!(snapshot["engine"], "sqlite");
+
+    let restore = format!(
+        "/api/snapshots/{}/restore",
+        snapshot["id"].as_str().unwrap()
+    );
+    let other = json!({ "server_id": pg, "database_name": "shop" });
+    let reply = call(&app, "POST", &restore, Some(&cookie), Some(other)).await;
+    assert_eq!(reply.body["error"], "different_engine");
+    let same = json!({ "server_id": lite, "database_name": "copy.db" });
+    let reply = call(&app, "POST", &restore, Some(&cookie), Some(same)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let claimed = as_agent(&app, &agent, "/api/agent/jobs/claim", json!({})).await;
+    assert_eq!(claimed.body["job"]["task"]["source"], "app.db");
+}

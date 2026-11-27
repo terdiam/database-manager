@@ -1,0 +1,467 @@
+//! The client tools of each database engine. Passwords travel in the environment or a
+//! private file: never on the command line, and tools never see the agent's variables.
+
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
+
+use dbm_shared::jobs::{DatabaseSecret, valid_target};
+use tempfile::{NamedTempFile, TempPath};
+
+use crate::Result;
+
+/// A command ready to run, and what has to live or happen around it.
+pub struct Tool {
+    pub command: Command,
+    pub name: &'static str,
+    /// Removed when the tool is done with it.
+    _secret_file: Option<NamedTempFile>,
+    /// SQLite restores into a new file that replaces the target only on success.
+    replace: Option<(TempPath, PathBuf)>,
+}
+
+impl Tool {
+    fn new(command: Command, name: &'static str) -> Self {
+        Self {
+            command,
+            name,
+            _secret_file: None,
+            replace: None,
+        }
+    }
+
+    /// Puts a restored SQLite file in place. Nothing to do for servers.
+    pub fn commit(replace: Option<(TempPath, PathBuf)>) -> Result<()> {
+        if let Some((new, target)) = replace {
+            // Journals of the old file would be applied to the new one.
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let mut stale = target.clone().into_os_string();
+                stale.push(suffix);
+                let _ = std::fs::remove_file(stale);
+            }
+            new.persist(target).map_err(|e| e.error)?;
+        }
+        Ok(())
+    }
+
+    pub fn take_replace(&mut self) -> Option<(TempPath, PathBuf)> {
+        self.replace.take()
+    }
+}
+
+fn quiet(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+/// Runs a short command and returns what it printed.
+fn output(mut command: Command, name: &str) -> Result<String> {
+    let output = command
+        .output()
+        .map_err(|e| format!("cannot run {name}: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn checked<'a>(secret: &DatabaseSecret, name: &'a str) -> Result<&'a str> {
+    if valid_target(&secret.engine, name) {
+        Ok(name)
+    } else {
+        Err("invalid database name".into())
+    }
+}
+
+// ---------------------------------------------------------------- PostgreSQL
+
+const SSL_MODES: [&str; 6] = [
+    "disable",
+    "allow",
+    "prefer",
+    "require",
+    "verify-ca",
+    "verify-full",
+];
+
+fn postgres(program: &str, secret: &DatabaseSecret, database: &str) -> Result<Command> {
+    if !SSL_MODES.contains(&secret.ssl_mode.as_str()) {
+        return Err("unknown ssl mode".into());
+    }
+    let mut command = quiet(program);
+    command
+        .env("PGHOST", &secret.host)
+        .env("PGPORT", secret.port.to_string())
+        .env("PGUSER", &secret.username)
+        .env("PGPASSWORD", &secret.password)
+        .env("PGSSLMODE", &secret.ssl_mode)
+        .env("PGDATABASE", database)
+        .env("PGCONNECT_TIMEOUT", "10")
+        .arg("--no-password");
+    Ok(command)
+}
+
+fn psql(secret: &DatabaseSecret, sql: &str) -> Result<String> {
+    let mut command = postgres("psql", secret, "postgres")?;
+    command.args([
+        "--no-psqlrc",
+        "--tuples-only",
+        "--no-align",
+        "--command",
+        sql,
+    ]);
+    output(command, "psql")
+}
+
+// ---------------------------------------------------------------- MySQL and MariaDB
+
+/// Oracle's tools for MySQL, MariaDB's for MariaDB: their options and dumps differ.
+fn mysql(program: &str, secret: &DatabaseSecret) -> Result<Command> {
+    let maria = secret.engine == "mariadb";
+    let ssl: &[&str] = match (secret.ssl_mode.as_str(), maria) {
+        ("disable", false) => &["--ssl-mode=DISABLED"],
+        ("allow" | "prefer", false) => &["--ssl-mode=PREFERRED"],
+        ("require", false) => &["--ssl-mode=REQUIRED"],
+        ("verify-ca", false) => &["--ssl-mode=VERIFY_CA"],
+        ("verify-full", false) => &["--ssl-mode=VERIFY_IDENTITY"],
+        ("disable", true) => &["--skip-ssl"],
+        ("allow" | "prefer", true) => &["--skip-ssl-verify-server-cert"],
+        ("require", true) => &["--ssl", "--skip-ssl-verify-server-cert"],
+        ("verify-ca" | "verify-full", true) => &["--ssl", "--ssl-verify-server-cert"],
+        _ => return Err("unknown ssl mode".into()),
+    };
+    // A value starting with '-' would be read as an option.
+    if secret.host.starts_with('-') || secret.username.starts_with('-') {
+        return Err("invalid host or user name".into());
+    }
+    let mut command = quiet(program);
+    command
+        .env("MYSQL_PWD", &secret.password)
+        // Must come first: no option file of the host is read.
+        .arg("--no-defaults")
+        .arg(format!("--host={}", secret.host))
+        .arg(format!("--port={}", secret.port))
+        .arg(format!("--user={}", secret.username))
+        .arg("--protocol=TCP")
+        .args(ssl);
+    Ok(command)
+}
+
+fn mysql_programs(secret: &DatabaseSecret) -> (&'static str, &'static str) {
+    if secret.engine == "mariadb" {
+        ("mariadb", "mariadb-dump")
+    } else {
+        ("mysql", "mysqldump")
+    }
+}
+
+fn mysql_query(secret: &DatabaseSecret, sql: &str) -> Result<String> {
+    let (client, _) = mysql_programs(secret);
+    let mut command = mysql(client, secret)?;
+    command.args([
+        "--connect-timeout=10",
+        "--batch",
+        "--skip-column-names",
+        "-e",
+        sql,
+    ]);
+    output(command, client)
+}
+
+// ---------------------------------------------------------------- MongoDB
+
+/// The password goes into a file only the agent can read, never onto the command line.
+fn mongo(program: &str, secret: &DatabaseSecret) -> Result<(Command, Option<NamedTempFile>)> {
+    let tls: &[&str] = match secret.ssl_mode.as_str() {
+        "disable" | "allow" | "prefer" => &[],
+        "require" => &["--ssl", "--tlsInsecure"],
+        "verify-ca" | "verify-full" => &["--ssl"],
+        _ => return Err("unknown ssl mode".into()),
+    };
+    let mut command = quiet(program);
+    command
+        .arg(format!("--host={}", secret.host))
+        .arg(format!("--port={}", secret.port))
+        .args(tls);
+    if secret.username.is_empty() {
+        return Ok((command, None));
+    }
+    let mut file = NamedTempFile::new()?;
+    // A JSON string is a valid YAML string.
+    writeln!(
+        file,
+        "password: {}",
+        serde_json::to_string(&secret.password)?
+    )?;
+    command
+        .arg(format!("--config={}", file.path().display()))
+        .arg(format!("--username={}", secret.username))
+        .arg("--authenticationDatabase=admin");
+    Ok((command, Some(file)))
+}
+
+// ---------------------------------------------------------------- SQLite
+
+/// The folder SQLite files are read from and written to. Without it SQLite is off, so a
+/// server cannot ask for any file the agent can read.
+fn sqlite_root() -> Result<PathBuf> {
+    let root = std::env::var("DBM_SQLITE_ROOT")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .ok_or("SQLite is off on this agent: set DBM_SQLITE_ROOT")?;
+    let root = std::fs::canonicalize(root)?;
+    let state = std::env::var("DBM_STATE_FILE").unwrap_or_else(|_| "agent-state".into());
+    if std::fs::canonicalize(state).is_ok_and(|state| state.starts_with(&root)) {
+        return Err("DBM_SQLITE_ROOT must not contain the agent's state file".into());
+    }
+    Ok(root)
+}
+
+/// `<root>/<folder>/<name>`, refused if links or `..` lead outside the root.
+fn sqlite_path(root: &Path, folder: &str, name: &str) -> Result<PathBuf> {
+    let outside = "that folder or file is outside DBM_SQLITE_ROOT";
+    let folder = std::fs::canonicalize(root.join(folder.trim_start_matches('/')))
+        .map_err(|e| format!("cannot open the folder: {e}"))?;
+    if !folder.starts_with(root) {
+        return Err(outside.into());
+    }
+    let path = folder.join(name);
+    match std::fs::canonicalize(&path) {
+        Ok(real) if real.starts_with(root) => Ok(real),
+        Ok(_) => Err(outside.into()),
+        Err(_) if path.symlink_metadata().is_err() => Ok(path),
+        Err(_) => Err(outside.into()),
+    }
+}
+
+fn sqlite(path: &Path) -> Command {
+    let mut command = quiet("sqlite3");
+    // -safe: nothing in the input can run programs or touch other files.
+    command.args(["-batch", "-bail", "-safe"]).arg(path);
+    command
+}
+
+// ---------------------------------------------------------------- what jobs ask for
+
+/// Connects and says what answered.
+pub fn test(secret: &DatabaseSecret) -> Result<String> {
+    match secret.engine.as_str() {
+        "postgresql" => Ok(format!(
+            "PostgreSQL {}",
+            psql(secret, "SHOW server_version")?
+        )),
+        "mysql" | "mariadb" => {
+            let version = mysql_query(secret, "SELECT VERSION()")?;
+            Ok(format!("{} {version}", secret.engine))
+        }
+        "mongodb" => {
+            // Dumping a database that does not exist needs a connection and a login, nothing else.
+            let (mut command, _file) = mongo("mongodump", secret)?;
+            command.args(["--quiet", "--db=dbm_connection_test", "--archive=/dev/null"]);
+            output(command, "mongodump")?;
+            Ok("MongoDB".into())
+        }
+        "sqlite" => {
+            let root = sqlite_root()?;
+            let folder = sqlite_path(&root, &secret.host, ".")?;
+            if !folder.is_dir() {
+                return Err("that folder does not exist".into());
+            }
+            Ok(format!("SQLite folder {}", folder.display()))
+        }
+        _ => Err("unknown engine".into()),
+    }
+}
+
+/// A command that writes the dump of `name` to standard output.
+pub fn dump(secret: &DatabaseSecret, name: &str) -> Result<Tool> {
+    let name = checked(secret, name)?;
+    Ok(match secret.engine.as_str() {
+        "postgresql" => {
+            let mut command = postgres("pg_dump", secret, name)?;
+            // Uncompressed: compression is done by the agent's own stage.
+            command.args(["--format=custom", "--compress=0"]);
+            Tool::new(command, "pg_dump")
+        }
+        "mysql" | "mariadb" => {
+            let (_, program) = mysql_programs(secret);
+            let mut command = mysql(program, secret)?;
+            command.args([
+                "--single-transaction",
+                "--routines",
+                "--triggers",
+                "--events",
+                "--hex-blob",
+                "--no-tablespaces",
+            ]);
+            if secret.engine == "mysql" {
+                command.arg("--set-gtid-purged=OFF");
+            }
+            // Without --databases the dump can be restored under another name.
+            command.arg(name);
+            Tool::new(command, program)
+        }
+        "mongodb" => {
+            let (mut command, file) = mongo("mongodump", secret)?;
+            command
+                .arg("--quiet")
+                .arg(format!("--db={name}"))
+                .arg("--archive");
+            Tool {
+                _secret_file: file,
+                ..Tool::new(command, "mongodump")
+            }
+        }
+        "sqlite" => {
+            let path = sqlite_path(&sqlite_root()?, &secret.host, name)?;
+            // sqlite3 would create an empty database for a name that is not there.
+            if !path.is_file() {
+                return Err(format!("{name} does not exist").into());
+            }
+            let mut command = sqlite(&path);
+            command.arg(".dump");
+            Tool::new(command, "sqlite3")
+        }
+        _ => return Err("unknown engine".into()),
+    })
+}
+
+/// Creates the target if needed and returns the command that reads the dump from
+/// standard input. `source` is the name the backup was taken from. The flag says
+/// whether a database was created.
+pub fn restore(secret: &DatabaseSecret, name: &str, source: &str) -> Result<(Tool, bool)> {
+    let name = checked(secret, name)?;
+    let (mut tool, created) = match secret.engine.as_str() {
+        "postgresql" => {
+            // The name is restricted to [A-Za-z0-9_-], so quoting it cannot be escaped.
+            let found = psql(
+                secret,
+                &format!("SELECT 1 FROM pg_database WHERE datname = '{name}'"),
+            )?;
+            if found != "1" {
+                psql(secret, &format!("CREATE DATABASE \"{name}\""))?;
+            }
+            let mut command = postgres("pg_restore", secret, name)?;
+            command
+                .args([
+                    "--clean",
+                    "--if-exists",
+                    "--no-owner",
+                    "--no-privileges",
+                    "--exit-on-error",
+                ])
+                .arg(format!("--dbname={name}"));
+            (Tool::new(command, "pg_restore"), found != "1")
+        }
+        "mysql" | "mariadb" => {
+            let found = mysql_query(
+                secret,
+                &format!("SELECT 1 FROM information_schema.schemata WHERE schema_name = '{name}'"),
+            )?;
+            if found != "1" {
+                mysql_query(secret, &format!("CREATE DATABASE `{name}`"))?;
+            }
+            let (client, _) = mysql_programs(secret);
+            let mut command = mysql(client, secret)?;
+            // Binary mode: the client runs no commands of its own that appear in the data.
+            command.args(["--binary-mode", &format!("--database={name}")]);
+            (Tool::new(command, client), found != "1")
+        }
+        "mongodb" => {
+            if !valid_target("mongodb", source) {
+                return Err("the source database name is missing".into());
+            }
+            let (mut command, file) = mongo("mongorestore", secret)?;
+            command
+                .args(["--quiet", "--archive", "--drop", "--stopOnError"])
+                .arg(format!("--nsInclude={source}.*"))
+                .arg(format!("--nsFrom={source}.*"))
+                .arg(format!("--nsTo={name}.*"));
+            let tool = Tool {
+                _secret_file: file,
+                ..Tool::new(command, "mongorestore")
+            };
+            (tool, false)
+        }
+        "sqlite" => {
+            let target = sqlite_path(&sqlite_root()?, &secret.host, name)?;
+            let folder = target.parent().ok_or("no folder")?;
+            let new = tempfile::Builder::new()
+                .prefix(".dbm-restore-")
+                .tempfile_in(folder)
+                .map_err(|e| format!("cannot write in the folder: {e}"))?
+                .into_temp_path();
+            let command = sqlite(&new);
+            let created = !target.exists();
+            let tool = Tool {
+                replace: Some((new, target)),
+                ..Tool::new(command, "sqlite3")
+            };
+            (tool, created)
+        }
+        _ => return Err("unknown engine".into()),
+    };
+    tool.command.stdin(Stdio::piped()).stdout(Stdio::null());
+    Ok((tool, created))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn secret(engine: &str) -> DatabaseSecret {
+        DatabaseSecret {
+            engine: engine.into(),
+            host: "db".into(),
+            port: 1,
+            username: "u".into(),
+            password: "hunter2-secret".into(),
+            ssl_mode: "disable".into(),
+        }
+    }
+
+    #[test]
+    fn passwords_never_reach_the_command_line() {
+        for engine in ["postgresql", "mysql", "mariadb", "mongodb"] {
+            let tool = dump(&secret(engine), "shop").unwrap();
+            let args: Vec<_> = tool.command.get_args().collect();
+            assert!(
+                !args.iter().any(|a| a.to_string_lossy().contains("hunter2")),
+                "{engine}: {args:?}"
+            );
+        }
+        let mut sneaky = secret("mysql");
+        sneaky.host = "--plugin-dir=/tmp".into();
+        assert!(dump(&sneaky, "shop").is_err());
+    }
+
+    #[test]
+    fn sqlite_stays_inside_its_folder() {
+        let top = tempfile::tempdir().unwrap();
+        let root = top.path().join("root");
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        std::fs::write(top.path().join("key"), "secret").unwrap();
+        std::os::unix::fs::symlink(top.path().join("key"), root.join("app/link")).unwrap();
+        std::os::unix::fs::symlink(top.path().join("gone"), root.join("app/dangling")).unwrap();
+
+        assert!(sqlite_path(&root, "app", "new.db").is_ok());
+        assert!(sqlite_path(&root, "/app", "new.db").is_ok());
+        for (folder, name) in [
+            ("..", "key"),
+            ("app/../..", "key"),
+            ("app", "link"),
+            ("app", "dangling"),
+        ] {
+            assert!(sqlite_path(&root, folder, name).is_err(), "{folder}/{name}");
+        }
+    }
+}

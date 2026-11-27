@@ -451,6 +451,13 @@ export const messages = {
 	'error.has_snapshots': ["Bucket dan folder tidak bisa diubah karena sudah ada backup di sana.", "Bucket and folder cannot change: backups are already stored there."],
 	'error.cannot_change_own_role': ["Tidak bisa mengubah role akun sendiri.", "You cannot change your own role."],
 	'error.ssl_mode': ["SSL mode tidak valid.", "Invalid SSL mode."],
+	'field.folder': ["Folder", "Folder"],
+	'help.folder': ["Folder di dalam DBM_SQLITE_ROOT pada agent. Kosongkan untuk folder utamanya.", "A folder inside DBM_SQLITE_ROOT on the agent. Leave empty for the root itself."],
+	'field.fileName': ["Nama file", "File name"],
+	'help.fileName': ["Misalnya app.db. Tanpa folder.", "For example app.db. No folders."],
+	'help.mongoUser': ["Kosongkan bila server tidak memakai login. Akun diperiksa di database admin.", "Leave empty without authentication. The account is checked in the admin database."],
+	'error.engine': ["Jenis database tidak didukung.", "Unsupported database engine."],
+	'error.different_engine': ["Backup hanya bisa dipulihkan ke jenis database yang sama.", "A backup can only be restored into the same engine."],
 } satisfies Record<string, [string, string]>;
 
 export type Key = keyof typeof messages;

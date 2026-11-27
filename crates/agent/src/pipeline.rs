@@ -11,17 +11,17 @@ use std::{
 use age::x25519;
 use tokio::runtime::Handle;
 
-use crate::{Result, progress::Progress, storage::Upload};
+use crate::{Result, engines, progress::Progress, storage::Upload};
 
 /// Kills the child if the pipeline stops early, and collects what it says on stderr.
-struct Tool {
+struct Running {
     child: Child,
     stderr: Option<JoinHandle<String>>,
     name: &'static str,
 }
 
-impl Tool {
-    fn start(mut command: Command, name: &'static str) -> Result<Self> {
+impl Running {
+    fn start(command: &mut Command, name: &'static str) -> Result<Self> {
         let mut child = command
             .spawn()
             .map_err(|e| format!("cannot run {name}: {e}"))?;
@@ -71,7 +71,7 @@ impl Tool {
     }
 }
 
-impl Drop for Tool {
+impl Drop for Running {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -150,7 +150,7 @@ fn decompress<'a>(kind: &str, from: impl Read + 'a) -> Result<Box<dyn Read + 'a>
 /// Blocking. Returns the stored file's SHA-256; on any failure nothing is committed and
 /// the caller aborts the upload.
 pub fn backup(
-    dump: Command,
+    mut dump: engines::Tool,
     compression: &str,
     level: i32,
     recipients: &[String],
@@ -166,8 +166,12 @@ pub fn backup(
         age::Encryptor::with_recipients(recipients.iter().map(|r| r as &dyn age::Recipient))?;
     let upload = Upload::new(writer, handle, progress.clone());
 
-    let mut tool = Tool::start(dump, "pg_dump")?;
-    let mut stdout = tool.child.stdout.take().ok_or("pg_dump has no output")?;
+    let mut tool = Running::start(&mut dump.command, dump.name)?;
+    let mut stdout = tool
+        .child
+        .stdout
+        .take()
+        .ok_or("the dump tool has no output")?;
     let encrypted = encryptor.wrap_output(upload)?;
     let encrypted = compress(compression, level, &mut stdout, encrypted, progress)?;
     // End of output is not success: a dump that died halfway must not be committed.
@@ -177,7 +181,7 @@ pub fn backup(
 
 /// Blocking. `file` has already been checked against the recorded SHA-256.
 pub fn restore(
-    restore: Command,
+    mut restore: engines::Tool,
     compression: &str,
     identity: &str,
     file: std::fs::File,
@@ -188,15 +192,20 @@ pub fn restore(
         .decrypt(std::iter::once(&identity as &dyn age::Identity))?;
     let mut input = decompress(compression, decrypted)?;
 
-    let mut tool = Tool::start(restore, "pg_restore")?;
-    let mut stdin = tool.child.stdin.take().ok_or("pg_restore has no input")?;
+    let mut tool = Running::start(&mut restore.command, restore.name)?;
+    let mut stdin = tool
+        .child
+        .stdin
+        .take()
+        .ok_or("the restore tool has no input")?;
     let fed = copy(&mut input, &mut stdin, progress);
     drop(stdin);
-    // pg_restore's own message explains a broken pipe better than the pipe does.
+    // The tool's own message explains a broken pipe better than the pipe does.
     if progress.check().is_ok() {
         tool.wait(progress)?;
     }
-    fed
+    fed?;
+    engines::Tool::commit(restore.take_replace())
 }
 
 #[cfg(test)]

@@ -2,6 +2,19 @@
 export type Engine = 'postgresql' | 'mysql' | 'mariadb' | 'mongodb' | 'sqlite' | 'redis' | 'opensearch' | 'elasticsearch';
 export type Status = 'completed' | 'running' | 'failed' | 'pending' | 'cancelled' | 'online' | 'offline';
 
+/** Engines that work today; the others are shown as coming. */
+export const supported: Engine[] = ['postgresql', 'mysql', 'mariadb', 'mongodb', 'sqlite'];
+
+/** The values sealed for an agent. SQLite has only a folder below the agent's root. */
+export function connectionOf(engine: Engine, form: { host: string; port: number; username: string; password: string; ssl_mode: string }) {
+	return engine === 'sqlite'
+		? { host: form.host.trim(), port: 0, username: '', password: '', ssl_mode: 'disable' }
+		: { host: form.host.trim(), port: form.port, username: form.username.trim(), password: form.password, ssl_mode: form.ssl_mode };
+}
+
+/** Allowed database names; for SQLite a file name without a path. */
+export const namePattern = (engine?: Engine) => (engine === 'sqlite' ? '[A-Za-z0-9_][A-Za-z0-9_.\\-]*' : '[A-Za-z0-9_][A-Za-z0-9_\\-]*');
+
 export const engines: Record<Engine, { label: string; port: number; incremental: boolean }> = {
 	postgresql: { label: 'PostgreSQL', port: 5432, incremental: true },
 	mysql: { label: 'MySQL', port: 3306, incremental: true },

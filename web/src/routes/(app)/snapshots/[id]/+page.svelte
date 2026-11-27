@@ -9,6 +9,7 @@
 	import PageHeader from '#lib/components/PageHeader.svelte';
 	import Select from '#lib/components/Select.svelte';
 	import SplitTitle from '#lib/components/SplitTitle.svelte';
+	import { namePattern } from '#lib/api/index.ts';
 	import { errorText } from '#lib/errors.ts';
 	import { bytes, dateTime } from '#lib/format.ts';
 	import { t } from '#lib/i18n/index.svelte.ts';
@@ -44,7 +45,7 @@
 	}
 
 	// Restores run on the agent that can open the destination's credentials.
-	const targets = $derived(servers.filter((s) => s.agent_id === snapshot?.agent_id));
+	const targets = $derived(servers.filter((s) => s.agent_id === snapshot?.agent_id && s.engine === snapshot?.engine));
 	const targetName = $derived(servers.find((s) => s.id === target)?.name ?? '');
 
 	$effect(() => {
@@ -54,7 +55,7 @@
 				missing = false;
 				snapshot = s;
 				servers = list;
-				database = `${s.database_name}_restore`;
+				database = s.engine === 'sqlite' ? `restore-${s.database_name}`.slice(0, 63) : `${s.database_name}_restore`;
 			},
 			(e) => {
 				missing = true;
@@ -121,8 +122,8 @@
 		<section class="card mt-3">
 			<SplitTitle text={t('restore.title')} class="mb-1 font-semibold" />
 			<form onsubmit={(e) => { e.preventDefault(); restoreConfirm?.open(); }}>
-				<FormField label={t('restore.server')}>{#snippet children(a)}<Select {...a} required bind:value={target} placeholder={t('restore.choose')} options={targets.map((s) => ({ value: s.id, label: s.name, brand: s.engine, description: `${s.host}:${s.port}` }))} />{/snippet}</FormField>
-				<FormField label={t('restore.database')} help={t('restore.createHint')}>{#snippet children(a)}<input {...a} class="input min-h-11" maxlength="63" pattern={'[A-Za-z0-9_][A-Za-z0-9_\\-]*'} required bind:value={database} />{/snippet}</FormField>
+				<FormField label={t('restore.server')}>{#snippet children(a)}<Select {...a} required bind:value={target} placeholder={t('restore.choose')} options={targets.map((s) => ({ value: s.id, label: s.name, brand: s.engine, description: s.engine === 'sqlite' ? `/${s.host}` : `${s.host}:${s.port}` }))} />{/snippet}</FormField>
+				<FormField label={t('restore.database')} help={t('restore.createHint')}>{#snippet children(a)}<input {...a} class="input min-h-11" maxlength="63" pattern={namePattern(snapshot?.engine)} required bind:value={database} />{/snippet}</FormField>
 				<button type="submit" class="btn btn-primary">{t('restore.start')}</button>
 			</form>
 		</section>

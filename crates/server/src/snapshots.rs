@@ -4,7 +4,7 @@ use axum::{
     Json,
     extract::{Path, Query, State},
 };
-use dbm_shared::jobs::{extension, valid_database_name};
+use dbm_shared::jobs::{dump_extension, extension, valid_target};
 use serde::{Deserialize, Serialize};
 use sqlx::{Postgres, QueryBuilder};
 use time::OffsetDateTime;
@@ -47,10 +47,10 @@ pub async fn run_backup(
 
 /// Queues one run of a backup entry; returns the job and the entry's name.
 pub async fn queue_backup(app: &AppState, id: Uuid, by: &str) -> Result<(Uuid, String), Error> {
-    let (name, server_id, server, agent, database, destination_id, compression, level): (
-        String, Uuid, String, Uuid, String, Uuid, String, i32,
+    let (name, server_id, server, agent, database, destination_id, compression, level, engine): (
+        String, Uuid, String, Uuid, String, Uuid, String, i32, String,
     ) = sqlx::query_as(
-        "SELECT b.name, s.id, s.name, s.agent_id, b.database_name, b.destination_id, b.compression, b.level
+        "SELECT b.name, s.id, s.name, s.agent_id, b.database_name, b.destination_id, b.compression, b.level, s.engine
          FROM backup_configs b JOIN database_servers s ON s.id = b.server_id WHERE b.id = $1",
     )
     .bind(id)
@@ -70,8 +70,9 @@ pub async fn queue_backup(app: &AppState, id: Uuid, by: &str) -> Result<(Uuid, S
     );
     let unique = &Uuid::new_v4().simple().to_string()[..8];
     let object_key = format!(
-        "{}/{database}/{stamp}-{unique}.dump{}.age",
+        "{}/{database}/{stamp}-{unique}{}{}.age",
         slug(&server),
+        dump_extension(&engine),
         extension(&compression)
     );
     let job = NewJob {
@@ -104,6 +105,7 @@ pub struct Snapshot {
     size: i64,
     sha256: String,
     compression: String,
+    engine: String,
     #[serde(with = "time::serde::rfc3339")]
     created_at: OffsetDateTime,
     /// `None` when kept until rotated or removed by hand.
@@ -112,7 +114,7 @@ pub struct Snapshot {
 }
 
 const SELECT: &str = "SELECT s.id, s.server_name, s.database_name, d.name AS destination, d.agent_id, s.object_key,
-    s.size, s.sha256, s.compression, s.created_at, s.expires_at FROM snapshots s JOIN destinations d ON d.id = s.destination_id";
+    s.size, s.sha256, s.compression, s.engine, s.created_at, s.expires_at FROM snapshots s JOIN destinations d ON d.id = s.destination_id";
 
 #[derive(Deserialize)]
 pub struct Filter {
@@ -189,19 +191,17 @@ pub async fn restore(
     Json(body): Json<Restore>,
 ) -> Result<Json<Queued>, Error> {
     me.require_operator()?;
-    if !valid_database_name(&body.database_name) {
-        return Err(Error::Invalid("database_name"));
-    }
-    let (destination_id, source_agent, object_key): (Uuid, Uuid, String) = sqlx::query_as(
-        "SELECT s.destination_id, d.agent_id, s.object_key
+    let (destination_id, source_agent, object_key, engine): (Uuid, Uuid, String, String) =
+        sqlx::query_as(
+            "SELECT s.destination_id, d.agent_id, s.object_key, s.engine
          FROM snapshots s JOIN destinations d ON d.id = s.destination_id WHERE s.id = $1",
-    )
-    .bind(id)
-    .fetch_optional(&app.db)
-    .await?
-    .ok_or(Error::NotFound)?;
-    let (server, agent): (String, Uuid) =
-        sqlx::query_as("SELECT name, agent_id FROM database_servers WHERE id = $1")
+        )
+        .bind(id)
+        .fetch_optional(&app.db)
+        .await?
+        .ok_or(Error::NotFound)?;
+    let (server, agent, target_engine): (String, Uuid, String) =
+        sqlx::query_as("SELECT name, agent_id, engine FROM database_servers WHERE id = $1")
             .bind(body.server_id)
             .fetch_optional(&app.db)
             .await?
@@ -209,6 +209,12 @@ pub async fn restore(
     // Only that agent can open the destination's credentials.
     if agent != source_agent {
         return Err(Error::Invalid("different_agent"));
+    }
+    if engine != target_engine {
+        return Err(Error::Invalid("different_engine"));
+    }
+    if !valid_target(&engine, &body.database_name) {
+        return Err(Error::Invalid("database_name"));
     }
     let job = NewJob {
         server_id: Some(body.server_id),

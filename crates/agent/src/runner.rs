@@ -9,7 +9,7 @@ use dbm_shared::{
 use serde::de::DeserializeOwned;
 use tokio::{runtime::Handle, task};
 
-use crate::{Result, manifest, pipeline, postgres, progress::Progress, state::State, storage};
+use crate::{Result, engines, manifest, pipeline, progress::Progress, state::State, storage};
 
 /// Opens a secret sealed to this agent. A server cannot read it, and cannot move it
 /// to another record without the check failing.
@@ -57,8 +57,8 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
     match job.task {
         Task::TestDatabase { database } => {
             let secret: DatabaseSecret = open_json(state, &database, "database")?;
-            let version = blocking(move || postgres::server_version(&secret).map_err(text)).await?;
-            progress.log("ok", format!("connected, PostgreSQL {version}"));
+            let version = blocking(move || engines::test(&secret).map_err(text)).await?;
+            progress.log("ok", format!("connected: {version}"));
             Ok(Output::default())
         }
         Task::TestDestination { destination } => {
@@ -86,7 +86,7 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
             let handle = Handle::current();
             let shared = progress.clone();
             let (writer, result) = task::spawn_blocking(move || {
-                let result = postgres::dump(&database, &name)
+                let result = engines::dump(&database, &name)
                     .and_then(|dump| {
                         pipeline::backup(
                             dump,
@@ -132,6 +132,7 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
             manifest,
             compression,
             name,
+            source,
         } => {
             // Checked before anything is downloaded or touched.
             match &manifest {
@@ -164,12 +165,12 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
             let file = temporary.reopen()?;
             let shared = progress.clone();
             blocking(move || {
-                if postgres::ensure_database(&database, &name).map_err(text)? {
-                    shared.log("info", format!("created database {name}"));
+                let (tool, created) = engines::restore(&database, &name, &source).map_err(text)?;
+                if created {
+                    shared.log("info", format!("created {name}"));
                 }
                 shared.log("info", format!("restoring into {name}"));
-                let command = postgres::restore(&database, &name).map_err(text)?;
-                pipeline::restore(command, &compression, &identity, file, &shared).map_err(text)
+                pipeline::restore(tool, &compression, &identity, file, &shared).map_err(text)
             })
             .await?;
             progress.log("ok", "restore completed");
