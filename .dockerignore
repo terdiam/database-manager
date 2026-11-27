@@ -1,0 +1,10 @@
+target
+web/node_modules
+web/build
+web/.svelte-kit
+.env
+.env.*
+agent-state
+.git
+backups
+certs

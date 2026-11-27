@@ -1,0 +1,22 @@
+# Hanoey in front of DB Manager (docker compose --profile https up -d).
+
+[upstreams.dbm]
+targets = ["http://server:8080"]
+
+[[routes]]
+name = "dbm"
+path = "/"
+handler = { type = "reverse_proxy", upstream = "dbm" }
+
+[tls]
+redirect_http = true
+# Turn HSTS on only for a real domain. Browsers apply it to every port of a host, so on
+# localhost it would force https onto all your other local servers too.
+hsts = false
+
+# Own certificate (see README for a self-signed one for localhost):
+certificates = [{ cert = "/certs/fullchain.pem", key = "/certs/privkey.pem" }]
+
+# Public domain instead: remove `certificates`, set hosts = ["dbm.example.com"] on the route,
+# then enable automatic certificates (ports 80 and 443 must be reachable from the internet):
+# acme = { email = "admin@example.com" }

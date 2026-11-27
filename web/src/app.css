@@ -1,0 +1,278 @@
+@import 'tailwindcss';
+
+/* One token set for both schemes through light-dark(): no dark: variants needed. */
+@theme {
+	--color-canvas: light-dark(#f5f6f8, #0e1116);
+	--color-surface: light-dark(#ffffff, #171b22);
+	--color-muted: light-dark(#eef0f4, #212631);
+	--color-line: light-dark(#dde1e8, #2c3340);
+	--color-ink: light-dark(#161a22, #e7eaf0);
+	--color-dim: light-dark(#55606f, #a0a9b8);
+	--color-brand: light-dark(#3b4fd8, #8b9bff);
+	--color-on-brand: light-dark(#ffffff, #10142e);
+	--color-ok: light-dark(#157347, #56d08f);
+	--color-warn: light-dark(#8a5a00, #e8b44c);
+	--color-bad: light-dark(#bb2d3b, #ff8089);
+}
+
+:root {
+	color-scheme: light dark;
+	scrollbar-gutter: stable;
+}
+:root:has(> head > meta[name='color-scheme'][content='dark']) {
+	color-scheme: dark;
+}
+:root:has(> head > meta[name='color-scheme'][content='light']) {
+	color-scheme: light;
+}
+
+:root[data-accent='emerald'] {
+	--color-brand: light-dark(#0f7a55, #5fd6a6);
+}
+:root[data-accent='rose'] {
+	--color-brand: light-dark(#b8285a, #ff8fb1);
+}
+:root[data-accent='amber'] {
+	--color-brand: light-dark(#8f5200, #f2b856);
+}
+
+@layer components {
+	/* Selects. Base look for every browser (Firefox keeps its native list)... */
+	select.input {
+		appearance: none;
+		min-height: 2.75rem;
+		padding-right: 2.25rem;
+		background: var(--color-surface) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23808a9a' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E") no-repeat right 0.7rem center / 1rem;
+		cursor: pointer;
+		transition: border-color 0.15s;
+	}
+	select.input:hover {
+		border-color: var(--color-brand);
+	}
+
+	/* ...and a themed dropdown where customizable select is supported. */
+	@supports (appearance: base-select) {
+		select.input,
+		select.input::picker(select) {
+			appearance: base-select;
+		}
+		select.input {
+			display: flex;
+			align-items: center;
+			gap: 0.5rem;
+			padding-right: 0.75rem;
+			background-image: none;
+		}
+		select.input > button {
+			display: flex;
+			flex: 1;
+			min-width: 0;
+		}
+		select.input::picker-icon {
+			content: '';
+			width: 0.45rem;
+			height: 0.45rem;
+			margin-inline-start: auto;
+			border: solid var(--color-dim);
+			border-width: 0 2px 2px 0;
+			rotate: 45deg;
+			translate: 0 -2px;
+			transition: rotate 0.15s;
+		}
+		select.input:open::picker-icon {
+			rotate: 225deg;
+			translate: 0 1px;
+		}
+		select.input::picker(select) {
+			min-width: anchor-size(width);
+			max-height: min(20rem, 60dvh);
+			margin-block: 0.25rem;
+			padding: 0.25rem;
+			border: 1px solid var(--color-line);
+			border-radius: 0.75rem;
+			background: var(--color-surface);
+			color: var(--color-ink);
+			box-shadow: 0 12px 32px rgb(0 0 0 / 0.18);
+			overflow-y: auto;
+		}
+		select.input option {
+			display: flex;
+			align-items: center;
+			gap: 0.625rem;
+			min-height: 2.5rem;
+			padding: 0.375rem 0.625rem;
+			border-radius: 0.5rem;
+			cursor: pointer;
+		}
+		select.input option:hover,
+		select.input option:focus-visible {
+			background: var(--color-muted);
+		}
+		select.input option:checked {
+			background: color-mix(in oklab, var(--color-brand) 14%, transparent);
+			font-weight: 600;
+		}
+		select.input option::checkmark {
+			order: 1;
+			margin-inline-start: auto;
+			color: var(--color-brand);
+		}
+		select.input selectedcontent {
+			display: flex;
+			align-items: center;
+			gap: 0.625rem;
+			min-width: 0;
+		}
+		select.input option .opt-desc {
+			display: block;
+		}
+		/* The closed control stays one line; descriptions show in the list. */
+		select.input selectedcontent .opt-desc {
+			display: none;
+		}
+	}
+
+	/* Added by cardMotion to informational cards only. */
+	.card.lift {
+		transition: box-shadow 0.18s, border-color 0.18s;
+	}
+	.card.lift:hover {
+		border-color: color-mix(in oklab, var(--color-brand) 45%, var(--color-line));
+		box-shadow: 0 10px 28px rgb(0 0 0 / 0.12);
+	}
+
+	/* Login side panel: two soft accent glows, static so they cost nothing. */
+	.showcase {
+		background:
+			radial-gradient(60% 50% at 15% 10%, color-mix(in oklab, var(--color-brand) 18%, transparent), transparent),
+			radial-gradient(55% 45% at 90% 95%, color-mix(in oklab, var(--color-ok) 14%, transparent), transparent),
+			var(--color-canvas);
+	}
+
+	.menu {
+		@apply m-0 w-60 rounded-xl border border-line bg-surface p-1 text-sm text-ink shadow-xl;
+		/* Fallback without anchor positioning: pinned to the bottom-left, never centered. */
+		inset: auto auto 4rem 0.75rem;
+	}
+	.menu.drop {
+		inset: 3.5rem 0.75rem auto auto;
+	}
+	@supports (position-area: block-start) {
+		.menu {
+			inset: auto;
+			position-area: block-start span-inline-end;
+			position-try-fallbacks: flip-block, flip-inline;
+		}
+		.menu.drop {
+			position-area: block-end span-inline-start;
+			position-try-fallbacks: flip-block, flip-inline;
+		}
+		/* Narrow screens: pin to the right edge so the panel cannot spill off the left. */
+		@media (width < 40rem) {
+			.menu.drop {
+				position-area: none;
+				position-try-fallbacks: none;
+				inset: 3.5rem 0.75rem auto auto;
+			}
+		}
+		.menu.submenu {
+			position-area: inline-end span-block-start;
+			position-try-fallbacks: flip-inline, block-start;
+		}
+	}
+	.menu-item {
+		@apply flex min-h-9 w-full items-center gap-2.5 rounded-lg px-2.5 text-left hover:bg-muted;
+	}
+}
+
+@layer base {
+	body {
+		@apply bg-canvas text-ink antialiased;
+	}
+	h1,
+	h2,
+	h3 {
+		text-wrap: balance;
+	}
+	:focus-visible {
+		outline: 2px solid var(--color-brand);
+		outline-offset: 2px;
+	}
+	button:not(:disabled),
+	summary {
+		cursor: pointer;
+	}
+}
+
+@layer components {
+	.card {
+		@apply rounded-xl border border-line bg-surface p-4;
+	}
+	.btn {
+		@apply inline-flex min-h-9 items-center justify-center gap-1.5 rounded-lg border border-line bg-surface px-3 text-sm font-medium whitespace-nowrap hover:bg-muted disabled:opacity-50;
+	}
+	.btn-primary {
+		@apply border-brand bg-brand text-on-brand hover:bg-brand hover:brightness-110;
+	}
+	.btn-danger {
+		@apply border-bad text-bad;
+	}
+	.input {
+		@apply min-h-9 w-full rounded-lg border border-line bg-surface px-3 text-sm text-ink;
+	}
+	.input:user-invalid {
+		@apply border-bad;
+	}
+
+	dialog.modal {
+		@apply m-auto max-h-[85dvh] w-[min(32rem,calc(100vw-2rem))] overflow-auto rounded-xl border border-line bg-surface p-5 text-ink;
+		overscroll-behavior: contain;
+	}
+	dialog.drawer {
+		@apply m-0 h-dvh max-h-dvh w-64 border-r border-line bg-surface text-ink;
+		overscroll-behavior: contain;
+	}
+	dialog::backdrop {
+		background: rgb(0 0 0 / 0.5);
+		overscroll-behavior: contain;
+	}
+
+	/* Tables turn into stacked cards when their container is narrow. */
+	.table-wrap {
+		container-type: inline-size;
+		overflow-x: auto;
+	}
+	.table {
+		@apply w-full text-left text-sm;
+	}
+	.table th {
+		@apply border-b border-line px-3 py-2 text-xs font-semibold text-dim;
+	}
+	.table td {
+		@apply border-b border-line px-3 py-2.5 align-middle;
+	}
+	.table tr:last-child td {
+		@apply border-b-0;
+	}
+	@container (width < 640px) {
+		.table,
+		.table tbody,
+		.table tr,
+		.table td {
+			display: block;
+		}
+		.table thead {
+			display: none;
+		}
+		.table tr {
+			@apply border-b border-line py-2;
+		}
+		.table td {
+			@apply flex items-center justify-between gap-3 border-b-0 py-1 text-right;
+		}
+		.table td::before {
+			content: attr(data-label);
+			@apply text-left text-xs font-semibold text-dim;
+		}
+	}
+}

@@ -1,0 +1,8 @@
+/target
+.env
+.env.*
+!.env.example
+agent-state
+.DS_Store
+backups/
+certs/

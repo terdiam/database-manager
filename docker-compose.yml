@@ -1,0 +1,76 @@
+services:
+  db:
+    image: postgres:19-alpine
+    environment:
+      POSTGRES_USER: dbm
+      POSTGRES_DB: dbm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:5433:5432" # for local development
+    volumes:
+      - db:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "dbm", "-h", "127.0.0.1"]
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
+
+  server:
+    build: { context: ., target: server }
+    environment:
+      # The password must be URL safe (the example uses hex).
+      DATABASE_URL: postgres://dbm:${POSTGRES_PASSWORD}@db:5432/dbm
+      DBM_COOKIE_SECURE: ${DBM_COOKIE_SECURE:-true}
+      # Encrypts sensitive values in the database. Back it up: without it they are lost.
+      DBM_MASTER_KEY: ${DBM_MASTER_KEY:?set DBM_MASTER_KEY in .env}
+      # Encrypt API bodies on top of TLS: on or off.
+      DBM_E2EE: ${DBM_E2EE:-on}
+      # true only when requests arrive through the proxy below.
+      DBM_TRUST_PROXY: ${DBM_TRUST_PROXY:-false}
+      DBM_TURNSTILE_SITE_KEY: ${DBM_TURNSTILE_SITE_KEY:-}
+      DBM_TURNSTILE_SECRET_KEY: ${DBM_TURNSTILE_SECRET_KEY:-}
+      DBM_TURNSTILE_HOSTNAMES: ${DBM_TURNSTILE_HOSTNAMES:-}
+    ports:
+      # Local only. Put a TLS reverse proxy in front before exposing it.
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      db: { condition: service_healthy }
+    restart: unless-stopped
+
+  agent:
+    profiles: [agent] # start after creating a token on the Agents page
+    build: { context: ., target: agent }
+    environment:
+      DBM_SERVER_URL: http://server:8080
+      DBM_ALLOW_INSECURE: "true" # private compose network only
+      DBM_ENROLL_TOKEN: ${DBM_ENROLL_TOKEN:-}
+      DBM_SERVER_FINGERPRINT: ${DBM_SERVER_FINGERPRINT:-}
+    volumes:
+      - agent:/data
+    depends_on: [server]
+    restart: on-failure
+
+  hanoey:
+    profiles: [https] # needs certificates, see README
+    image: ghcr.io/terdiam/hanoey:1.5.0
+    environment:
+      HANOEY_CONFIG: /etc/hanoey/hanoey.toml
+      HANOEY_HTTPS_PUBLIC_PORT: ${DBM_HTTPS_PORT:-443}
+      # The admin UI stays inside the container.
+      HANOEY_ADMIN_LISTEN: 127.0.0.1:9900
+    ports:
+      # Local only by default; set DBM_HTTPS_BIND=0.0.0.0 to serve the network.
+      - "${DBM_HTTPS_BIND:-127.0.0.1}:${DBM_HTTP_PORT:-80}:8080"
+      - "${DBM_HTTPS_BIND:-127.0.0.1}:${DBM_HTTPS_PORT:-443}:8443"
+      - "${DBM_HTTPS_BIND:-127.0.0.1}:${DBM_HTTPS_PORT:-443}:8443/udp"
+    volumes:
+      - ./deploy/hanoey.toml:/etc/hanoey/hanoey.toml:ro
+      - ./certs:/certs:ro
+      - hanoey:/data
+    depends_on: [server]
+    restart: unless-stopped
+
+volumes:
+  db:
+  agent:
+  hanoey:

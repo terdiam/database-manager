@@ -1,0 +1,197 @@
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode, header},
+};
+use dbm_shared::{EnrollRequest, EnrollResponse, HeartbeatRequest, OFFLINE_AFTER_SECS, e2ee};
+use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
+use uuid::Uuid;
+
+use crate::{
+    AppState, Error, audit,
+    auth::{Auth, Ip, new_token, token_hash},
+};
+
+const TOKEN_MINUTES: i32 = 60;
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct Agent {
+    id: Uuid,
+    name: String,
+    version: String,
+    #[serde(with = "time::serde::rfc3339")]
+    last_seen_at: OffsetDateTime,
+    online: bool,
+    #[serde(skip)]
+    public_key: Option<Vec<u8>>,
+    /// To compare with the one the agent prints; absent for agents enrolled before keys existed.
+    #[sqlx(skip)]
+    fingerprint: Option<String>,
+}
+
+pub async fn list(State(app): State<AppState>, Auth(_): Auth) -> Result<Json<Vec<Agent>>, Error> {
+    let mut agents: Vec<Agent> = sqlx::query_as(
+        "SELECT id, name, version, public_key, last_seen_at, last_seen_at > now() - make_interval(secs => $1) AS online
+         FROM agents ORDER BY name LIMIT 500",
+    )
+    .bind(OFFLINE_AFTER_SECS as f64)
+    .fetch_all(&app.db)
+    .await?;
+    for agent in &mut agents {
+        agent.fingerprint = agent.public_key.as_deref().map(e2ee::fingerprint);
+    }
+    Ok(Json(agents))
+}
+
+#[derive(Deserialize)]
+pub struct NewToken {
+    name: String,
+}
+
+#[derive(Serialize)]
+pub struct Token {
+    token: String,
+    expires_in_minutes: i32,
+}
+
+/// One-time token an administrator hands to a new agent.
+pub async fn create_token(
+    State(app): State<AppState>,
+    Auth(me): Auth,
+    Ip(ip): Ip,
+    Json(body): Json<NewToken>,
+) -> Result<Json<Token>, Error> {
+    me.require_admin()?;
+    let name = body.name.trim();
+    if name.is_empty() || name.len() > 64 {
+        return Err(Error::Invalid("name"));
+    }
+    let taken: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM agents WHERE name = $1)")
+        .bind(name)
+        .fetch_one(&app.db)
+        .await?;
+    if taken {
+        return Err(Error::Conflict("agent_name_taken"));
+    }
+    let token = new_token();
+    sqlx::query("DELETE FROM enrollment_tokens WHERE expires_at <= now() OR used_at IS NOT NULL")
+        .execute(&app.db)
+        .await?;
+    sqlx::query("INSERT INTO enrollment_tokens (token_hash, agent_name, expires_at) VALUES ($1, $2, now() + make_interval(mins => $3))")
+        .bind(token_hash(&token))
+        .bind(name)
+        .bind(TOKEN_MINUTES)
+        .execute(&app.db)
+        .await?;
+    audit::record(
+        &app.db,
+        Some(&me),
+        "create",
+        &format!("enrollment token for agent {name}"),
+        &ip,
+        true,
+    )
+    .await?;
+    Ok(Json(Token {
+        token,
+        expires_in_minutes: TOKEN_MINUTES,
+    }))
+}
+
+/// Removing an agent revokes its credential.
+pub async fn remove(
+    State(app): State<AppState>,
+    Auth(me): Auth,
+    Ip(ip): Ip,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, Error> {
+    me.require_admin()?;
+    let name: String = sqlx::query_scalar("DELETE FROM agents WHERE id = $1 RETURNING name")
+        .bind(id)
+        .fetch_optional(&app.db)
+        .await?
+        .ok_or(Error::NotFound)?;
+    audit::record(
+        &app.db,
+        Some(&me),
+        "delete",
+        &format!("agent {name}"),
+        &ip,
+        true,
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn clipped(version: &str) -> String {
+    version.chars().take(32).collect()
+}
+
+pub async fn enroll(
+    State(app): State<AppState>,
+    Ip(ip): Ip,
+    Json(body): Json<EnrollRequest>,
+) -> Result<Json<EnrollResponse>, Error> {
+    let public_key = e2ee::decode(&body.public_key)
+        .ok()
+        .filter(|key| key.len() == 32)
+        .ok_or(Error::Invalid("public_key"))?;
+
+    let mut tx = app.db.begin().await?;
+    // The UPDATE claims the token atomically, so it works exactly once.
+    let name: String = sqlx::query_scalar(
+        "UPDATE enrollment_tokens SET used_at = now()
+         WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now() RETURNING agent_name",
+    )
+    .bind(token_hash(&body.token))
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(Error::Unauthorized)?;
+
+    let secret = new_token();
+    let agent_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO agents (name, token_hash, version, public_key) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (name) DO NOTHING RETURNING id",
+    )
+    .bind(&name)
+    .bind(token_hash(&secret))
+    .bind(clipped(&body.version))
+    .bind(public_key)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(Error::Conflict("agent_name_taken"))?;
+    audit::record(
+        &mut *tx,
+        None,
+        "create",
+        &format!("agent {name} enrolled"),
+        &ip,
+        true,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(EnrollResponse { agent_id, secret }))
+}
+
+pub async fn heartbeat(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<HeartbeatRequest>,
+) -> Result<StatusCode, Error> {
+    let secret = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(Error::Unauthorized)?;
+    let updated =
+        sqlx::query("UPDATE agents SET last_seen_at = now(), version = $1 WHERE token_hash = $2")
+            .bind(clipped(&body.version))
+            .bind(token_hash(secret))
+            .execute(&app.db)
+            .await?;
+    if updated.rows_affected() == 0 {
+        return Err(Error::Unauthorized);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}

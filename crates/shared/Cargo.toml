@@ -1,0 +1,14 @@
+[package]
+name = "dbm-shared"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aes-gcm = "0.11.1"
+base64 = "0.23.1"
+getrandom = "0.4.3"
+hkdf = "0.13.0"
+hpke = { version = "0.15", default-features = false, features = ["alloc", "getrandom", "x25519", "aes", "hkdfsha2"] }
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.2"
+uuid = { version = "1.29.3", features = ["serde"] }
