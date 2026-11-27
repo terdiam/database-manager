@@ -5,6 +5,7 @@
 	import { resolve } from '$app/paths';
 	import { request, type Backup, type DbServer, type Destination } from '#lib/api/http.ts';
 	import { namePattern } from '#lib/api/index.ts';
+	import { kinds } from '#lib/storage.ts';
 	import FormField from './FormField.svelte';
 	import PageHeader from './PageHeader.svelte';
 	import RetentionPicker from './RetentionPicker.svelte';
@@ -82,7 +83,7 @@
 		<FormField label={t('nav.databases')}>{#snippet children(a)}<Select {...a} required bind:value={form.server_id} options={servers.map((s) => ({ value: s.id, label: s.name, brand: s.engine, description: `${s.engine === 'sqlite' ? `/${s.host}` : `${s.host}:${s.port}`} · ${s.agent}` }))} />{/snippet}</FormField>
 		<FormField label={t(server?.engine === 'sqlite' ? 'field.fileName' : 'field.databaseName')} help={t(server?.engine === 'sqlite' ? 'help.fileName' : 'help.databaseName')}>{#snippet children(a)}<input {...a} class="input min-h-11" maxlength="63" pattern={namePattern(server?.engine)} required bind:value={form.database_name} />{/snippet}</FormField>
 	</div>
-	<FormField label={t('col.destination')} help={t('help.destinationAgent')}>{#snippet children(a)}<Select {...a} required bind:value={form.destination_id} options={usable.map((d) => ({ value: d.id, label: d.name, brand: 'S3 / MinIO', description: `s3://${d.bucket}/${d.prefix}` }))} />{/snippet}</FormField>
+	<FormField label={t('col.destination')} help={t('help.destinationAgent')}>{#snippet children(a)}<Select {...a} required bind:value={form.destination_id} options={usable.map((d) => ({ value: d.id, label: d.name, brand: kinds[d.kind].brand, description: d.kind === 's3' ? `s3://${d.bucket}/${d.prefix}` : `${d.endpoint}/${d.prefix}` }))} />{/snippet}</FormField>
 	{#if server && !usable.length}<p class="mb-3 text-sm text-warn" role="alert">{t('backups.noDestination', { agent: server.agent })} <a class="underline" href={resolve('destinations')}>{t('nav.destinations')}</a></p>{/if}
 	<div class="grid gap-x-3 sm:grid-cols-2">
 		<FormField label={t('wizard.compression')} help={t('help.compression')}>{#snippet children(a)}<Select {...a} bind:value={form.compression} options={(['zstd', 'gzip', 'lz4', 'xz', 'bzip2', 'none'] as const).map((c) => ({ value: c, label: c, description: t(`compression.${c}`) }))} />{/snippet}</FormField>

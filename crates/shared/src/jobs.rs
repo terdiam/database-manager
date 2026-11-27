@@ -74,20 +74,51 @@ fn postgresql() -> String {
     "postgresql".into()
 }
 
-/// Plaintext of a sealed S3 destination secret.
-#[derive(Serialize, Deserialize)]
-pub struct S3Secret {
+/// Plaintext of a sealed destination secret. Which fields are used depends on `kind`.
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct StorageSecret {
+    /// `s3` (also when empty, as before the other kinds), `sftp`, `ftp` or `smb`.
+    pub kind: String,
+    /// S3 only.
     pub endpoint: String,
     pub region: String,
-    pub bucket: String,
-    pub prefix: String,
     pub access_key: String,
     pub secret_key: String,
-    #[serde(default)]
     pub virtual_host: bool,
     /// Address browsers use to download, when `endpoint` is only reachable by the agent.
-    #[serde(default)]
     pub public_endpoint: String,
+    /// S3 bucket or SMB share.
+    pub bucket: String,
+    /// Folder inside the storage.
+    pub prefix: String,
+    /// SFTP, FTP and SMB.
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub password: String,
+    /// SFTP with a key.
+    pub private_key: String,
+    pub passphrase: String,
+    /// SFTP host key fingerprint (`SHA256:…`); empty trusts the first one seen.
+    pub fingerprint: String,
+    /// SMB.
+    pub domain: String,
+    /// FTP over TLS.
+    pub tls: bool,
+}
+
+/// Plaintext of a sealed SSH secret, used to reach a database through a bastion.
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SshSecret {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub password: String,
+    pub private_key: String,
+    pub passphrase: String,
+    pub fingerprint: String,
 }
 
 /// A value only this agent can open (HPKE, base64url) and what it is bound to.
@@ -110,6 +141,8 @@ pub enum Task {
         /// age recipients the file is encrypted to.
         recipients: Vec<String>,
         object_key: String,
+        #[serde(default)]
+        ssh: Option<Sealed>,
     },
     Restore {
         database: Sealed,
@@ -125,9 +158,16 @@ pub enum Task {
         /// The database the backup was taken from.
         #[serde(default)]
         source: String,
+        #[serde(default)]
+        ssh: Option<Sealed>,
     },
     TestDatabase {
         database: Sealed,
+        #[serde(default)]
+        ssh: Option<Sealed>,
+    },
+    TestSsh {
+        ssh: Sealed,
     },
     TestDestination {
         destination: Sealed,

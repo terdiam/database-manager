@@ -4,6 +4,7 @@ mod manifest;
 mod pipeline;
 mod progress;
 mod runner;
+mod ssh;
 mod state;
 mod storage;
 
@@ -283,6 +284,11 @@ async fn execute(api: &Api, state: &State, job: Job) {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::process::ExitCode {
     use tokio::signal::unix::{SignalKind, signal};
+
+    // ssh runs this binary to ask for a password or passphrase.
+    if ssh::answer_askpass() {
+        return std::process::ExitCode::SUCCESS;
+    }
 
     tracing_subscriber::fmt().init();
     // OpenDAL does not pick an HTTP client by itself when built without its defaults.

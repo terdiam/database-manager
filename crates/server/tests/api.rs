@@ -1960,3 +1960,156 @@ async fn a_backup_only_restores_into_its_own_engine(db: PgPool) {
     let claimed = as_agent(&app, &agent, "/api/agent/jobs/claim", json!({})).await;
     assert_eq!(claimed.body["job"]["task"]["source"], "app.db");
 }
+
+// ---------------------------------------------------------------- SSH tunnels and storage kinds
+
+#[sqlx::test]
+async fn tunnels_belong_to_their_agent_and_go_with_the_job(db: PgPool) {
+    let app = router(db.clone());
+    let cookie = admin(&app).await;
+    let agent = enroll(&app, &cookie, "a1").await;
+    let other = enroll(&app, &cookie, "a2").await;
+    let tunnel = uuid::Uuid::new_v4().to_string();
+    let body = json!({ "id": tunnel, "name": "bastion", "agent_id": agent.id, "host": "bastion", "port": 22,
+        "username": "backup", "auth": "password",
+        "secret": sealed_for(&agent, &tunnel, "ssh", r#"{"password":"very-secret"}"#) });
+    let mut bad = body.clone();
+    bad["host"] = json!("-oProxyCommand=x");
+    let reply = call(&app, "POST", "/api/ssh-configs", Some(&cookie), Some(bad)).await;
+    assert_eq!(reply.body["error"], "host");
+    let reply = call(&app, "POST", "/api/ssh-configs", Some(&cookie), Some(body)).await;
+    assert_eq!(reply.status, StatusCode::CREATED);
+
+    let add = |name: &str, engine: &str, owner: &Agent| {
+        let id = uuid::Uuid::new_v4().to_string();
+        let body = json!({ "id": id, "name": name, "engine": engine, "agent_id": owner.id, "host": "db", "port": 5432,
+            "username": "u", "ssh_config_id": tunnel, "secret": sealed_for(owner, &id, "database", "{}") });
+        (id, body)
+    };
+    for (case, code) in [
+        (add("x", "sqlite", &agent), "ssh_sqlite"),
+        (add("y", "mysql", &other), "different_agent"),
+    ] {
+        let reply = call(
+            &app,
+            "POST",
+            "/api/database-servers",
+            Some(&cookie),
+            Some(case.1),
+        )
+        .await;
+        assert_eq!(reply.body["error"], code);
+    }
+    let (server, body) = add("through", "postgresql", &agent);
+    let reply = call(
+        &app,
+        "POST",
+        "/api/database-servers",
+        Some(&cookie),
+        Some(body),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::CREATED);
+    let reply = call(
+        &app,
+        "DELETE",
+        &format!("/api/ssh-configs/{tunnel}"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(reply.body["error"], "in_use");
+
+    // The job carries both secrets; neither is readable by the server's listing.
+    call(
+        &app,
+        "POST",
+        &format!("/api/database-servers/{server}/test"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    let task = finish_next(&app, &agent, json!({ "sha256": null })).await;
+    assert_eq!(task["task"]["ssh"]["id"], tunnel);
+    call(
+        &app,
+        "POST",
+        &format!("/api/ssh-configs/{tunnel}/test"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    let task = finish_next(&app, &agent, json!({ "sha256": null })).await;
+    assert_eq!(task["task"]["kind"], "test_ssh");
+    let list = call(&app, "GET", "/api/ssh-configs", Some(&cookie), None).await;
+    assert_eq!(list.body[0]["used"], 1);
+    assert!(!list.body.to_string().contains("secret"));
+
+    // Editing without a tunnel connects directly.
+    let reply = call(
+        &app,
+        "PUT",
+        &format!("/api/database-servers/{server}"),
+        Some(&cookie),
+        Some(json!({ "name": "through" })),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    let list = call(&app, "GET", "/api/database-servers", Some(&cookie), None).await;
+    assert!(list.body[0]["ssh_config_id"].is_null());
+}
+
+#[sqlx::test]
+async fn only_s3_snapshots_can_be_downloaded(db: PgPool) {
+    let app = router(db.clone());
+    let cookie = admin(&app).await;
+    let agent = enroll(&app, &cookie, "a1").await;
+    let (server, _, _) = add_resources(&app, &cookie, &agent).await;
+    let nas = uuid::Uuid::new_v4().to_string();
+    let mut body = json!({ "id": nas, "name": "nas", "kind": "nfs", "agent_id": agent.id, "endpoint": "smb://nas:445",
+        "bucket": "share", "prefix": "", "username": "u", "secret": sealed_for(&agent, &nas, "destination", "{}") });
+    let reply = call(
+        &app,
+        "POST",
+        "/api/destinations",
+        Some(&cookie),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(reply.body["error"], "kind");
+    body["kind"] = json!("smb");
+    let reply = call(&app, "POST", "/api/destinations", Some(&cookie), Some(body)).await;
+    assert_eq!(reply.status, StatusCode::CREATED);
+    let entry = json!({ "name": "to-nas", "server_id": server, "database_name": "shop", "destination_id": nas,
+        "compression": "zstd", "level": 3 });
+    call(&app, "POST", "/api/backups", Some(&cookie), Some(entry)).await;
+    let list = call(&app, "GET", "/api/backups", Some(&cookie), None).await;
+    let id = list
+        .body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["name"] == "to-nas")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    call(
+        &app,
+        "POST",
+        &format!("/api/backups/{id}/run"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    finish_next(&app, &agent, json!({})).await;
+    let snapshots = call(&app, "GET", "/api/snapshots", Some(&cookie), None).await;
+    let snapshot = &snapshots.body["items"][0];
+    assert_eq!(snapshot["storage"], "smb");
+    let path = format!(
+        "/api/snapshots/{}/download",
+        snapshot["id"].as_str().unwrap()
+    );
+    let reply = call(&app, "POST", &path, Some(&cookie), None).await;
+    assert_eq!(reply.body["error"], "download_unsupported");
+}

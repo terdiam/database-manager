@@ -32,15 +32,15 @@ FROM mongo:8.0 AS mongo-tools
 # databases it backs up.
 FROM postgres:19-bookworm AS agent
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates mariadb-client sqlite3 libncurses6 libgssapi-krb5-2 \
+    ca-certificates mariadb-client sqlite3 libncurses6 libgssapi-krb5-2 openssh-client smbclient \
     && rm -rf /var/lib/apt/lists/*
 # MySQL's own tools in /usr/local/bin come before MariaDB's compatibility names.
 COPY --from=mysql-tools /usr/bin/mysql /usr/bin/mysqldump /usr/local/bin/
 COPY --from=mongo-tools /usr/bin/mongodump /usr/bin/mongorestore /usr/local/bin/
 # Fails the build if a copied tool cannot start here.
 RUN mysql --version && mysqldump --version && mongodump --version && mongorestore --version \
-    && mariadb-dump --version && sqlite3 --version
-RUN useradd --system --uid 10001 dbm
+    && mariadb-dump --version && sqlite3 --version && ssh -V && smbclient --version
+RUN useradd --system --uid 10001 --create-home dbm
 COPY --from=build /app/target/release/dbm-agent /usr/local/bin/
 RUN mkdir /data /sqlite && chown dbm /data /sqlite
 USER dbm

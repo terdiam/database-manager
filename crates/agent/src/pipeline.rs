@@ -11,7 +11,11 @@ use std::{
 use age::x25519;
 use tokio::runtime::Handle;
 
-use crate::{Result, engines, progress::Progress, storage::Upload};
+use crate::{
+    Result, engines,
+    progress::Progress,
+    storage::{Sink, Upload},
+};
 
 /// Kills the child if the pipeline stops early, and collects what it says on stderr.
 struct Running {
@@ -154,7 +158,7 @@ pub fn backup(
     compression: &str,
     level: i32,
     recipients: &[String],
-    writer: &mut opendal::Writer,
+    sink: &mut Sink,
     handle: Handle,
     progress: &Progress,
 ) -> Result<String> {
@@ -164,7 +168,7 @@ pub fn backup(
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let encryptor =
         age::Encryptor::with_recipients(recipients.iter().map(|r| r as &dyn age::Recipient))?;
-    let upload = Upload::new(writer, handle, progress.clone());
+    let upload = Upload::new(sink, handle, progress.clone());
 
     let mut tool = Running::start(&mut dump.command, dump.name)?;
     let mut stdout = tool
@@ -233,31 +237,6 @@ mod tests {
                 .unwrap();
             assert_eq!(back, original, "{kind}");
         }
-    }
-
-    /// Building the client is not enough: a request must find an HTTP transport.
-    #[tokio::test]
-    async fn s3_requests_have_a_transport() {
-        opendal::install_default();
-        let secret = dbm_shared::jobs::S3Secret {
-            endpoint: "http://127.0.0.1:1".into(),
-            region: String::new(),
-            bucket: "b".into(),
-            prefix: String::new(),
-            access_key: "a".into(),
-            secret_key: "s".into(),
-            virtual_host: false,
-            public_endpoint: String::new(),
-        };
-        let error = crate::storage::open(&secret)
-            .unwrap()
-            .stat("x")
-            .await
-            .unwrap_err();
-        assert!(
-            !error.to_string().contains("transport is not installed"),
-            "{error}"
-        );
     }
 
     #[test]

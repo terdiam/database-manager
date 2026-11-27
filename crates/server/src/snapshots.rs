@@ -106,6 +106,8 @@ pub struct Snapshot {
     sha256: String,
     compression: String,
     engine: String,
+    /// The destination's kind: only S3 can make a download link.
+    storage: String,
     #[serde(with = "time::serde::rfc3339")]
     created_at: OffsetDateTime,
     /// `None` when kept until rotated or removed by hand.
@@ -114,7 +116,7 @@ pub struct Snapshot {
 }
 
 const SELECT: &str = "SELECT s.id, s.server_name, s.database_name, d.name AS destination, d.agent_id, s.object_key,
-    s.size, s.sha256, s.compression, s.engine, s.created_at, s.expires_at FROM snapshots s JOIN destinations d ON d.id = s.destination_id";
+    s.size, s.sha256, s.compression, s.engine, d.kind AS storage, s.created_at, s.expires_at FROM snapshots s JOIN destinations d ON d.id = s.destination_id";
 
 #[derive(Deserialize)]
 pub struct Filter {
@@ -276,14 +278,18 @@ pub async fn download(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Queued>, Error> {
     me.require_operator()?;
-    let (server, destination_id, agent, object_key): (String, Uuid, Uuid, String) = sqlx::query_as(
-        "SELECT s.server_name, s.destination_id, d.agent_id, s.object_key
+    let (server, destination_id, agent, object_key, kind): (String, Uuid, Uuid, String, String) =
+        sqlx::query_as(
+            "SELECT s.server_name, s.destination_id, d.agent_id, s.object_key, d.kind
          FROM snapshots s JOIN destinations d ON d.id = s.destination_id WHERE s.id = $1",
-    )
-    .bind(id)
-    .fetch_optional(&app.db)
-    .await?
-    .ok_or(Error::NotFound)?;
+        )
+        .bind(id)
+        .fetch_optional(&app.db)
+        .await?
+        .ok_or(Error::NotFound)?;
+    if kind != "s3" {
+        return Err(Error::Invalid("download_unsupported"));
+    }
     let job = NewJob {
         destination_id: Some(destination_id),
         snapshot_id: Some(id),

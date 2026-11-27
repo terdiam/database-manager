@@ -25,10 +25,12 @@ Done:
 - [x] Telegram and Mattermost alerts
 - [x] Download backup files
 - [x] Edit databases, storage, backups, alerts, users and agent names
+- [x] SSH tunnels to databases
+- [x] SFTP, FTP/FTPS and Samba storage
 
 Planned:
 
-- [ ] SSH tunnel; SFTP, FTP, Samba and Google Drive storage
+- [ ] Google Drive storage
 - [ ] Redis, Elasticsearch, OpenSearch
 - [ ] Incremental backups
 
@@ -59,6 +61,12 @@ DBM_ENROLL_TOKEN=<token> docker compose --profile agent up -d --build agent
 The agent connects to your database and storage, so use addresses it can reach
 (`host.docker.internal` for something running on the Docker host).
 
+## SSH tunnels
+
+Add the tunnel on the SSH Tunnel page, then choose it on a database. The database host and
+port are as seen from the SSH server. The first host key seen is remembered; a changed key
+stops the connection. Download links are only available for S3 destinations.
+
 ## SQLite
 
 The agent only touches files inside its `DBM_SQLITE_ROOT` (`/sqlite` in Docker). Set
@@ -68,7 +76,7 @@ Stop the application that uses a file before restoring over it.
 
 ## Backups
 
-Add a database and an S3 destination, then create a backup with a schedule or run it by hand.
+Add a database and a destination (S3, SFTP, FTP or Samba), then create a backup with a schedule or run it by hand.
 A new retention setting applies to backups made after it. Passwords are
 encrypted in the browser for the agent, which needs `https` or `localhost`.
 

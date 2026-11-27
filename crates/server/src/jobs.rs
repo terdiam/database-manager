@@ -38,6 +38,7 @@ pub struct NewJob {
     pub compression: Option<String>,
     pub level: Option<i32>,
     pub key_id: Option<i32>,
+    pub ssh_config_id: Option<Uuid>,
 }
 
 impl NewJob {
@@ -56,6 +57,7 @@ impl NewJob {
             compression: None,
             level: None,
             key_id: None,
+            ssh_config_id: None,
         }
     }
 }
@@ -63,8 +65,8 @@ impl NewJob {
 pub async fn enqueue(db: &PgPool, job: NewJob) -> Result<Uuid, Error> {
     let id = sqlx::query_scalar(
         "INSERT INTO jobs (kind, agent_id, target, created_by, backup_config_id, server_id, destination_id,
-                           snapshot_id, database_name, object_key, compression, level, key_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id",
+                           snapshot_id, database_name, object_key, compression, level, key_id, ssh_config_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id",
     )
     .bind(job.kind)
     .bind(job.agent_id)
@@ -79,6 +81,7 @@ pub async fn enqueue(db: &PgPool, job: NewJob) -> Result<Uuid, Error> {
     .bind(job.compression)
     .bind(job.level)
     .bind(job.key_id)
+    .bind(job.ssh_config_id)
     .fetch_one(db)
     .await?;
     Ok(id)
@@ -251,6 +254,7 @@ struct Claimed {
     compression: Option<String>,
     level: Option<i32>,
     key_id: Option<i32>,
+    ssh_config_id: Option<Uuid>,
 }
 
 async fn sealed_from(db: &PgPool, sql: &'static str, id: Option<Uuid>) -> Result<Sealed, Error> {
@@ -283,9 +287,29 @@ async fn task(app: &AppState, agent: Uuid, job: &Claimed) -> Result<Task, Error>
             job.destination_id,
         )
     };
+    // The tunnel of the database this job talks to, if it has one.
+    let tunnel = || async {
+        let id: Option<Uuid> =
+            sqlx::query_scalar("SELECT ssh_config_id FROM database_servers WHERE id = $1")
+                .bind(job.server_id)
+                .fetch_optional(&app.db)
+                .await?
+                .flatten();
+        match id {
+            Some(id) => sealed_from(
+                &app.db,
+                "SELECT secret FROM ssh_configs WHERE id = $1",
+                Some(id),
+            )
+            .await
+            .map(Some),
+            None => Ok(None),
+        }
+    };
     let missing = || Error::Conflict("record_removed");
     Ok(match job.kind.as_str() {
         "backup" => Task::Backup {
+            ssh: tunnel().await?,
             database: database().await?,
             destination: destination().await?,
             name: job.database_name.clone().ok_or_else(missing)?,
@@ -305,6 +329,7 @@ async fn task(app: &AppState, agent: Uuid, job: &Claimed) -> Result<Task, Error>
                 .await?
                 .ok_or_else(missing)?;
             Task::Restore {
+                ssh: tunnel().await?,
                 database: database().await?,
                 destination: destination().await?,
                 identity: keys::seal_identity(app, key_id, agent, job.id).await?,
@@ -318,6 +343,15 @@ async fn task(app: &AppState, agent: Uuid, job: &Claimed) -> Result<Task, Error>
         }
         "test_database" => Task::TestDatabase {
             database: database().await?,
+            ssh: tunnel().await?,
+        },
+        "test_ssh" => Task::TestSsh {
+            ssh: sealed_from(
+                &app.db,
+                "SELECT secret FROM ssh_configs WHERE id = $1",
+                job.ssh_config_id,
+            )
+            .await?,
         },
         "test_destination" => Task::TestDestination {
             destination: destination().await?,
@@ -344,7 +378,7 @@ pub async fn claim(State(app): State<AppState>, headers: HeaderMap) -> Result<Js
          WHERE id = (SELECT id FROM jobs WHERE agent_id = $1 AND status = 'pending'
                      ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED)
          RETURNING id, lease, kind, server_id, destination_id, snapshot_id, database_name, object_key,
-                   compression, level, key_id",
+                   compression, level, key_id, ssh_config_id",
     )
     .bind(agent)
     .bind(f64::from(LEASE_SECS))

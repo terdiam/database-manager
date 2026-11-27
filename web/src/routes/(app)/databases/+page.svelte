@@ -2,7 +2,7 @@
 	import IconButton from '#lib/components/IconButton.svelte';
 	import { onMount } from 'svelte';
 	import { resolve } from '$app/paths';
-	import { request, type Agent, type DbServer, type Queued } from '#lib/api/http.ts';
+	import { request, type Agent, type DbServer, type Queued, type SshConfig } from '#lib/api/http.ts';
 	import { connectionOf, engines } from '#lib/api/index.ts';
 	import BrandIcon from '#lib/components/BrandIcon.svelte';
 	import ConfirmDialog from '#lib/components/ConfirmDialog.svelte';
@@ -12,6 +12,7 @@
 	import Modal from '#lib/components/Modal.svelte';
 	import JobDialog from '#lib/components/JobDialog.svelte';
 	import PageHeader from '#lib/components/PageHeader.svelte';
+	import Select from '#lib/components/Select.svelte';
 	import { toast } from '#lib/components/toast.svelte.ts';
 	import { errorText } from '#lib/errors.ts';
 	import { t } from '#lib/i18n/index.svelte.ts';
@@ -29,17 +30,20 @@
 	let editor: Modal;
 	let editing = $state<DbServer>();
 	let agent = $state<Agent>();
-	let form = $state({ name: '', reconnect: false, host: '', port: 5432, username: '', password: '', ssl_mode: '' });
+	let tunnels = $state<SshConfig[]>([]);
+	let form = $state({ name: '', reconnect: false, host: '', port: 5432, username: '', password: '', ssl_mode: '', ssh_config_id: '' });
 	let formError = $state('');
 
 	async function edit(server: DbServer) {
 		editing = server;
-		form = { name: server.name, reconnect: false, host: server.host, port: server.port, username: server.username, password: '', ssl_mode: server.ssl_mode ?? '' };
+		form = { name: server.name, reconnect: false, host: server.host, port: server.port, username: server.username, password: '', ssl_mode: server.ssl_mode ?? '', ssh_config_id: server.ssh_config_id ?? '' };
 		formError = '';
 		agent = undefined;
 		editor.open();
 		try {
-			agent = (await request<Agent[]>('GET', '/agents')).find((a) => a.id === server.agent_id);
+			const [agents, configs] = await Promise.all([request<Agent[]>('GET', '/agents'), request<SshConfig[]>('GET', '/ssh-configs')]);
+			agent = agents.find((a) => a.id === server.agent_id);
+			tunnels = configs;
 		} catch (e) {
 			formError = errorText(e);
 		}
@@ -57,7 +61,7 @@
 				const { host, port, username, ssl_mode } = values;
 				connection = { host, port, username, ssl_mode, secret };
 			}
-			await request('PUT', `/database-servers/${id}`, { name, connection });
+			await request('PUT', `/database-servers/${id}`, { name, connection, ssh_config_id: form.ssh_config_id || null });
 			close();
 			form.password = '';
 			toast(t('toast.updated', { name }));
@@ -117,7 +121,7 @@
 		{:else if i === 1}<span class="inline-flex items-center gap-2"><BrandIcon name={server.engine} />{engines[server.engine].label}</span>
 		{:else if i === 2}<code class="text-xs">{server.engine === 'sqlite' ? `/${server.host}` : `${server.host}:${server.port}`}</code>
 		{:else if i === 3}{server.username}
-		{:else if i === 4}{server.agent}
+		{:else if i === 4}{server.agent}{#if server.ssh}<span class="block text-xs text-dim">SSH: {server.ssh}</span>{/if}
 		{:else}<span class="flex flex-wrap justify-end gap-1">
 			<IconButton icon="plug" label={t('action.test')} onclick={() => test(server)} />
 			<IconButton icon="edit" label={t('action.edit')} onclick={() => edit(server)} />
@@ -133,6 +137,7 @@
 			<label class="mb-1 flex items-center gap-2 text-sm font-medium"><input type="checkbox" bind:checked={form.reconnect} />{t('field.changeConnection')}</label>
 			<p class="mb-3 text-xs text-dim">{t('help.changeConnection', { agent: editing?.agent ?? '' })}</p>
 			{#if form.reconnect && editing}<ConnectionFields engine={editing.engine} bind:form />{/if}
+			{#if editing && editing.engine !== 'sqlite'}<FormField label="SSH tunnel" help={t('help.tunnel')}>{#snippet children(a)}<Select {...a} bind:value={form.ssh_config_id} options={[{ value: '', label: t('field.noTunnel') }, ...tunnels.filter((c) => c.agent_id === editing?.agent_id).map((c) => ({ value: c.id, label: c.name, icon: 'key' as const, description: `${c.username}@${c.host}` }))]} />{/snippet}</FormField>{/if}
 			<p class="text-sm text-bad empty:hidden" role="alert">{formError}</p>
 			<div class="mt-4 flex justify-end gap-2">
 				<button type="button" class="btn" onclick={close}>{t('action.cancel')}</button>

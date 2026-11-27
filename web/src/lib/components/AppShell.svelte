@@ -15,8 +15,6 @@
 	let collapsed = $state(false);
 	let tour: Tour;
 	let palette: CommandPalette;
-	// Still shows sample data until its phase.
-	const sample = $derived(page.url.pathname.startsWith('/ssh'));
 
 	function startTour() {
 		drawer.close();
@@ -46,7 +44,7 @@
 	<div class="min-w-0 flex-1">
 		<header class="sticky top-0 z-10 flex items-center gap-2 border-b border-line bg-surface px-4 py-2">
 			<button type="button" class="btn px-2" aria-label={t('nav.toggle')} onclick={toggleMenu}><Icon name="menu" /></button>
-			<span class="mr-auto">{#if sample}<span class="rounded-full border border-warn px-2 py-0.5 text-xs text-warn">{t('demo.badge')}</span>{/if}</span>
+			<span class="mr-auto"></span>
 			<button type="button" class="btn min-h-10 text-dim" aria-keyshortcuts="Meta+K Control+K" onclick={() => palette.open()}>
 				<Icon name="search" /><span class="max-sm:sr-only">{t('palette.button')}</span>
 				<kbd class="rounded border border-line px-1.5 text-xs max-sm:hidden">{navigator.platform.startsWith('Mac') ? '⌘K' : 'Ctrl K'}</kbd>

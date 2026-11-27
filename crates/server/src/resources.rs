@@ -21,14 +21,14 @@ use crate::{
 use time::OffsetDateTime;
 
 /// Sealed secrets are an encapsulated key plus a small JSON document.
-fn sealed_bytes(text: &str) -> Result<Vec<u8>, Error> {
+pub fn sealed_bytes(text: &str) -> Result<Vec<u8>, Error> {
     e2ee::decode(text)
         .ok()
         .filter(|bytes| (48..=8192).contains(&bytes.len()))
         .ok_or(Error::Invalid("secret"))
 }
 
-fn named(value: &str, code: &'static str) -> Result<String, Error> {
+pub fn named(value: &str, code: &'static str) -> Result<String, Error> {
     let value = value.trim();
     if value.is_empty() || value.len() > 64 {
         return Err(Error::Invalid(code));
@@ -36,7 +36,7 @@ fn named(value: &str, code: &'static str) -> Result<String, Error> {
     Ok(value.to_owned())
 }
 
-fn field(value: &str, code: &'static str) -> Result<(), Error> {
+pub fn field(value: &str, code: &'static str) -> Result<(), Error> {
     if value.len() > 255 {
         Err(Error::Invalid(code))
     } else {
@@ -44,7 +44,7 @@ fn field(value: &str, code: &'static str) -> Result<(), Error> {
     }
 }
 
-async fn require_agent_key(app: &AppState, agent: Uuid) -> Result<(), Error> {
+pub async fn require_agent_key(app: &AppState, agent: Uuid) -> Result<(), Error> {
     let has: Option<bool> =
         sqlx::query_scalar("SELECT public_key IS NOT NULL FROM agents WHERE id = $1")
             .bind(agent)
@@ -67,6 +67,8 @@ pub struct Server {
     port: i32,
     username: String,
     ssl_mode: Option<String>,
+    ssh_config_id: Option<Uuid>,
+    ssh: Option<String>,
 }
 
 pub async fn list_servers(
@@ -74,8 +76,10 @@ pub async fn list_servers(
     Auth(_): Auth,
 ) -> Result<Json<Vec<Server>>, Error> {
     let rows = sqlx::query_as(
-        "SELECT s.id, s.name, s.engine, s.agent_id, a.name AS agent, s.host, s.port, s.username, s.ssl_mode
-         FROM database_servers s JOIN agents a ON a.id = s.agent_id ORDER BY s.name LIMIT 500",
+        "SELECT s.id, s.name, s.engine, s.agent_id, a.name AS agent, s.host, s.port, s.username, s.ssl_mode,
+                s.ssh_config_id, c.name AS ssh
+         FROM database_servers s JOIN agents a ON a.id = s.agent_id
+         LEFT JOIN ssh_configs c ON c.id = s.ssh_config_id ORDER BY s.name LIMIT 500",
     )
     .fetch_all(&app.db)
     .await?;
@@ -95,7 +99,33 @@ pub struct NewServer {
     username: String,
     #[serde(default)]
     ssl_mode: Option<String>,
+    #[serde(default)]
+    ssh_config_id: Option<Uuid>,
     secret: String,
+}
+
+/// A tunnel belongs to one agent, and SQLite is a file: nothing to forward.
+async fn check_tunnel(
+    app: &AppState,
+    tunnel: Option<Uuid>,
+    agent: Uuid,
+    engine: &str,
+) -> Result<(), Error> {
+    let Some(tunnel) = tunnel else {
+        return Ok(());
+    };
+    if engine == "sqlite" {
+        return Err(Error::Invalid("ssh_sqlite"));
+    }
+    let owner: Option<Uuid> = sqlx::query_scalar("SELECT agent_id FROM ssh_configs WHERE id = $1")
+        .bind(tunnel)
+        .fetch_optional(&app.db)
+        .await?;
+    match owner {
+        Some(owner) if owner == agent => Ok(()),
+        Some(_) => Err(Error::Invalid("different_agent")),
+        None => Err(Error::NotFound),
+    }
 }
 
 fn postgresql() -> String {
@@ -117,9 +147,11 @@ pub async fn create_server(
     }
     let secret = sealed_bytes(&body.secret)?;
     require_agent_key(&app, body.agent_id).await?;
+    check_tunnel(&app, body.ssh_config_id, body.agent_id, &body.engine).await?;
     sqlx::query(
-        "INSERT INTO database_servers (id, name, engine, agent_id, host, port, username, secret, ssl_mode)
-         VALUES ($1, $2, $9, $3, $4, $5, $6, $7, $8)",
+        "INSERT INTO database_servers (id, name, engine, agent_id, host, port, username, secret, ssl_mode,
+             ssh_config_id)
+         VALUES ($1, $2, $9, $3, $4, $5, $6, $7, $8, $10)",
     )
     .bind(body.id)
     .bind(&name)
@@ -130,6 +162,7 @@ pub async fn create_server(
     .bind(secret)
     .bind(ssl_mode(body.ssl_mode.as_deref())?)
     .bind(&body.engine)
+    .bind(body.ssh_config_id)
     .execute(&app.db)
     .await?;
     audit::record(
@@ -165,6 +198,9 @@ pub struct Connection {
 pub struct ServerEdit {
     name: String,
     connection: Option<Connection>,
+    /// Always the full choice: `null` connects directly.
+    #[serde(default)]
+    ssh_config_id: Option<Uuid>,
 }
 
 pub async fn update_server(
@@ -176,15 +212,20 @@ pub async fn update_server(
 ) -> Result<StatusCode, Error> {
     me.require_operator()?;
     let name = named(&body.name, "name")?;
+    let (agent, engine): (Uuid, String) =
+        sqlx::query_as("SELECT agent_id, engine FROM database_servers WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&app.db)
+            .await?
+            .ok_or(Error::NotFound)?;
+    check_tunnel(&app, body.ssh_config_id, agent, &engine).await?;
     let mut tx = app.db.begin().await?;
-    let found = sqlx::query("UPDATE database_servers SET name = $2 WHERE id = $1")
+    sqlx::query("UPDATE database_servers SET name = $2, ssh_config_id = $3 WHERE id = $1")
         .bind(id)
         .bind(&name)
+        .bind(body.ssh_config_id)
         .execute(&mut *tx)
         .await?;
-    if found.rows_affected() == 0 {
-        return Err(Error::NotFound);
-    }
     if let Some(connection) = &body.connection {
         field(&connection.host, "host")?;
         field(&connection.username, "username")?;
@@ -276,6 +317,7 @@ pub struct Destination {
     region: Option<String>,
     virtual_host: Option<bool>,
     public_endpoint: Option<String>,
+    username: Option<String>,
 }
 
 pub async fn list_destinations(
@@ -284,7 +326,7 @@ pub async fn list_destinations(
 ) -> Result<Json<Vec<Destination>>, Error> {
     let rows = sqlx::query_as(
         "SELECT d.id, d.name, d.kind, d.agent_id, a.name AS agent, d.endpoint, d.bucket, d.prefix,
-                d.region, d.virtual_host, d.public_endpoint
+                d.region, d.virtual_host, d.public_endpoint, d.username
          FROM destinations d JOIN agents a ON a.id = d.agent_id ORDER BY d.name LIMIT 500",
     )
     .fetch_all(&app.db)
@@ -300,9 +342,15 @@ pub struct NewDestination {
     endpoint: String,
     bucket: String,
     prefix: String,
+    #[serde(default = "s3")]
+    kind: String,
     #[serde(flatten)]
     options: Options,
     secret: String,
+}
+
+fn s3() -> String {
+    "s3".into()
 }
 
 #[derive(Deserialize, Default)]
@@ -313,11 +361,15 @@ pub struct Options {
     virtual_host: Option<bool>,
     #[serde(default)]
     public_endpoint: Option<String>,
+    /// SFTP, FTP and SMB.
+    #[serde(default)]
+    username: Option<String>,
 }
 
 impl Options {
     fn check(&self) -> Result<(), Error> {
         field(self.region.as_deref().unwrap_or_default(), "endpoint")?;
+        field(self.username.as_deref().unwrap_or_default(), "username")?;
         field(
             self.public_endpoint.as_deref().unwrap_or_default(),
             "endpoint",
@@ -337,12 +389,15 @@ pub async fn create_destination(
     field(&body.bucket, "bucket")?;
     field(&body.prefix, "prefix")?;
     body.options.check()?;
+    if !["s3", "sftp", "ftp", "smb"].contains(&body.kind.as_str()) {
+        return Err(Error::Invalid("kind"));
+    }
     let secret = sealed_bytes(&body.secret)?;
     require_agent_key(&app, body.agent_id).await?;
     sqlx::query(
         "INSERT INTO destinations (id, name, kind, agent_id, endpoint, bucket, prefix, secret, region,
-             virtual_host, public_endpoint)
-         VALUES ($1, $2, 's3', $3, $4, $5, $6, $7, $8, $9, $10)",
+             virtual_host, public_endpoint, username)
+         VALUES ($1, $2, $12, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(body.id)
     .bind(&name)
@@ -354,6 +409,8 @@ pub async fn create_destination(
     .bind(&body.options.region)
     .bind(body.options.virtual_host)
     .bind(&body.options.public_endpoint)
+    .bind(&body.options.username)
+    .bind(&body.kind)
     .execute(&app.db)
     .await?;
     audit::record(
@@ -421,7 +478,7 @@ pub async fn update_destination(
         }
         sqlx::query(
             "UPDATE destinations SET endpoint = $2, bucket = $3, prefix = $4, secret = $5, region = $6,
-                 virtual_host = $7, public_endpoint = $8
+                 virtual_host = $7, public_endpoint = $8, username = $9
              WHERE id = $1",
         )
         .bind(id)
@@ -432,6 +489,7 @@ pub async fn update_destination(
         .bind(&storage.options.region)
         .bind(storage.options.virtual_host)
         .bind(&storage.options.public_endpoint)
+        .bind(&storage.options.username)
         .execute(&mut *tx)
         .await?;
     }

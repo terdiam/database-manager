@@ -109,7 +109,7 @@
 			<dt class="text-dim">SHA-256</dt><dd><code class="text-xs break-all">{snapshot.sha256}</code></dd>
 			<dt class="text-dim">{t('col.expires')}</dt><dd>{snapshot.expires_at ? dateTime(snapshot.expires_at) : '-'}</dd>
 		</dl>
-		{#if canOperate()}
+		{#if canOperate() && snapshot.storage === 's3'}
 			<div class="mt-4 flex flex-wrap items-center gap-2">
 				<button type="button" class="btn" onclick={download}>{t('action.download')}</button>
 				<span role="status">{#if link}<a class="btn btn-primary" href={link} target="_blank" rel="noopener noreferrer external">{t('snapshots.saveFile')}</a>{/if}</span>

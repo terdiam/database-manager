@@ -1,4 +1,4 @@
-// Shared constants, and sample data for the page that has no backend yet (SSH tunnels).
+// Shared constants about database engines and statuses.
 export type Engine = 'postgresql' | 'mysql' | 'mariadb' | 'mongodb' | 'sqlite' | 'redis' | 'opensearch' | 'elasticsearch';
 export type Status = 'completed' | 'running' | 'failed' | 'pending' | 'cancelled' | 'online' | 'offline';
 
@@ -25,8 +25,3 @@ export const engines: Record<Engine, { label: string; port: number; incremental:
 	opensearch: { label: 'OpenSearch', port: 9200, incremental: false },
 	elasticsearch: { label: 'Elasticsearch', port: 9200, incremental: false }
 };
-
-export const sshConfigs = [
-	{ id: 's1', name: 'bastion-prod', host: 'bastion.example.com', port: 22, user: 'backup', auth: 'key', used: 2 },
-	{ id: 's2', name: 'jump-staging', host: '10.8.0.4', port: 2222, user: 'deploy', auth: 'password', used: 1 }
-];

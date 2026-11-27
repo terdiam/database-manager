@@ -14,6 +14,7 @@ mod resources;
 mod schedule;
 mod scheduler;
 mod snapshots;
+mod ssh;
 mod turnstile;
 mod users;
 mod web;
@@ -119,6 +120,9 @@ pub fn app(state: AppState) -> Router {
         .route("/agents/tokens", post(agents::create_token))
         .route("/agents/{id}", put(agents::rename).delete(agents::remove))
         .route("/audit", get(audit::list))
+        .route("/ssh-configs", get(ssh::list).post(ssh::create))
+        .route("/ssh-configs/{id}", put(ssh::update).delete(ssh::delete))
+        .route("/ssh-configs/{id}/test", post(ssh::test))
         .route(
             "/database-servers",
             get(resources::list_servers).post(resources::create_server),

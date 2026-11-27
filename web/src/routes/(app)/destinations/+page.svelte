@@ -5,26 +5,26 @@
 	import BrandIcon from '#lib/components/BrandIcon.svelte';
 	import ConfirmDialog from '#lib/components/ConfirmDialog.svelte';
 	import DataTable from '#lib/components/DataTable.svelte';
+	import DestinationFields from '#lib/components/DestinationFields.svelte';
 	import FormField from '#lib/components/FormField.svelte';
 	import JobDialog from '#lib/components/JobDialog.svelte';
 	import Modal from '#lib/components/Modal.svelte';
 	import PageHeader from '#lib/components/PageHeader.svelte';
-	import PasswordInput from '#lib/components/PasswordInput.svelte';
 	import Select from '#lib/components/Select.svelte';
 	import { toast } from '#lib/components/toast.svelte.ts';
 	import { errorText } from '#lib/errors.ts';
 	import { t } from '#lib/i18n/index.svelte.ts';
 	import { live } from '#lib/events.ts';
 	import { sealFor } from '#lib/secrets.ts';
+	import { blankStorage, connectionOf, formOf, kinds, type Kind } from '#lib/storage.ts';
 	import { canOperate } from '#lib/session.svelte.ts';
 
-	const blank = () => ({ name: '', agent: '', endpoint: '', region: '', bucket: '', prefix: '', access_key: '', secret_key: '', virtual_host: false, public_endpoint: '' });
 	let destinations = $state<Destination[]>([]);
 	let agents = $state<Agent[]>([]);
 	let error = $state('');
 	let loadError = $state('');
 	let formError = $state('');
-	let form = $state(blank());
+	let form = $state(blankStorage());
 	let removing = $state<Destination>();
 	// Set while the dialog edits an existing destination.
 	let editing = $state<Destination>();
@@ -49,9 +49,7 @@
 	async function open(destination?: Destination) {
 		editing = destination;
 		reconnect = !destination;
-		form = destination
-			? { ...blank(), name: destination.name, agent: destination.agent_id, endpoint: destination.endpoint, region: destination.region ?? '', bucket: destination.bucket, prefix: destination.prefix, virtual_host: destination.virtual_host ?? false, public_endpoint: destination.public_endpoint ?? '' }
-			: blank();
+		form = destination ? formOf(destination) : blankStorage();
 		formError = '';
 		modal.open();
 		try {
@@ -66,14 +64,15 @@
 		event.preventDefault();
 		const element = event.currentTarget;
 		const id = editing?.id ?? crypto.randomUUID();
-		const { name, agent, endpoint, region, bucket, prefix, access_key, secret_key, virtual_host, public_endpoint } = form;
+		const { name, agent, kind } = form;
 		try {
-			const options = { region: region.trim(), virtual_host, public_endpoint: public_endpoint.trim() };
-			const connection = reconnect
-				? { endpoint, bucket, prefix, ...options, secret: await sealFor(agents.find((a) => a.id === agent), 'destination', id, { endpoint: endpoint.trim(), bucket: bucket.trim(), prefix: prefix.trim(), access_key, secret_key, ...options }) }
-				: undefined;
+			let connection;
+			if (reconnect) {
+				const { record, secret } = connectionOf(form);
+				connection = { ...record, secret: await sealFor(agents.find((a) => a.id === agent), 'destination', id, secret) };
+			}
 			if (editing) await request('PUT', `/destinations/${id}`, { name, connection });
-			else await request('POST', '/destinations', { id, name, agent_id: agent, ...connection });
+			else await request('POST', '/destinations', { id, name, kind, agent_id: agent, ...connection });
 			close();
 			element.reset();
 			toast(t(editing ? 'toast.updated' : 'toast.created', { name }));
@@ -112,8 +111,8 @@
 <DataTable label={t('nav.destinations')} columns={[t('col.name'), t('col.type'), t('col.target'), t('col.via'), ...(canOperate() ? [t('col.actions')] : [])]} rows={destinations}>
 	{#snippet cell(d, i)}
 		{#if i === 0}<strong>{d.name}</strong>
-		{:else if i === 1}<span class="inline-flex items-center gap-2"><BrandIcon name="S3 / MinIO" />S3 / MinIO</span>
-		{:else if i === 2}<code class="text-xs break-all">{d.endpoint || 'AWS'} · s3://{d.bucket}/{d.prefix}</code>
+		{:else if i === 1}<span class="inline-flex items-center gap-2"><BrandIcon name={kinds[d.kind].brand} />{kinds[d.kind].label}</span>
+		{:else if i === 2}<code class="text-xs break-all">{d.kind === 's3' ? `${d.endpoint || 'AWS'} · s3://${d.bucket}/${d.prefix}` : `${d.endpoint}/${d.bucket ? `${d.bucket}/` : ''}${d.prefix}`}</code>
 		{:else if i === 3}{d.agent}
 		{:else}<span class="flex flex-wrap justify-end gap-1">
 			<IconButton icon="plug" label={t('action.test')} onclick={() => test(d)} />
@@ -126,25 +125,15 @@
 <Modal bind:this={modal} title={editing ? `${t('action.edit')}: ${editing.name}` : t('destinations.new')}>
 	{#snippet children(close)}
 		<form onsubmit={(e) => create(e, close)}>
-			<p class="mb-3 text-sm text-dim">{t('destinations.s3Only')}</p>
 			<FormField label={t('col.name')}>{#snippet children(a)}<input {...a} class="input" maxlength="64" required bind:value={form.name} />{/snippet}</FormField>
 			{#if editing}
 				<label class="mb-1 flex items-center gap-2 text-sm font-medium"><input type="checkbox" bind:checked={reconnect} />{t('field.changeConnection')}</label>
 				<p class="mb-3 text-xs text-dim">{t('help.changeConnection', { agent: editing.agent })}</p>
+			{:else}
+				<FormField label={t('col.type')}>{#snippet children(a)}<Select {...a} bind:value={() => form.kind, (kind) => (form = { ...blankStorage(kind as Kind), name: form.name, agent: form.agent })} options={Object.entries(kinds).map(([value, k]) => ({ value, label: k.label, brand: k.brand }))} />{/snippet}</FormField>
+				<FormField label={t('field.agent')} help={t('help.destinationAgent')}>{#snippet children(a)}<Select {...a} required bind:value={form.agent} options={agents.map((x) => ({ value: x.id, label: x.name, icon: 'server' as const }))} />{/snippet}</FormField>
 			{/if}
-			{#if reconnect}
-			{#if !editing}<FormField label={t('field.agent')} help={t('help.destinationAgent')}>{#snippet children(a)}<Select {...a} required bind:value={form.agent} options={agents.map((x) => ({ value: x.id, label: x.name, icon: 'server' as const }))} />{/snippet}</FormField>{/if}
-			<FormField label="Endpoint" help={t('help.endpoint')}>{#snippet children(a)}<input {...a} class="input" type="url" maxlength="255" placeholder="http://minio:9000" bind:value={form.endpoint} />{/snippet}</FormField>
-			<FormField label={t('field.publicEndpoint')} help={t('help.publicEndpoint')}>{#snippet children(a)}<input {...a} class="input" type="url" maxlength="255" bind:value={form.public_endpoint} />{/snippet}</FormField>
-			<div class="grid gap-x-3 sm:grid-cols-2">
-				<FormField label="Bucket">{#snippet children(a)}<input {...a} class="input" maxlength="255" required bind:value={form.bucket} />{/snippet}</FormField>
-				<FormField label="Region">{#snippet children(a)}<input {...a} class="input" maxlength="64" placeholder="us-east-1" bind:value={form.region} />{/snippet}</FormField>
-			</div>
-			<FormField label={t('field.prefix')}>{#snippet children(a)}<input {...a} class="input" maxlength="255" placeholder="backups/" bind:value={form.prefix} />{/snippet}</FormField>
-			<FormField label="Access key">{#snippet children(a)}<input {...a} class="input" autocomplete="off" required bind:value={form.access_key} />{/snippet}</FormField>
-			<FormField label="Secret key" help={t('help.sealed')}>{#snippet children(a)}<PasswordInput {...a} autocomplete="new-password" required bind:value={form.secret_key} />{/snippet}</FormField>
-			<label class="mb-3 flex items-center gap-2 text-sm"><input type="checkbox" bind:checked={form.virtual_host} />{t('field.virtualHost')}</label>
-			{/if}
+			{#if reconnect}<DestinationFields bind:form />{/if}
 			<p class="text-sm text-bad empty:hidden" role="alert">{formError}</p>
 			<div class="mt-4 flex justify-end gap-2">
 				<button type="button" class="btn" onclick={close}>{t('action.cancel')}</button>

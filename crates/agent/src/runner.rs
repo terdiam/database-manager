@@ -4,12 +4,14 @@ use std::time::Duration;
 
 use dbm_shared::{
     e2ee::{self, SecretContext},
-    jobs::{DatabaseSecret, Job, S3Secret, Sealed, Task},
+    jobs::{DatabaseSecret, Job, Sealed, SshSecret, StorageSecret, Task},
 };
 use serde::de::DeserializeOwned;
 use tokio::{runtime::Handle, task};
 
-use crate::{Result, engines, manifest, pipeline, progress::Progress, state::State, storage};
+use crate::{
+    Result, engines, manifest, pipeline, progress::Progress, ssh::Tunnel, state::State, storage,
+};
 
 /// Opens a secret sealed to this agent. A server cannot read it, and cannot move it
 /// to another record without the check failing.
@@ -27,6 +29,35 @@ fn open(state: &State, sealed: &Sealed, kind: &str) -> Result<Vec<u8>> {
 
 fn open_json<T: DeserializeOwned>(state: &State, sealed: &Sealed, kind: &str) -> Result<T> {
     Ok(serde_json::from_slice(&open(state, sealed, kind)?)?)
+}
+
+/// The database to talk to, going through its SSH tunnel when it has one. The tunnel
+/// stays open as long as it is held.
+async fn database(
+    state: &State,
+    sealed: &Sealed,
+    ssh: Option<&Sealed>,
+    progress: &Progress,
+) -> Result<(DatabaseSecret, Option<Tunnel>)> {
+    let mut secret: DatabaseSecret = open_json(state, sealed, "database")?;
+    let Some(sealed) = ssh else {
+        return Ok((secret, None));
+    };
+    let login: SshSecret = open_json(state, sealed, "ssh")?;
+    if secret.engine == "sqlite" {
+        return Err("SQLite files cannot be reached through SSH".into());
+    }
+    let tunnel = Tunnel::open(&sealed.id, &login, &secret.host, secret.port).await?;
+    progress.log("info", format!("SSH tunnel through {} is open", login.host));
+    // Tools talk to the near end; the far end resolves the database host.
+    secret.host = "127.0.0.1".into();
+    secret.port = tunnel.port;
+    Ok((secret, Some(tunnel)))
+}
+
+async fn store(state: &State, sealed: &Sealed) -> Result<(storage::Store, StorageSecret)> {
+    let secret: StorageSecret = open_json(state, sealed, "destination")?;
+    Ok((storage::open(&secret, &sealed.id).await?, secret))
 }
 
 /// Blocking work off the async thread, so reports keep flowing.
@@ -55,37 +86,50 @@ fn unsigned_allowed() -> bool {
 
 pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> {
     match job.task {
-        Task::TestDatabase { database } => {
-            let secret: DatabaseSecret = open_json(state, &database, "database")?;
+        Task::TestSsh { ssh } => {
+            let login: SshSecret = open_json(state, &ssh, "ssh")?;
+            // Forwarding to the SSH port itself proves the login and that forwarding is allowed.
+            let _tunnel = Tunnel::open(&ssh.id, &login, "127.0.0.1", login.port).await?;
+            progress.log(
+                "ok",
+                format!("signed in to {} and opened a tunnel", login.host),
+            );
+            Ok(Output::default())
+        }
+        Task::TestDatabase {
+            database: sealed,
+            ssh,
+        } => {
+            let (secret, _tunnel) = database(state, &sealed, ssh.as_ref(), &progress).await?;
             let version = blocking(move || engines::test(&secret).map_err(text)).await?;
             progress.log("ok", format!("connected: {version}"));
             Ok(Output::default())
         }
         Task::TestDestination { destination } => {
-            let secret: S3Secret = open_json(state, &destination, "destination")?;
-            storage::test(&storage::open(&secret)?).await?;
+            store(state, &destination).await?.0.test().await?;
             progress.log("ok", "wrote, read and deleted a test file");
             Ok(Output::default())
         }
         Task::Backup {
-            database,
+            database: sealed,
             destination,
             name,
             compression,
             level,
             recipients,
             object_key,
+            ssh,
         } => {
-            let database: DatabaseSecret = open_json(state, &database, "database")?;
-            let destination: S3Secret = open_json(state, &destination, "destination")?;
-            let operator = storage::open(&destination)?;
+            let (database, _tunnel) = database(state, &sealed, ssh.as_ref(), &progress).await?;
+            let (store, _) = store(state, &destination).await?;
             progress.log("info", format!("dumping {name}, compression {compression}"));
             let method = compression.clone();
 
-            let mut writer = storage::Upload::start(&operator, &object_key).await?;
+            let mut sink = store.sink(&object_key).await?;
             let handle = Handle::current();
             let shared = progress.clone();
-            let (writer, result) = task::spawn_blocking(move || {
+            // The pipeline blocks, so it gets its own thread and the reports keep flowing.
+            let (sink, result) = task::spawn_blocking(move || {
                 let result = engines::dump(&database, &name)
                     .and_then(|dump| {
                         pipeline::backup(
@@ -93,17 +137,18 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
                             &compression,
                             level,
                             &recipients,
-                            &mut writer,
+                            &mut sink,
                             handle,
                             &shared,
                         )
                     })
                     .map_err(text);
-                (writer, result)
+                (sink, result)
             })
             .await?;
             match result {
                 Ok(sha256) => {
+                    sink.commit().await?;
                     progress.log("ok", format!("stored {object_key}"));
                     Ok(Output {
                         manifest: Some(manifest::sign(state, &object_key, &sha256, &method)?),
@@ -112,19 +157,18 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
                     })
                 }
                 Err(error) => {
-                    let mut writer = writer;
-                    if tokio::time::timeout(Duration::from_secs(30), writer.abort())
-                        .await
-                        .is_err()
-                    {
-                        progress.log("warn", "could not abort the unfinished upload");
+                    if !matches!(
+                        tokio::time::timeout(Duration::from_secs(30), sink.abort()).await,
+                        Ok(Ok(()))
+                    ) {
+                        progress.log("warn", "could not remove the unfinished upload");
                     }
                     Err(error.into())
                 }
             }
         }
         Task::Restore {
-            database,
+            database: sealed,
             destination,
             identity,
             object_key,
@@ -133,6 +177,7 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
             compression,
             name,
             source,
+            ssh,
         } => {
             // Checked before anything is downloaded or touched.
             match &manifest {
@@ -147,21 +192,20 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
                     return Err("this backup has no signature: set DBM_ALLOW_UNSIGNED_RESTORE=true on the agent to restore it".into());
                 }
             }
-            let database: DatabaseSecret = open_json(state, &database, "database")?;
-            let destination: S3Secret = open_json(state, &destination, "destination")?;
             let identity = String::from_utf8(open(state, &identity, "backup-key")?)?;
-            let operator = storage::open(&destination)?;
+            let (store, _) = store(state, &destination).await?;
 
             progress.log("info", format!("downloading {object_key}"));
             let temporary = tempfile::NamedTempFile::new()?;
             let mut file = tokio::fs::File::from_std(temporary.reopen()?);
-            if storage::download(&operator, &object_key, &mut file, &progress).await? != sha256 {
+            if store.download(&object_key, &mut file, &progress).await? != sha256 {
                 return Err(
                     "checksum mismatch: the stored file is not the one that was backed up".into(),
                 );
             }
             progress.log("ok", "checksum verified");
 
+            let (database, _tunnel) = database(state, &sealed, ssh.as_ref(), &progress).await?;
             let file = temporary.reopen()?;
             let shared = progress.clone();
             blocking(move || {
@@ -180,8 +224,11 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
             destination,
             object_key,
         } => {
-            let secret: S3Secret = open_json(state, &destination, "destination")?;
-            storage::open(&secret)?.delete(&object_key).await?;
+            store(state, &destination)
+                .await?
+                .0
+                .delete(&object_key)
+                .await?;
             progress.log("ok", format!("deleted {object_key}"));
             Ok(Output::default())
         }
@@ -189,7 +236,7 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
             destination,
             object_key,
         } => {
-            let secret: S3Secret = open_json(state, &destination, "destination")?;
+            let secret: StorageSecret = open_json(state, &destination, "destination")?;
             let link = storage::link(&secret, &object_key).await?;
             progress.log("ok", "download link created, valid for 5 minutes");
             Ok(Output {
