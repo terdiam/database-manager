@@ -15,10 +15,13 @@
 </script>
 
 <button type="button" class="btn relative min-h-10 px-2.5" popovertarget="{id}-bell" aria-label={t('bell.label', { n: unread })}>
-	<Icon name="bell" size={20} />
-	{#if unread}
-		<span class="absolute -top-1.5 -right-1.5 grid min-w-5 place-items-center rounded-full bg-bad px-1 text-xs font-bold text-surface tabular-nums" aria-hidden="true">{unread > 9 ? '9+' : unread}</span>
-	{/if}
+	<!-- A new key restarts the animations for every arrival. -->
+	{#key notices.arrived}
+		<span class="bell {unread ? 'bell-unread' : ''} {notices.arrived ? 'bell-ring' : ''}"><Icon name="bell" size={20} /></span>
+		{#if unread}
+			<span class="absolute -top-1.5 -right-1.5 grid min-w-5 place-items-center rounded-full bg-bad px-1 text-xs font-bold text-surface tabular-nums {notices.arrived ? 'bell-badge' : ''}" aria-hidden="true">{unread > 9 ? '9+' : unread}</span>
+		{/if}
+	{/key}
 </button>
 <span class="sr-only" role="status">{unread ? t('bell.new', { n: unread }) : ''}</span>
 
