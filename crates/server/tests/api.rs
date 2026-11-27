@@ -1249,8 +1249,9 @@ async fn schedules_run_when_due(db: PgPool) {
     let app = app(state.clone());
     let cookie = admin(&app).await;
     let agent = enroll(&app, &cookie, "a1").await;
-    let (_, _, backup) = add_resources(&app, &cookie, &agent).await;
+    let (server, destination, backup) = add_resources(&app, &cookie, &agent).await;
     let path = format!("/api/backups/{backup}");
+    let entry = |plan: Value| backup_body(&server, &destination, plan);
 
     for bad in [
         json!({ "schedule": "every day" }),
@@ -1259,11 +1260,11 @@ async fn schedules_run_when_due(db: PgPool) {
         json!({ "retention_unit": "gfs" }),
         json!({ "retention_unit": "forever" }),
     ] {
-        let reply = call(&app, "PUT", &path, Some(&cookie), Some(bad.clone())).await;
+        let reply = call(&app, "PUT", &path, Some(&cookie), Some(entry(bad.clone()))).await;
         assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY, "{bad}");
     }
     let plan = json!({ "schedule": "0 1 * * *", "timezone": "Asia/Jakarta", "retention_unit": "days", "retention_value": 7 });
-    let reply = call(&app, "PUT", &path, Some(&cookie), Some(plan)).await;
+    let reply = call(&app, "PUT", &path, Some(&cookie), Some(entry(plan))).await;
     assert_eq!(reply.status, StatusCode::NO_CONTENT);
     let list = call(&app, "GET", "/api/backups", Some(&cookie), None).await;
     assert!(list.body[0]["next_run_at"].is_string());
@@ -1344,14 +1345,15 @@ async fn retention_deletes_the_old_but_never_the_last(db: PgPool) {
     let app = app(state.clone());
     let cookie = admin(&app).await;
     let agent = enroll(&app, &cookie, "a1").await;
-    let (_, _, backup) = add_resources(&app, &cookie, &agent).await;
+    let (server, destination, backup) = add_resources(&app, &cookie, &agent).await;
     sqlx::query("INSERT INTO backup_keys (recipient, secret) VALUES ('age1', '\\x00')")
         .execute(&db)
         .await
         .unwrap();
     let path = format!("/api/backups/{backup}");
     let plan = json!({ "retention_unit": "days", "retention_value": 7 });
-    call(&app, "PUT", &path, Some(&cookie), Some(plan)).await;
+    let body = backup_body(&server, &destination, plan);
+    call(&app, "PUT", &path, Some(&cookie), Some(body)).await;
 
     // All expired: the newest one stays anyway.
     old_snapshots(&db, &[30, 20, 10]).await;
@@ -1593,4 +1595,254 @@ async fn download_links_are_handed_out_once(db: PgPool) {
     )
     .await;
     assert_eq!(preview.body["runs"].as_array().unwrap().len(), 3);
+}
+
+// ---------------------------------------------------------------- editing
+
+/// The body of a backup entry, with `plan` fields added.
+fn backup_body(server: &str, destination: &str, plan: Value) -> Value {
+    let mut body = json!({ "name": "nightly", "server_id": server, "database_name": "shop",
+        "destination_id": destination, "compression": "zstd", "level": 3 });
+    for (key, value) in plan.as_object().unwrap() {
+        body[key] = value.clone();
+    }
+    body
+}
+
+async fn put(app: &Router, cookie: &str, path: &str, body: Value) -> StatusCode {
+    call(app, "PUT", path, Some(cookie), Some(body))
+        .await
+        .status
+}
+
+#[sqlx::test]
+async fn everything_configured_can_be_edited_by_the_right_role(db: PgPool) {
+    let app = router(db.clone());
+    let cookie = admin(&app).await;
+    let agent = enroll(&app, &cookie, "a1").await;
+    enroll(&app, &cookie, "taken").await;
+    let (server, destination, backup) = add_resources(&app, &cookie, &agent).await;
+    let viewer =
+        json!({ "name": "V", "email": "v@example.com", "password": PASSWORD, "role": "viewer" });
+    let created = call(&app, "POST", "/api/users", Some(&cookie), Some(viewer)).await;
+    let viewer_id = created.body["id"].as_str().unwrap().to_owned();
+    let viewer = login(&app, "v@example.com", PASSWORD).await.cookie.unwrap();
+    let channel = json!({ "name": "ops", "events": ["agent_offline"],
+        "secret": { "kind": "mattermost", "webhook_url": "https://chat.example.com/hooks/first" } });
+    call(
+        &app,
+        "POST",
+        "/api/notification-channels",
+        Some(&cookie),
+        Some(channel),
+    )
+    .await;
+    let channels = call(
+        &app,
+        "GET",
+        "/api/notification-channels",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    let channel = channels.body[0]["id"].as_str().unwrap().to_owned();
+
+    let server_path = format!("/api/database-servers/{server}");
+    let destination_path = format!("/api/destinations/{destination}");
+    let backup_path = format!("/api/backups/{backup}");
+    let channel_path = format!("/api/notification-channels/{channel}");
+    let agent_path = format!("/api/agents/{}", agent.id);
+    let user_path = format!("/api/users/{viewer_id}");
+    let user = json!({ "name": "Op", "email": "OP@example.com", "role": "operator" });
+    for (path, body) in [
+        (&server_path, json!({ "name": "x" })),
+        (&destination_path, json!({ "name": "x" })),
+        (&backup_path, backup_body(&server, &destination, json!({}))),
+        (
+            &channel_path,
+            json!({ "name": "x", "events": ["agent_offline"] }),
+        ),
+        (&agent_path, json!({ "name": "x" })),
+        (&user_path, user.clone()),
+    ] {
+        assert_eq!(
+            put(&app, &viewer, path, body).await,
+            StatusCode::FORBIDDEN,
+            "{path}"
+        );
+    }
+
+    // A rename keeps the sealed secret; a new connection replaces it as a whole.
+    let sealed_before: Vec<u8> = sqlx::query_scalar("SELECT secret FROM database_servers")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(
+        put(&app, &cookie, &server_path, json!({ "name": "Renamed" })).await,
+        StatusCode::NO_CONTENT
+    );
+    let sealed: Vec<u8> = sqlx::query_scalar("SELECT secret FROM database_servers")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(sealed, sealed_before);
+    let secret = sealed_for(&agent, &server, "database", r#"{"password":"new"}"#);
+    let connection = json!({ "host": "db2", "port": 6000, "username": "u2", "ssl_mode": "require", "secret": secret });
+    assert_eq!(
+        put(
+            &app,
+            &cookie,
+            &server_path,
+            json!({ "name": "Renamed", "connection": connection })
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let list = call(&app, "GET", "/api/database-servers", Some(&cookie), None).await;
+    assert_eq!(
+        (&list.body[0]["host"], &list.body[0]["ssl_mode"]),
+        (&json!("db2"), &json!("require"))
+    );
+    // Host without a new secret is not accepted: the two would disagree.
+    let partial = json!({ "name": "Renamed", "connection": { "host": "evil" } });
+    assert_eq!(
+        put(&app, &cookie, &server_path, partial).await,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    let storage = |bucket: &str| {
+        json!({ "name": "minio", "connection": { "endpoint": "http://s3-new", "bucket": bucket, "prefix": "",
+        "public_endpoint": "http://localhost:9000", "virtual_host": false,
+        "secret": sealed_for(&agent, &destination, "destination", "{}") } })
+    };
+    assert_eq!(
+        put(&app, &cookie, &destination_path, storage("other")).await,
+        StatusCode::NO_CONTENT
+    );
+    // With backups stored there, the place stays; the address may still change.
+    call(
+        &app,
+        "POST",
+        &format!("/api/backups/{backup}/run"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    finish_next(&app, &agent, json!({})).await;
+    assert_eq!(
+        put(&app, &cookie, &destination_path, storage("moved")).await,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        put(&app, &cookie, &destination_path, storage("other")).await,
+        StatusCode::NO_CONTENT
+    );
+    let list = call(&app, "GET", "/api/destinations", Some(&cookie), None).await;
+    assert_eq!(list.body[0]["public_endpoint"], "http://localhost:9000");
+
+    let mut changed = backup_body(&server, &destination, json!({ "schedule": "0 2 * * *" }));
+    changed["name"] = json!("weekly");
+    changed["database_name"] = json!("orders");
+    assert_eq!(
+        put(&app, &cookie, &backup_path, changed.clone()).await,
+        StatusCode::NO_CONTENT
+    );
+    let list = call(&app, "GET", "/api/backups", Some(&cookie), None).await;
+    assert_eq!(
+        (&list.body[0]["name"], &list.body[0]["database_name"]),
+        (&json!("weekly"), &json!("orders"))
+    );
+    changed["database_name"] = json!("bad name");
+    assert_eq!(
+        put(&app, &cookie, &backup_path, changed).await,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    // The webhook stays unless a new one is given, and is never echoed.
+    assert_eq!(
+        put(
+            &app,
+            &cookie,
+            &channel_path,
+            json!({ "name": "ops2", "events": ["backup_failed"] })
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let list = call(
+        &app,
+        "GET",
+        "/api/notification-channels",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(list.body[0]["target"], "chat.example.com");
+    let replaced = json!({ "name": "ops2", "events": ["backup_failed"],
+        "secret": { "kind": "telegram", "bot_token": "1:abc", "chat_id": "-5" } });
+    assert_eq!(
+        put(&app, &cookie, &channel_path, replaced).await,
+        StatusCode::NO_CONTENT
+    );
+    let list = call(
+        &app,
+        "GET",
+        "/api/notification-channels",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(
+        (&list.body[0]["kind"], &list.body[0]["target"]),
+        (&json!("telegram"), &json!("chat -5"))
+    );
+
+    let taken = call(
+        &app,
+        "PUT",
+        &agent_path,
+        Some(&cookie),
+        Some(json!({ "name": "taken" })),
+    )
+    .await;
+    assert_eq!(taken.body["error"], "agent_name_taken");
+    assert_eq!(
+        put(&app, &cookie, &agent_path, json!({ "name": "dc-1" })).await,
+        StatusCode::NO_CONTENT
+    );
+
+    // A new role applies at once; nobody changes their own.
+    assert_eq!(
+        put(&app, &cookie, &user_path, user).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        put(
+            &app,
+            &viewer,
+            &server_path,
+            json!({ "name": "By operator" })
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let me = call(&app, "GET", "/api/auth/state", Some(&cookie), None).await;
+    let my_path = format!("/api/users/{}", me.body["user"]["id"].as_str().unwrap());
+    let demote = json!({ "name": "Admin", "email": "admin@example.com", "role": "viewer" });
+    assert_eq!(
+        put(&app, &cookie, &my_path, demote).await,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let clash = json!({ "name": "Op", "email": "admin@example.com", "role": "operator" });
+    let reply = call(&app, "PUT", &user_path, Some(&cookie), Some(clash)).await;
+    assert_eq!(reply.body["error"], "email_taken");
+
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) FROM audit_logs WHERE action = 'update'"
+        )
+        .await,
+        10
+    );
 }

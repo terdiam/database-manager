@@ -10,6 +10,7 @@
 	import ConfirmDialog from './ConfirmDialog.svelte';
 	import DataTable from './DataTable.svelte';
 	import FormField from './FormField.svelte';
+	import IconButton from './IconButton.svelte';
 	import Modal from './Modal.svelte';
 	import PageHeader from './PageHeader.svelte';
 	import StatusBadge from './StatusBadge.svelte';
@@ -43,8 +44,8 @@
 	{#snippet cell(row, i)}
 		{#if i === headers.length - 1}
 			<span class="flex flex-wrap justify-end gap-1">
-				{#if testLabel}<button type="button" class="btn" onclick={() => toast(t('toast.test', { name: row.cells[0] }))}>{testLabel}</button>{/if}
-				<button type="button" class="btn btn-danger" onclick={() => remove(row.cells[0])}>{t('action.delete')}</button>
+				{#if testLabel}<IconButton icon="plug" label={testLabel} onclick={() => toast(t('toast.test', { name: row.cells[0] }))} />{/if}
+				<IconButton icon="trash" label={t('action.delete')} onclick={() => remove(row.cells[0])} danger />
 			</span>
 		{:else if i === row.cells.length && row.status}<StatusBadge status={row.status} />
 		{:else if i === brandColumn}<span class="inline-flex items-center gap-2"><BrandIcon name={row.cells[i]} />{row.cells[i]}</span>

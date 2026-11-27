@@ -1,5 +1,7 @@
 <script lang="ts">
+	import IconButton from '#lib/components/IconButton.svelte';
 	import { onMount } from 'svelte';
+	import { invalidateAll } from '$app/navigation';
 	import { request, type Role, type User } from '#lib/api/http.ts';
 	import ConfirmDialog from '#lib/components/ConfirmDialog.svelte';
 	import DataTable from '#lib/components/DataTable.svelte';
@@ -21,6 +23,7 @@
 	let form = $state(blank());
 	let formError = $state('');
 	let removing = $state<User>();
+	let editing = $state<User>();
 	let modal: Modal;
 	let confirm: ConfirmDialog;
 
@@ -37,8 +40,9 @@
 		return live(['users'], load);
 	});
 
-	function open() {
-		form = blank();
+	function open(user?: User) {
+		editing = user;
+		form = user ? { ...blank(), name: user.name, email: user.email, role: user.role } : blank();
 		formError = '';
 		modal.open();
 	}
@@ -47,10 +51,15 @@
 		event.preventDefault();
 		const element = event.currentTarget;
 		try {
-			await request('POST', '/users', { ...form, role: form.role as Role });
+			const { name, email, password } = form;
+			const role = form.role as Role;
+			if (editing) await request('PUT', `/users/${editing.id}`, { name, email, role });
+			else await request('POST', '/users', { name, email, password, role });
 			close();
 			element.reset();
-			toast(t('toast.created', { name: form.email }));
+			toast(t(editing ? 'toast.updated' : 'toast.created', { name: email }));
+			// The name shown in the menu is the signed-in user's.
+			if (editing?.id === session.user?.id) await invalidateAll();
 			await load();
 		} catch (e) {
 			formError = errorText(e);
@@ -71,7 +80,7 @@
 </script>
 
 <PageHeader title={t('nav.users')} description={t('users.desc')}>
-	{#snippet actions()}<button type="button" class="btn btn-primary" onclick={open}>{t('users.new')}</button>{/snippet}
+	{#snippet actions()}<button type="button" class="btn btn-primary" onclick={() => open()}>{t('users.new')}</button>{/snippet}
 </PageHeader>
 
 <p class="mb-3 text-sm text-bad empty:hidden" role="alert">{actionError || loadError}</p>
@@ -81,18 +90,21 @@
 		{#if i === 0}<strong>{user.name}</strong>
 		{:else if i === 1}{user.email}
 		{:else if i === 2}<span class="capitalize">{user.role}</span>
-		{:else if user.id === session.user?.id}<span class="text-xs text-dim">{t('users.you')}</span>
-		{:else}<button type="button" class="btn btn-danger" onclick={() => { removing = user; confirm.open(); }}>{t('action.delete')}</button>{/if}
+		{:else}<span class="flex flex-wrap items-center justify-end gap-1">
+			{#if user.id === session.user?.id}<span class="text-xs text-dim">{t('users.you')}</span>{/if}
+			<IconButton icon="edit" label={t('action.edit')} onclick={() => open(user)} />
+			{#if user.id !== session.user?.id}<IconButton icon="trash" label={t('action.delete')} onclick={() => { removing = user; confirm.open(); }} danger />{/if}
+		</span>{/if}
 	{/snippet}
 </DataTable>
 
-<Modal bind:this={modal} title={t('users.new')}>
+<Modal bind:this={modal} title={editing ? `${t('action.edit')}: ${editing.email}` : t('users.new')}>
 	{#snippet children(close)}
 		<form onsubmit={(e) => create(e, close)}>
 			<FormField label={t('col.name')}>{#snippet children(a)}<input {...a} class="input" maxlength="100" autocomplete="off" required bind:value={form.name} />{/snippet}</FormField>
 			<FormField label="Email">{#snippet children(a)}<input {...a} class="input" type="email" autocomplete="off" required bind:value={form.email} />{/snippet}</FormField>
-			<NewPassword label="Password" bind:value={form.password} />
-			<FormField label="Role">{#snippet children(a)}<Select {...a} bind:value={form.role} options={(['viewer', 'operator', 'admin'] as const).map((r) => ({ value: r, label: r, description: t(`role.${r}`) }))} />{/snippet}</FormField>
+			{#if !editing}<NewPassword label="Password" bind:value={form.password} />{/if}
+			<FormField label="Role">{#snippet children(a)}<Select {...a} disabled={editing?.id === session.user?.id} bind:value={form.role} options={(['viewer', 'operator', 'admin'] as const).map((r) => ({ value: r, label: r, description: t(`role.${r}`) }))} />{/snippet}</FormField>
 			<p class="text-sm text-bad empty:hidden" role="alert">{formError}</p>
 			<div class="mt-4 flex justify-end gap-2">
 				<button type="button" class="btn" onclick={close}>{t('action.cancel')}</button>

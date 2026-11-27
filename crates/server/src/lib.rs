@@ -26,7 +26,7 @@ use axum::{
     http::{HeaderValue, Method, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, post, put},
+    routing::{get, post, put},
 };
 use dbm_shared::e2ee::Keypair;
 use sqlx::PgPool;
@@ -114,22 +114,28 @@ pub fn app(state: AppState) -> Router {
         .route("/auth/logout", post(auth::logout))
         .route("/auth/password", post(auth::change_password))
         .route("/users", get(users::list).post(users::create))
-        .route("/users/{id}", delete(users::remove))
+        .route("/users/{id}", put(users::update).delete(users::remove))
         .route("/agents", get(agents::list))
         .route("/agents/tokens", post(agents::create_token))
-        .route("/agents/{id}", delete(agents::remove))
+        .route("/agents/{id}", put(agents::rename).delete(agents::remove))
         .route("/audit", get(audit::list))
         .route(
             "/database-servers",
             get(resources::list_servers).post(resources::create_server),
         )
-        .route("/database-servers/{id}", delete(resources::delete_server))
+        .route(
+            "/database-servers/{id}",
+            put(resources::update_server).delete(resources::delete_server),
+        )
         .route("/database-servers/{id}/test", post(resources::test_server))
         .route(
             "/destinations",
             get(resources::list_destinations).post(resources::create_destination),
         )
-        .route("/destinations/{id}", delete(resources::delete_destination))
+        .route(
+            "/destinations/{id}",
+            put(resources::update_destination).delete(resources::delete_destination),
+        )
         .route("/destinations/{id}/test", post(resources::test_destination))
         .route(
             "/backups",
@@ -154,7 +160,10 @@ pub fn app(state: AppState) -> Router {
             "/notification-channels",
             get(notify::list).post(notify::create),
         )
-        .route("/notification-channels/{id}", delete(notify::delete))
+        .route(
+            "/notification-channels/{id}",
+            put(notify::update).delete(notify::delete),
+        )
         .route("/notification-channels/{id}/test", post(notify::test))
         .route("/jobs", get(jobs::list))
         .route("/jobs/{id}", get(jobs::get))

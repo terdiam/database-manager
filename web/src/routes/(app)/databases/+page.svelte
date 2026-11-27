@@ -1,16 +1,22 @@
 <script lang="ts">
+	import IconButton from '#lib/components/IconButton.svelte';
 	import { onMount } from 'svelte';
 	import { resolve } from '$app/paths';
-	import { request, type DbServer, type Queued } from '#lib/api/http.ts';
+	import { request, type Agent, type DbServer, type Queued } from '#lib/api/http.ts';
 	import BrandIcon from '#lib/components/BrandIcon.svelte';
 	import ConfirmDialog from '#lib/components/ConfirmDialog.svelte';
 	import DataTable from '#lib/components/DataTable.svelte';
+	import FormField from '#lib/components/FormField.svelte';
+	import Modal from '#lib/components/Modal.svelte';
+	import PasswordInput from '#lib/components/PasswordInput.svelte';
+	import Select from '#lib/components/Select.svelte';
 	import JobDialog from '#lib/components/JobDialog.svelte';
 	import PageHeader from '#lib/components/PageHeader.svelte';
 	import { toast } from '#lib/components/toast.svelte.ts';
 	import { errorText } from '#lib/errors.ts';
 	import { t } from '#lib/i18n/index.svelte.ts';
 	import { live } from '#lib/events.ts';
+	import { sealFor } from '#lib/secrets.ts';
 	import { canOperate } from '#lib/session.svelte.ts';
 
 	let servers = $state<DbServer[]>([]);
@@ -20,6 +26,40 @@
 	let removing = $state<DbServer>();
 	let confirm: ConfirmDialog;
 	let job: JobDialog;
+	let editor: Modal;
+	let editing = $state<DbServer>();
+	let agent = $state<Agent>();
+	let form = $state({ name: '', reconnect: false, host: '', port: 5432, username: '', password: '', ssl_mode: '' });
+	let formError = $state('');
+
+	async function edit(server: DbServer) {
+		editing = server;
+		form = { name: server.name, reconnect: false, host: server.host, port: server.port, username: server.username, password: '', ssl_mode: server.ssl_mode ?? '' };
+		formError = '';
+		agent = undefined;
+		editor.open();
+		try {
+			agent = (await request<Agent[]>('GET', '/agents')).find((a) => a.id === server.agent_id);
+		} catch (e) {
+			formError = errorText(e);
+		}
+	}
+
+	async function save(close: () => void) {
+		const { name, reconnect, host, port, username, password, ssl_mode } = form;
+		const id = editing!.id;
+		try {
+			// Sealed to the same record id: host, user and password travel together.
+			const connection = reconnect ? { host, port, username, ssl_mode, secret: await sealFor(agent, 'database', id, { host: host.trim(), port, username, password, ssl_mode }) } : undefined;
+			await request('PUT', `/database-servers/${id}`, { name, connection });
+			close();
+			form.password = '';
+			toast(t('toast.updated', { name }));
+			await load();
+		} catch (e) {
+			formError = errorText(e);
+		}
+	}
 	const rows = $derived(servers.filter((s) => `${s.name} ${s.host}`.toLowerCase().includes(query.toLowerCase())));
 
 	const load = () =>
@@ -73,11 +113,38 @@
 		{:else if i === 3}{server.username}
 		{:else if i === 4}{server.agent}
 		{:else}<span class="flex flex-wrap justify-end gap-1">
-			<button type="button" class="btn" onclick={() => test(server)}>{t('action.test')}</button>
-			<button type="button" class="btn btn-danger" onclick={() => { removing = server; confirm.open(); }}>{t('action.delete')}</button>
+			<IconButton icon="plug" label={t('action.test')} onclick={() => test(server)} />
+			<IconButton icon="edit" label={t('action.edit')} onclick={() => edit(server)} />
+			<IconButton icon="trash" label={t('action.delete')} onclick={() => { removing = server; confirm.open(); }} danger />
 		</span>{/if}
 	{/snippet}
 </DataTable>
+
+<Modal bind:this={editor} title="{t('action.edit')}: {editing?.name ?? ''}">
+	{#snippet children(close)}
+		<form onsubmit={(e) => { e.preventDefault(); save(close); }}>
+			<FormField label={t('col.name')}>{#snippet children(a)}<input {...a} class="input" maxlength="64" required bind:value={form.name} />{/snippet}</FormField>
+			<label class="mb-1 flex items-center gap-2 text-sm font-medium"><input type="checkbox" bind:checked={form.reconnect} />{t('field.changeConnection')}</label>
+			<p class="mb-3 text-xs text-dim">{t('help.changeConnection', { agent: editing?.agent ?? '' })}</p>
+			{#if form.reconnect}
+				<div class="grid gap-x-3 sm:grid-cols-[1fr_8rem]">
+					<FormField label="Host" help={t('help.host')}>{#snippet children(a)}<input {...a} class="input" maxlength="255" required bind:value={form.host} />{/snippet}</FormField>
+					<FormField label="Port">{#snippet children(a)}<input {...a} class="input" type="number" min="1" max="65535" required bind:value={form.port} />{/snippet}</FormField>
+				</div>
+				<div class="grid gap-x-3 sm:grid-cols-2">
+					<FormField label="Username">{#snippet children(a)}<input {...a} class="input" maxlength="255" autocomplete="off" required bind:value={form.username} />{/snippet}</FormField>
+					<FormField label="Password" help={t('help.sealed')}>{#snippet children(a)}<PasswordInput {...a} autocomplete="new-password" bind:value={form.password} />{/snippet}</FormField>
+				</div>
+				<FormField label="SSL mode">{#snippet children(a)}<Select {...a} required placeholder={t('field.choose')} bind:value={form.ssl_mode} options={['disable', 'prefer', 'require', 'verify-full'].map((v) => ({ value: v, label: v }))} />{/snippet}</FormField>
+			{/if}
+			<p class="text-sm text-bad empty:hidden" role="alert">{formError}</p>
+			<div class="mt-4 flex justify-end gap-2">
+				<button type="button" class="btn" onclick={close}>{t('action.cancel')}</button>
+				<button type="submit" class="btn btn-primary">{t('action.save')}</button>
+			</div>
+		</form>
+	{/snippet}
+</Modal>
 
 <JobDialog bind:this={job} title={t('action.test')} />
 <ConfirmDialog bind:this={confirm} title={t('action.delete')} message={t('confirm.delete', { name: removing?.name ?? '' })} confirmLabel={t('action.delete')} onconfirm={remove} />

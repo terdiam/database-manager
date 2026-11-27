@@ -1,4 +1,5 @@
 <script lang="ts">
+	import IconButton from '#lib/components/IconButton.svelte';
 	import { onMount } from 'svelte';
 	import { request, type Job, type Page } from '#lib/api/http.ts';
 	import DataTable from '#lib/components/DataTable.svelte';
@@ -62,7 +63,7 @@
 		{:else if i === 3}<StatusBadge status={job.status} />
 		{:else if i === 4}{job.bytes ? bytes(job.bytes) : '-'}
 		{:else if i === 5}{job.created_by}
-		{:else}<button type="button" class="btn {selected === job.id ? 'border-brand' : ''}" aria-pressed={selected === job.id} onclick={() => (selected = job.id)}>{t('action.log')}</button>{/if}
+		{:else}<IconButton icon="list" label={t('action.log')} onclick={() => (selected = job.id)} pressed={selected === job.id} />{/if}
 	{/snippet}
 </DataTable>
 

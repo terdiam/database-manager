@@ -24,6 +24,7 @@ Done:
 - [x] Live dashboard
 - [x] Telegram and Mattermost alerts
 - [x] Download backup files
+- [x] Edit databases, storage, backups, alerts, users and agent names
 
 Planned:
 

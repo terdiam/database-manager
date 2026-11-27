@@ -180,6 +180,11 @@
 			position-try-fallbacks: flip-inline, block-start;
 		}
 	}
+	/* The hint of an IconButton, placed by the component. */
+	.hint {
+		@apply m-0 rounded-md border border-line bg-surface px-2 py-1 text-xs font-medium whitespace-nowrap text-ink shadow-lg;
+		inset: auto;
+	}
 	.menu-item {
 		@apply flex min-h-9 w-full items-center gap-2.5 rounded-lg px-2.5 text-left hover:bg-muted;
 	}

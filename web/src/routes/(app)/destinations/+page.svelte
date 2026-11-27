@@ -1,4 +1,5 @@
 <script lang="ts">
+	import IconButton from '#lib/components/IconButton.svelte';
 	import { onMount } from 'svelte';
 	import { request, type Agent, type Destination, type Queued } from '#lib/api/http.ts';
 	import BrandIcon from '#lib/components/BrandIcon.svelte';
@@ -25,6 +26,9 @@
 	let formError = $state('');
 	let form = $state(blank());
 	let removing = $state<Destination>();
+	// Set while the dialog edits an existing destination.
+	let editing = $state<Destination>();
+	let reconnect = $state(true);
 	let modal: Modal;
 	let confirm: ConfirmDialog;
 	let job: JobDialog;
@@ -42,13 +46,17 @@
 		return live(['destinations'], load);
 	});
 
-	async function open() {
-		form = blank();
+	async function open(destination?: Destination) {
+		editing = destination;
+		reconnect = !destination;
+		form = destination
+			? { ...blank(), name: destination.name, agent: destination.agent_id, endpoint: destination.endpoint, region: destination.region ?? '', bucket: destination.bucket, prefix: destination.prefix, virtual_host: destination.virtual_host ?? false, public_endpoint: destination.public_endpoint ?? '' }
+			: blank();
 		formError = '';
 		modal.open();
 		try {
 			agents = (await request<Agent[]>('GET', '/agents')).filter((a) => a.key);
-			form.agent = agents[0]?.id ?? '';
+			form.agent ||= agents[0]?.id ?? '';
 		} catch (e) {
 			formError = errorText(e);
 		}
@@ -57,14 +65,18 @@
 	async function create(event: SubmitEvent & { currentTarget: HTMLFormElement }, close: () => void) {
 		event.preventDefault();
 		const element = event.currentTarget;
-		const id = crypto.randomUUID();
+		const id = editing?.id ?? crypto.randomUUID();
 		const { name, agent, endpoint, region, bucket, prefix, access_key, secret_key, virtual_host, public_endpoint } = form;
 		try {
-			const secret = await sealFor(agents.find((a) => a.id === agent), 'destination', id, { endpoint: endpoint.trim(), region: region.trim(), bucket: bucket.trim(), prefix: prefix.trim(), access_key, secret_key, virtual_host, public_endpoint: public_endpoint.trim() });
-			await request('POST', '/destinations', { id, name, agent_id: agent, endpoint, bucket, prefix, secret });
+			const options = { region: region.trim(), virtual_host, public_endpoint: public_endpoint.trim() };
+			const connection = reconnect
+				? { endpoint, bucket, prefix, ...options, secret: await sealFor(agents.find((a) => a.id === agent), 'destination', id, { endpoint: endpoint.trim(), bucket: bucket.trim(), prefix: prefix.trim(), access_key, secret_key, ...options }) }
+				: undefined;
+			if (editing) await request('PUT', `/destinations/${id}`, { name, connection });
+			else await request('POST', '/destinations', { id, name, agent_id: agent, ...connection });
 			close();
 			element.reset();
-			toast(t('toast.created', { name }));
+			toast(t(editing ? 'toast.updated' : 'toast.created', { name }));
 			await load();
 		} catch (e) {
 			formError = errorText(e);
@@ -92,7 +104,7 @@
 </script>
 
 <PageHeader title={t('nav.destinations')} description={t('destinations.desc')}>
-	{#snippet actions()}{#if canOperate()}<button type="button" class="btn btn-primary" onclick={open}>{t('destinations.new')}</button>{/if}{/snippet}
+	{#snippet actions()}{#if canOperate()}<button type="button" class="btn btn-primary" onclick={() => open()}>{t('destinations.new')}</button>{/if}{/snippet}
 </PageHeader>
 
 <p class="mb-3 text-sm text-bad empty:hidden" role="alert">{error || loadError}</p>
@@ -104,18 +116,24 @@
 		{:else if i === 2}<code class="text-xs break-all">{d.endpoint || 'AWS'} · s3://{d.bucket}/{d.prefix}</code>
 		{:else if i === 3}{d.agent}
 		{:else}<span class="flex flex-wrap justify-end gap-1">
-			<button type="button" class="btn" onclick={() => test(d)}>{t('action.test')}</button>
-			<button type="button" class="btn btn-danger" onclick={() => { removing = d; confirm.open(); }}>{t('action.delete')}</button>
+			<IconButton icon="plug" label={t('action.test')} onclick={() => test(d)} />
+			<IconButton icon="edit" label={t('action.edit')} onclick={() => open(d)} />
+			<IconButton icon="trash" label={t('action.delete')} onclick={() => { removing = d; confirm.open(); }} danger />
 		</span>{/if}
 	{/snippet}
 </DataTable>
 
-<Modal bind:this={modal} title={t('destinations.new')}>
+<Modal bind:this={modal} title={editing ? `${t('action.edit')}: ${editing.name}` : t('destinations.new')}>
 	{#snippet children(close)}
 		<form onsubmit={(e) => create(e, close)}>
 			<p class="mb-3 text-sm text-dim">{t('destinations.s3Only')}</p>
 			<FormField label={t('col.name')}>{#snippet children(a)}<input {...a} class="input" maxlength="64" required bind:value={form.name} />{/snippet}</FormField>
-			<FormField label={t('field.agent')} help={t('help.destinationAgent')}>{#snippet children(a)}<Select {...a} required bind:value={form.agent} options={agents.map((x) => ({ value: x.id, label: x.name, icon: 'server' as const }))} />{/snippet}</FormField>
+			{#if editing}
+				<label class="mb-1 flex items-center gap-2 text-sm font-medium"><input type="checkbox" bind:checked={reconnect} />{t('field.changeConnection')}</label>
+				<p class="mb-3 text-xs text-dim">{t('help.changeConnection', { agent: editing.agent })}</p>
+			{/if}
+			{#if reconnect}
+			{#if !editing}<FormField label={t('field.agent')} help={t('help.destinationAgent')}>{#snippet children(a)}<Select {...a} required bind:value={form.agent} options={agents.map((x) => ({ value: x.id, label: x.name, icon: 'server' as const }))} />{/snippet}</FormField>{/if}
 			<FormField label="Endpoint" help={t('help.endpoint')}>{#snippet children(a)}<input {...a} class="input" type="url" maxlength="255" placeholder="http://minio:9000" bind:value={form.endpoint} />{/snippet}</FormField>
 			<FormField label={t('field.publicEndpoint')} help={t('help.publicEndpoint')}>{#snippet children(a)}<input {...a} class="input" type="url" maxlength="255" bind:value={form.public_endpoint} />{/snippet}</FormField>
 			<div class="grid gap-x-3 sm:grid-cols-2">
@@ -126,6 +144,7 @@
 			<FormField label="Access key">{#snippet children(a)}<input {...a} class="input" autocomplete="off" required bind:value={form.access_key} />{/snippet}</FormField>
 			<FormField label="Secret key" help={t('help.sealed')}>{#snippet children(a)}<PasswordInput {...a} autocomplete="new-password" required bind:value={form.secret_key} />{/snippet}</FormField>
 			<label class="mb-3 flex items-center gap-2 text-sm"><input type="checkbox" bind:checked={form.virtual_host} />{t('field.virtualHost')}</label>
+			{/if}
 			<p class="text-sm text-bad empty:hidden" role="alert">{formError}</p>
 			<div class="mt-4 flex justify-end gap-2">
 				<button type="button" class="btn" onclick={close}>{t('action.cancel')}</button>

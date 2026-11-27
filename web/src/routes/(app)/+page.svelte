@@ -1,4 +1,5 @@
 <script lang="ts">
+	import IconButton from '#lib/components/IconButton.svelte';
 	import { onMount } from 'svelte';
 	import { resolve } from '$app/paths';
 	import { request, type Dashboard } from '#lib/api/http.ts';
@@ -87,7 +88,7 @@
 					<StatusBadge status={job.status} />
 					<span class="font-medium">{t(`job.${job.kind}`)} · {job.target}</span>
 					{#if job.bytes}<span class="tabular-nums">{bytes(job.bytes)}</span>{/if}
-					<a class="btn ml-auto" href={resolve('jobs')}>{t('action.log')}</a>
+					<span class="ml-auto"><IconButton icon="list" label={t('action.log')} href={resolve('jobs')} /></span>
 				</li>
 			{:else}
 				<li class="text-dim">{t('dashboard.idle')}</li>

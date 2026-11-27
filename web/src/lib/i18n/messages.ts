@@ -423,7 +423,6 @@ export const messages = {
 	'schedule.everyHours': ["Tiap {n} jam", "Every {n} hours"],
 	'retention.all': ["Simpan semua", "Keep everything"],
 	'retention.fromNow': ["Perubahan lama simpan berlaku untuk backup yang dibuat setelah ini.", "A new retention applies to backups made from now on."],
-	'action.schedule': ["Jadwal", "Schedule"],
 	'toast.updated': ["{name} diperbarui.", "{name} updated."],
 	'snapshots.saveFile': ["Simpan file", "Save file"],
 	'snapshots.downloadHint': ["Link berlaku 5 menit. File tetap terenkripsi age; buka dengan kunci dari Pengaturan.", "The link lasts 5 minutes. The file stays age-encrypted; open it with the keys from Settings."],
@@ -444,6 +443,14 @@ export const messages = {
 	'error.bot_token': ["Bot token tidak valid.", "Invalid bot token."],
 	'error.chat_id': ["Chat ID tidak valid.", "Invalid chat id."],
 	'error.webhook_url': ["URL webhook tidak valid.", "Invalid webhook URL."],
+	'action.edit': ["Edit", "Edit"],
+	'field.changeConnection': ["Ubah koneksi", "Change the connection"],
+	'help.changeConnection': ["Password harus diisi lagi karena dikunci bersama alamatnya. Agent tetap {agent}.", "The password must be entered again: it is sealed together with the address. The agent stays {agent}."],
+	'field.replaceSecret': ["Ganti token atau URL", "Replace the token or URL"],
+	'field.choose': ["Pilih…", "Choose…"],
+	'error.has_snapshots': ["Bucket dan folder tidak bisa diubah karena sudah ada backup di sana.", "Bucket and folder cannot change: backups are already stored there."],
+	'error.cannot_change_own_role': ["Tidak bisa mengubah role akun sendiri.", "You cannot change your own role."],
+	'error.ssl_mode': ["SSL mode tidak valid.", "Invalid SSL mode."],
 } satisfies Record<string, [string, string]>;
 
 export type Key = keyof typeof messages;

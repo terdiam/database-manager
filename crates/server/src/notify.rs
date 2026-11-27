@@ -175,6 +175,34 @@ pub struct NewChannel {
     secret: serde_json::Value,
 }
 
+fn described<'a>(name: &'a str, events: &[String]) -> Result<&'a str, Error> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > 64 {
+        return Err(Error::Invalid("name"));
+    }
+    if events.is_empty() || !events.iter().all(|e| EVENTS.contains(&e.as_str())) {
+        return Err(Error::Invalid("events"));
+    }
+    Ok(name)
+}
+
+/// Checks a new secret and encrypts it for the channel `id`: kind, label and ciphertext.
+fn seal(
+    app: &AppState,
+    id: Uuid,
+    secret: serde_json::Value,
+) -> Result<(&'static str, String, Vec<u8>), Error> {
+    // Parsed by hand: a serde error could echo the secret back.
+    let secret: Secret = serde_json::from_value(secret).map_err(|_| Error::Invalid("secret"))?;
+    let (kind, target) = secret.target()?;
+    let plain = serde_json::to_vec(&secret).map_err(|e| Error::Internal(e.to_string()))?;
+    let sealed = app
+        .master
+        .seal(TABLE, "secret", &id.to_string(), &plain)
+        .map_err(Error::Internal)?;
+    Ok((kind, target, sealed))
+}
+
 pub async fn create(
     State(app): State<AppState>,
     Auth(me): Auth,
@@ -182,23 +210,9 @@ pub async fn create(
     Json(body): Json<NewChannel>,
 ) -> Result<StatusCode, Error> {
     me.require_admin()?;
-    let name = body.name.trim();
-    if name.is_empty() || name.len() > 64 {
-        return Err(Error::Invalid("name"));
-    }
-    if body.events.is_empty() || !body.events.iter().all(|e| EVENTS.contains(&e.as_str())) {
-        return Err(Error::Invalid("events"));
-    }
-    // Parsed by hand: a serde error could echo the secret back.
-    let secret: Secret =
-        serde_json::from_value(body.secret).map_err(|_| Error::Invalid("secret"))?;
-    let (kind, target) = secret.target()?;
+    let name = described(&body.name, &body.events)?;
     let id = Uuid::new_v4();
-    let plain = serde_json::to_vec(&secret).map_err(|e| Error::Internal(e.to_string()))?;
-    let sealed = app
-        .master
-        .seal(TABLE, "secret", &id.to_string(), &plain)
-        .map_err(Error::Internal)?;
+    let (kind, target, sealed) = seal(&app, id, body.secret)?;
     sqlx::query(
         "INSERT INTO notification_channels (id, name, kind, target, secret, events)
          VALUES ($1, $2, $3, $4, $5, $6)",
@@ -214,6 +228,61 @@ pub async fn create(
     let target = format!("notification {name}");
     audit::record(&app.db, Some(&me), "create", &target, &ip, true).await?;
     Ok(StatusCode::CREATED)
+}
+
+#[derive(Deserialize)]
+pub struct ChannelEdit {
+    name: String,
+    events: Vec<String>,
+    /// Absent keeps the stored token or URL, which is never sent back.
+    secret: Option<serde_json::Value>,
+}
+
+pub async fn update(
+    State(app): State<AppState>,
+    Auth(me): Auth,
+    Ip(ip): Ip,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ChannelEdit>,
+) -> Result<StatusCode, Error> {
+    me.require_admin()?;
+    let name = described(&body.name, &body.events)?;
+    let replaced = body
+        .secret
+        .map(|secret| seal(&app, id, secret))
+        .transpose()?;
+    let mut tx = app.db.begin().await?;
+    let found =
+        sqlx::query("UPDATE notification_channels SET name = $2, events = $3 WHERE id = $1")
+            .bind(id)
+            .bind(name)
+            .bind(&body.events)
+            .execute(&mut *tx)
+            .await?;
+    if found.rows_affected() == 0 {
+        return Err(Error::NotFound);
+    }
+    if let Some((kind, target, sealed)) = &replaced {
+        sqlx::query(
+            "UPDATE notification_channels SET kind = $2, target = $3, secret = $4, last_error = NULL
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(kind)
+        .bind(target)
+        .bind(sealed)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let what = if replaced.is_some() {
+        " and secret"
+    } else {
+        ""
+    };
+    let target = format!("notification {name}{what}");
+    audit::record(&mut *tx, Some(&me), "update", &target, &ip, true).await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn delete(

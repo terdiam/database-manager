@@ -1,19 +1,17 @@
 <script lang="ts">
+	import IconButton from '#lib/components/IconButton.svelte';
 	import { onMount } from 'svelte';
 	import { resolve } from '$app/paths';
 	import { request, type Backup, type Queued } from '#lib/api/http.ts';
 	import ConfirmDialog from '#lib/components/ConfirmDialog.svelte';
 	import DataTable from '#lib/components/DataTable.svelte';
 	import JobDialog from '#lib/components/JobDialog.svelte';
-	import Modal from '#lib/components/Modal.svelte';
 	import PageHeader from '#lib/components/PageHeader.svelte';
-	import RetentionPicker from '#lib/components/RetentionPicker.svelte';
-	import SchedulePicker from '#lib/components/SchedulePicker.svelte';
 	import { toast } from '#lib/components/toast.svelte.ts';
 	import { errorText } from '#lib/errors.ts';
 	import { dateTime } from '#lib/format.ts';
 	import { locale, t } from '#lib/i18n/index.svelte.ts';
-	import { fromCron, localZone, newRetention, newSchedule, retentionOf, toPlan } from '#lib/schedule.ts';
+	import { fromCron } from '#lib/schedule.ts';
 	import { live } from '#lib/events.ts';
 	import { canOperate } from '#lib/session.svelte.ts';
 
@@ -23,33 +21,6 @@
 	let removing = $state<Backup>();
 	let confirm: ConfirmDialog;
 	let job: JobDialog;
-	let editor: Modal;
-	let editing = $state<Backup>();
-	let schedule = $state(newSchedule('manual'));
-	let timezone = $state(localZone());
-	let retention = $state(newRetention());
-	let editError = $state('');
-
-	function edit(backup: Backup) {
-		editing = backup;
-		schedule = fromCron(backup.schedule);
-		timezone = backup.schedule ? backup.timezone : localZone();
-		retention = retentionOf(backup);
-		editError = '';
-		editor.open();
-	}
-
-	async function save(close: () => void) {
-		try {
-			await request('PUT', `/backups/${editing!.id}`, toPlan(schedule, timezone, retention));
-			close();
-			toast(t('toast.updated', { name: editing!.name }));
-			await load();
-		} catch (e) {
-			editError = errorText(e);
-		}
-	}
-
 	function scheduleText(backup: Backup): string {
 		const s = fromCron(backup.schedule);
 		if (s.kind === 'manual') return t('schedule.manual');
@@ -121,27 +92,12 @@
 			{#if b.next_run_at}<span class="block text-xs text-dim">{t('schedule.next')}: {dateTime(b.next_run_at)}</span>{/if}
 		{:else if i === 4}{retentionText(b)}
 		{:else}<span class="flex flex-wrap justify-end gap-1">
-			<button type="button" class="btn" onclick={() => run(b)}>{t('action.runNow')}</button>
-			<button type="button" class="btn" onclick={() => edit(b)}>{t('action.schedule')}</button>
-			<button type="button" class="btn btn-danger" onclick={() => { removing = b; confirm.open(); }}>{t('action.delete')}</button>
+			<IconButton icon="play" label={t('action.runNow')} onclick={() => run(b)} />
+			<IconButton icon="edit" label={t('action.edit')} href={resolve(`backups/${b.id}`)} />
+			<IconButton icon="trash" label={t('action.delete')} onclick={() => { removing = b; confirm.open(); }} danger />
 		</span>{/if}
 	{/snippet}
 </DataTable>
-
-<Modal bind:this={editor} title="{t('action.schedule')}: {editing?.name ?? ''}">
-	{#snippet children(close)}
-		<form onsubmit={(e) => { e.preventDefault(); save(close); }}>
-			<SchedulePicker legend={t('col.schedule')} bind:value={schedule} bind:timezone />
-			<RetentionPicker bind:value={retention} />
-			<p class="mb-3 text-xs text-dim">{t('retention.fromNow')}</p>
-			<p class="text-sm text-bad empty:hidden" role="alert">{editError}</p>
-			<div class="mt-4 flex justify-end gap-2">
-				<button type="button" class="btn" onclick={close}>{t('action.cancel')}</button>
-				<button type="submit" class="btn btn-primary">{t('action.save')}</button>
-			</div>
-		</form>
-	{/snippet}
-</Modal>
 
 <JobDialog bind:this={job} title={t('job.backup')} />
 <ConfirmDialog bind:this={confirm} title={t('action.delete')} message={t('confirm.delete', { name: removing?.name ?? '' })} confirmLabel={t('action.delete')} onconfirm={remove} />

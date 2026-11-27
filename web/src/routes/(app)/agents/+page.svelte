@@ -1,4 +1,5 @@
 <script lang="ts">
+	import IconButton from '#lib/components/IconButton.svelte';
 	import { onMount } from 'svelte';
 	import { e2eeInfo, request, type Agent } from '#lib/api/http.ts';
 	import ConfirmDialog from '#lib/components/ConfirmDialog.svelte';
@@ -23,6 +24,10 @@
 	let formError = $state('');
 	let serverFingerprint = $state('');
 	let removing = $state<Agent>();
+	let renaming = $state<Agent>();
+	let newName = $state('');
+	let renameError = $state('');
+	let renameModal: Modal;
 	let modal: Modal;
 	let confirm: ConfirmDialog;
 
@@ -57,6 +62,24 @@
 			formError = '';
 		} catch (e) {
 			formError = errorText(e);
+		}
+	}
+
+	function rename(agent: Agent) {
+		renaming = agent;
+		newName = agent.name;
+		renameError = '';
+		renameModal.open();
+	}
+
+	async function saveName(close: () => void) {
+		try {
+			await request('PUT', `/agents/${renaming!.id}`, { name: newName });
+			close();
+			toast(t('toast.updated', { name: newName }));
+			await load();
+		} catch (e) {
+			renameError = errorText(e);
 		}
 	}
 
@@ -98,7 +121,10 @@
 			{:else if i === 2}{agent.version}
 			{:else if i === 3}{dateTime(agent.last_seen_at)}
 			{:else if i === 4}<code class="text-xs">{agent.fingerprint ?? t('agents.noKey')}</code>
-			{:else}<button type="button" class="btn btn-danger" onclick={() => { removing = agent; confirm.open(); }}>{t('action.delete')}</button>{/if}
+			{:else}<span class="flex flex-wrap justify-end gap-1">
+				<IconButton icon="edit" label={t('action.edit')} onclick={() => rename(agent)} />
+				<IconButton icon="trash" label={t('action.delete')} onclick={() => { removing = agent; confirm.open(); }} danger />
+			</span>{/if}
 		{/snippet}
 	</DataTable>
 {/if}
@@ -123,6 +149,19 @@
 				</div>
 			</form>
 		{/if}
+	{/snippet}
+</Modal>
+
+<Modal bind:this={renameModal} title="{t('action.edit')}: {renaming?.name ?? ''}">
+	{#snippet children(close)}
+		<form onsubmit={(e) => { e.preventDefault(); saveName(close); }}>
+			<FormField label={t('agents.name')}>{#snippet children(a)}<input {...a} class="input" maxlength="64" autocomplete="off" required bind:value={newName} />{/snippet}</FormField>
+			<p class="text-sm text-bad empty:hidden" role="alert">{renameError}</p>
+			<div class="mt-4 flex justify-end gap-2">
+				<button type="button" class="btn" onclick={close}>{t('action.cancel')}</button>
+				<button type="submit" class="btn btn-primary">{t('action.save')}</button>
+			</div>
+		</form>
 	{/snippet}
 </Modal>
 

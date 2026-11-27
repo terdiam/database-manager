@@ -42,7 +42,7 @@
 		const { name, host, port, username, password, ssl_mode } = form;
 		try {
 			const secret = await sealFor(agent, 'database', id, { host: host.trim(), port, username, password, ssl_mode });
-			await request('POST', '/database-servers', { id, name, agent_id: form.agent, host, port, username, secret });
+			await request('POST', '/database-servers', { id, name, agent_id: form.agent, host, port, username, ssl_mode, secret });
 			toast(t('toast.created', { name }));
 			await goto(resolve('databases'));
 		} catch (e) {

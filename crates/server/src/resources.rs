@@ -63,6 +63,7 @@ pub struct Server {
     host: String,
     port: i32,
     username: String,
+    ssl_mode: Option<String>,
 }
 
 pub async fn list_servers(
@@ -70,7 +71,7 @@ pub async fn list_servers(
     Auth(_): Auth,
 ) -> Result<Json<Vec<Server>>, Error> {
     let rows = sqlx::query_as(
-        "SELECT s.id, s.name, s.engine, s.agent_id, a.name AS agent, s.host, s.port, s.username
+        "SELECT s.id, s.name, s.engine, s.agent_id, a.name AS agent, s.host, s.port, s.username, s.ssl_mode
          FROM database_servers s JOIN agents a ON a.id = s.agent_id ORDER BY s.name LIMIT 500",
     )
     .fetch_all(&app.db)
@@ -87,6 +88,8 @@ pub struct NewServer {
     host: String,
     port: u16,
     username: String,
+    #[serde(default)]
+    ssl_mode: Option<String>,
     secret: String,
 }
 
@@ -103,8 +106,8 @@ pub async fn create_server(
     let secret = sealed_bytes(&body.secret)?;
     require_agent_key(&app, body.agent_id).await?;
     sqlx::query(
-        "INSERT INTO database_servers (id, name, engine, agent_id, host, port, username, secret)
-         VALUES ($1, $2, 'postgresql', $3, $4, $5, $6, $7)",
+        "INSERT INTO database_servers (id, name, engine, agent_id, host, port, username, secret, ssl_mode)
+         VALUES ($1, $2, 'postgresql', $3, $4, $5, $6, $7, $8)",
     )
     .bind(body.id)
     .bind(&name)
@@ -113,6 +116,7 @@ pub async fn create_server(
     .bind(i32::from(body.port))
     .bind(body.username.trim())
     .bind(secret)
+    .bind(ssl_mode(body.ssl_mode.as_deref())?)
     .execute(&app.db)
     .await?;
     audit::record(
@@ -125,6 +129,74 @@ pub async fn create_server(
     )
     .await?;
     Ok(StatusCode::CREATED)
+}
+
+fn ssl_mode(value: Option<&str>) -> Result<Option<&str>, Error> {
+    match value {
+        None | Some("disable" | "prefer" | "require" | "verify-full") => Ok(value),
+        Some(_) => Err(Error::Invalid("ssl_mode")),
+    }
+}
+
+/// Host, user and password are sealed together, so changing any of them needs all of them again.
+#[derive(Deserialize)]
+pub struct Connection {
+    host: String,
+    port: u16,
+    username: String,
+    ssl_mode: String,
+    secret: String,
+}
+
+#[derive(Deserialize)]
+pub struct ServerEdit {
+    name: String,
+    connection: Option<Connection>,
+}
+
+pub async fn update_server(
+    State(app): State<AppState>,
+    Auth(me): Auth,
+    Ip(ip): Ip,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ServerEdit>,
+) -> Result<StatusCode, Error> {
+    me.require_operator()?;
+    let name = named(&body.name, "name")?;
+    let mut tx = app.db.begin().await?;
+    let found = sqlx::query("UPDATE database_servers SET name = $2 WHERE id = $1")
+        .bind(id)
+        .bind(&name)
+        .execute(&mut *tx)
+        .await?;
+    if found.rows_affected() == 0 {
+        return Err(Error::NotFound);
+    }
+    if let Some(connection) = &body.connection {
+        field(&connection.host, "host")?;
+        field(&connection.username, "username")?;
+        sqlx::query(
+            "UPDATE database_servers SET host = $2, port = $3, username = $4, ssl_mode = $5, secret = $6
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(connection.host.trim())
+        .bind(i32::from(connection.port))
+        .bind(connection.username.trim())
+        .bind(ssl_mode(Some(&connection.ssl_mode))?)
+        .bind(sealed_bytes(&connection.secret)?)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let what = if body.connection.is_some() {
+        " and connection"
+    } else {
+        ""
+    };
+    let target = format!("database {name}{what}");
+    audit::record(&mut *tx, Some(&me), "update", &target, &ip, true).await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn delete_server(
@@ -188,6 +260,9 @@ pub struct Destination {
     endpoint: String,
     bucket: String,
     prefix: String,
+    region: Option<String>,
+    virtual_host: Option<bool>,
+    public_endpoint: Option<String>,
 }
 
 pub async fn list_destinations(
@@ -195,7 +270,8 @@ pub async fn list_destinations(
     Auth(_): Auth,
 ) -> Result<Json<Vec<Destination>>, Error> {
     let rows = sqlx::query_as(
-        "SELECT d.id, d.name, d.kind, d.agent_id, a.name AS agent, d.endpoint, d.bucket, d.prefix
+        "SELECT d.id, d.name, d.kind, d.agent_id, a.name AS agent, d.endpoint, d.bucket, d.prefix,
+                d.region, d.virtual_host, d.public_endpoint
          FROM destinations d JOIN agents a ON a.id = d.agent_id ORDER BY d.name LIMIT 500",
     )
     .fetch_all(&app.db)
@@ -211,7 +287,29 @@ pub struct NewDestination {
     endpoint: String,
     bucket: String,
     prefix: String,
+    #[serde(flatten)]
+    options: Options,
     secret: String,
+}
+
+#[derive(Deserialize, Default)]
+pub struct Options {
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    virtual_host: Option<bool>,
+    #[serde(default)]
+    public_endpoint: Option<String>,
+}
+
+impl Options {
+    fn check(&self) -> Result<(), Error> {
+        field(self.region.as_deref().unwrap_or_default(), "endpoint")?;
+        field(
+            self.public_endpoint.as_deref().unwrap_or_default(),
+            "endpoint",
+        )
+    }
 }
 
 pub async fn create_destination(
@@ -225,11 +323,13 @@ pub async fn create_destination(
     field(&body.endpoint, "endpoint")?;
     field(&body.bucket, "bucket")?;
     field(&body.prefix, "prefix")?;
+    body.options.check()?;
     let secret = sealed_bytes(&body.secret)?;
     require_agent_key(&app, body.agent_id).await?;
     sqlx::query(
-        "INSERT INTO destinations (id, name, kind, agent_id, endpoint, bucket, prefix, secret)
-         VALUES ($1, $2, 's3', $3, $4, $5, $6, $7)",
+        "INSERT INTO destinations (id, name, kind, agent_id, endpoint, bucket, prefix, secret, region,
+             virtual_host, public_endpoint)
+         VALUES ($1, $2, 's3', $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(body.id)
     .bind(&name)
@@ -238,6 +338,9 @@ pub async fn create_destination(
     .bind(body.bucket.trim())
     .bind(body.prefix.trim())
     .bind(secret)
+    .bind(&body.options.region)
+    .bind(body.options.virtual_host)
+    .bind(&body.options.public_endpoint)
     .execute(&app.db)
     .await?;
     audit::record(
@@ -250,6 +353,84 @@ pub async fn create_destination(
     )
     .await?;
     Ok(StatusCode::CREATED)
+}
+
+#[derive(Deserialize)]
+pub struct Storage {
+    endpoint: String,
+    bucket: String,
+    prefix: String,
+    #[serde(flatten)]
+    options: Options,
+    secret: String,
+}
+
+#[derive(Deserialize)]
+pub struct DestinationEdit {
+    name: String,
+    connection: Option<Storage>,
+}
+
+pub async fn update_destination(
+    State(app): State<AppState>,
+    Auth(me): Auth,
+    Ip(ip): Ip,
+    Path(id): Path<Uuid>,
+    Json(body): Json<DestinationEdit>,
+) -> Result<StatusCode, Error> {
+    me.require_operator()?;
+    let name = named(&body.name, "name")?;
+    let mut tx = app.db.begin().await?;
+    let (bucket, prefix): (String, String) =
+        sqlx::query_as("UPDATE destinations SET name = $2 WHERE id = $1 RETURNING bucket, prefix")
+            .bind(id)
+            .bind(&name)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(Error::NotFound)?;
+    if let Some(storage) = &body.connection {
+        field(&storage.endpoint, "endpoint")?;
+        field(&storage.bucket, "bucket")?;
+        field(&storage.prefix, "prefix")?;
+        storage.options.check()?;
+        // Stored backups are found by their place: moving it would orphan them.
+        if storage.bucket.trim() != bucket || storage.prefix.trim() != prefix {
+            let used: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM snapshots WHERE destination_id = $1)
+                     OR EXISTS (SELECT 1 FROM jobs WHERE destination_id = $1 AND status IN ('pending', 'running'))",
+            )
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if used {
+                return Err(Error::Conflict("has_snapshots"));
+            }
+        }
+        sqlx::query(
+            "UPDATE destinations SET endpoint = $2, bucket = $3, prefix = $4, secret = $5, region = $6,
+                 virtual_host = $7, public_endpoint = $8
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(storage.endpoint.trim())
+        .bind(storage.bucket.trim())
+        .bind(storage.prefix.trim())
+        .bind(sealed_bytes(&storage.secret)?)
+        .bind(&storage.options.region)
+        .bind(storage.options.virtual_host)
+        .bind(&storage.options.public_endpoint)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let what = if body.connection.is_some() {
+        " and connection"
+    } else {
+        ""
+    };
+    let target = format!("destination {name}{what}");
+    audit::record(&mut *tx, Some(&me), "update", &target, &ip, true).await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn delete_destination(
@@ -416,13 +597,8 @@ pub struct NewBackup {
     plan: Plan,
 }
 
-pub async fn create_backup(
-    State(app): State<AppState>,
-    Auth(me): Auth,
-    Ip(ip): Ip,
-    Json(body): Json<NewBackup>,
-) -> Result<StatusCode, Error> {
-    me.require_operator()?;
+/// The rules a backup entry must meet, new or edited.
+async fn check_backup(app: &AppState, body: &NewBackup) -> Result<(String, Planned), Error> {
     let name = named(&body.name, "name")?;
     if !valid_database_name(&body.database_name) {
         return Err(Error::Invalid("database_name"));
@@ -442,10 +618,20 @@ pub async fn create_backup(
     .fetch_optional(&app.db)
     .await?;
     match same {
-        Some(true) => {}
-        Some(false) => return Err(Error::Invalid("different_agent")),
-        None => return Err(Error::NotFound),
+        Some(true) => Ok((name, planned)),
+        Some(false) => Err(Error::Invalid("different_agent")),
+        None => Err(Error::NotFound),
     }
+}
+
+pub async fn create_backup(
+    State(app): State<AppState>,
+    Auth(me): Auth,
+    Ip(ip): Ip,
+    Json(body): Json<NewBackup>,
+) -> Result<StatusCode, Error> {
+    me.require_operator()?;
+    let (name, planned) = check_backup(&app, &body).await?;
     sqlx::query(
         "INSERT INTO backup_configs (name, server_id, database_name, destination_id, compression, level,
              schedule, timezone, next_run_at, retention_unit, retention_value, keep_daily, keep_weekly,
@@ -468,49 +654,55 @@ pub async fn create_backup(
     .bind(planned.keep[2])
     .execute(&app.db)
     .await?;
-    audit::record(
-        &app.db,
-        Some(&me),
-        "create",
-        &format!("backup {name}"),
-        &ip,
-        true,
-    )
-    .await?;
+    let target = format!("backup {name}");
+    audit::record(&app.db, Some(&me), "create", &target, &ip, true).await?;
     Ok(StatusCode::CREATED)
 }
 
-/// Changes the schedule and retention. Snapshots already made keep their own expiry.
+/// Snapshots already made keep their own expiry, and rotation only judges those made after
+/// the retention or what is backed up last changed.
 pub async fn update_backup(
     State(app): State<AppState>,
     Auth(me): Auth,
     Ip(ip): Ip,
     Path(id): Path<Uuid>,
-    Json(plan): Json<Plan>,
+    Json(body): Json<NewBackup>,
 ) -> Result<StatusCode, Error> {
     me.require_operator()?;
-    let planned = plan.check()?;
-    let name: String = sqlx::query_scalar(
-        "UPDATE backup_configs SET schedule = $2, timezone = $3, next_run_at = $4,
-             retention_since = CASE WHEN (retention_unit, retention_value, keep_daily, keep_weekly, keep_monthly)
-                 IS DISTINCT FROM ($5::text, $6::integer, $7::integer, $8::integer, $9::integer)
+    let (name, planned) = check_backup(&app, &body).await?;
+    let found = sqlx::query(
+        "UPDATE backup_configs SET
+             retention_since = CASE WHEN (server_id, database_name, destination_id, retention_unit,
+                     retention_value, keep_daily, keep_weekly, keep_monthly)
+                 IS DISTINCT FROM ($3::uuid, $4::text, $5::uuid, $11::text, $12::integer, $13::integer,
+                     $14::integer, $15::integer)
                  THEN now() ELSE retention_since END,
-             retention_unit = $5, retention_value = $6, keep_daily = $7, keep_weekly = $8, keep_monthly = $9
-         WHERE id = $1 RETURNING name",
+             name = $2, server_id = $3, database_name = $4, destination_id = $5, compression = $6,
+             level = $7, schedule = $8, timezone = $9, next_run_at = $10, retention_unit = $11,
+             retention_value = $12, keep_daily = $13, keep_weekly = $14, keep_monthly = $15
+         WHERE id = $1",
     )
     .bind(id)
-    .bind(&plan.schedule)
+    .bind(&name)
+    .bind(body.server_id)
+    .bind(&body.database_name)
+    .bind(body.destination_id)
+    .bind(&body.compression)
+    .bind(body.level)
+    .bind(&body.plan.schedule)
     .bind(planned.timezone)
     .bind(planned.next_run_at)
-    .bind(&plan.retention_unit)
+    .bind(&body.plan.retention_unit)
     .bind(planned.value)
     .bind(planned.keep[0])
     .bind(planned.keep[1])
     .bind(planned.keep[2])
-    .fetch_optional(&app.db)
-    .await?
-    .ok_or(Error::NotFound)?;
-    let target = format!("backup {name} schedule and retention");
+    .execute(&app.db)
+    .await?;
+    if found.rows_affected() == 0 {
+        return Err(Error::NotFound);
+    }
+    let target = format!("backup {name}");
     audit::record(&app.db, Some(&me), "update", &target, &ip, true).await?;
     Ok(StatusCode::NO_CONTENT)
 }

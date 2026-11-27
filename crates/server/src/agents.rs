@@ -103,6 +103,40 @@ pub async fn create_token(
     }))
 }
 
+#[derive(Deserialize)]
+pub struct Rename {
+    name: String,
+}
+
+pub async fn rename(
+    State(app): State<AppState>,
+    Auth(me): Auth,
+    Ip(ip): Ip,
+    Path(id): Path<Uuid>,
+    Json(body): Json<Rename>,
+) -> Result<StatusCode, Error> {
+    me.require_admin()?;
+    let name = body.name.trim();
+    if name.is_empty() || name.len() > 64 {
+        return Err(Error::Invalid("name"));
+    }
+    let found = sqlx::query("UPDATE agents SET name = $2 WHERE id = $1")
+        .bind(id)
+        .bind(name)
+        .execute(&app.db)
+        .await
+        .map_err(|e| match Error::from(e) {
+            Error::Conflict("duplicate") => Error::Conflict("agent_name_taken"),
+            other => other,
+        })?;
+    if found.rows_affected() == 0 {
+        return Err(Error::NotFound);
+    }
+    let target = format!("agent {name}");
+    audit::record(&app.db, Some(&me), "update", &target, &ip, true).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Removing an agent revokes its credential.
 pub async fn remove(
     State(app): State<AppState>,

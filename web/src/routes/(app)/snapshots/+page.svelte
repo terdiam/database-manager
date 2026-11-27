@@ -1,4 +1,5 @@
 <script lang="ts">
+	import IconButton from '#lib/components/IconButton.svelte';
 	import { onMount } from 'svelte';
 	import { resolve } from '$app/paths';
 	import { request, type DbServer, type Page, type Snapshot } from '#lib/api/http.ts';
@@ -60,7 +61,7 @@
 		{:else if i === 2}{s.destination}
 		{:else if i === 3}{bytes(s.size)}
 		{:else if i === 4}{s.expires_at ? dateTime(s.expires_at) : '-'}
-		{:else}<a class="btn" href={resolve(`snapshots/${s.id}`)}>{t('snapshots.open')}</a>{/if}
+		{:else}<IconButton icon="eye" label={t('snapshots.open')} href={resolve(`snapshots/${s.id}`)} />{/if}
 	{/snippet}
 </DataTable>
 
