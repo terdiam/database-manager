@@ -32,7 +32,7 @@ export default defineConfig({
 				}
 			},
 			// SPA: the Rust server embeds this build and serves the fallback for unknown paths.
-			adapter: adapter({ fallback: '200.html' })
+			adapter: adapter({ fallback: '200.html', precompress: true })
 		})
 	]
 });

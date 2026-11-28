@@ -1,15 +1,16 @@
 <script lang="ts">
-	import { resolve } from '$app/paths';
+	import { asset, resolve } from '$app/paths';
 	import { page } from '$app/state';
 	import { isAdmin } from '#lib/session.svelte.ts';
 	import { t } from '#lib/i18n/index.svelte.ts';
 	import Icon from './Icon.svelte';
 	import { nav } from './nav';
-	import logo from '#lib/assets/favicon.svg';
 	import UserMenu from './UserMenu.svelte';
 
 	let { collapsed = false, ontour }: { collapsed?: boolean; ontour: () => void } = $props();
 	const active = (href: string) => (href === '/' ? page.url.pathname === '/' : page.url.pathname.startsWith(href));
+
+	const logo = asset('favicon.svg');
 </script>
 
 <div class="flex h-full flex-col">

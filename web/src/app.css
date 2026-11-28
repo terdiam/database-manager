@@ -65,8 +65,11 @@
 		}
 		select.input > button {
 			display: flex;
+			align-items: center;
 			flex: 1;
 			min-width: 0;
+			/* The part that is clicked: at least the 24px a pointer target needs. */
+			min-height: 1.5rem;
 		}
 		select.input::picker-icon {
 			content: '';

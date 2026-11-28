@@ -1,5 +1,5 @@
 <script lang="ts">
-	import logo from '#lib/assets/favicon.svg';
+	import { asset } from '$app/paths';
 	import { t } from '#lib/i18n/index.svelte.ts';
 	import { enter, loop } from '#lib/motion.ts';
 	import BrandIcon from './BrandIcon.svelte';
@@ -20,6 +20,8 @@
 		{ key: 'monitor', icon: 'bell' }
 	];
 	let selected = $state<(typeof features)[number]['key']>('schedule');
+
+	const logo = asset('favicon.svg');
 </script>
 
 <div class="flex w-full max-w-xl flex-col gap-7" {@attach enter}>

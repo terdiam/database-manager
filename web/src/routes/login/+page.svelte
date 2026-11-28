@@ -1,9 +1,8 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
-	import { resolve } from '$app/paths';
+	import { asset, resolve } from '$app/paths';
 	import { e2eeInfo, request, type AuthState } from '#lib/api/http.ts';
-	import logo from '#lib/assets/favicon.svg';
 	import Icon from '#lib/components/Icon.svelte';
 	import LoginShowcase from '#lib/components/LoginShowcase.svelte';
 	import NewPassword from '#lib/components/NewPassword.svelte';
@@ -72,6 +71,8 @@
 			busy = false;
 		}
 	}
+
+	const logo = asset('favicon.svg');
 </script>
 
 <svelte:head><title>{t(setup ? 'login.setup' : 'login.title')} · DB Manager</title></svelte:head>
@@ -86,7 +87,7 @@
 			</span>
 			{#if encrypted}
 				<span class="inline-flex items-center gap-1 rounded-full border border-line px-2 py-0.5 text-xs text-ok" title={t('login.encryptedHint')}>
-					<Icon name="shield" size={13} />{t('login.encrypted')}
+					<Icon name="shield" size={13} /><span class="max-sm:sr-only">{t('login.encrypted')}</span>
 				</span>
 			{/if}
 			{#if server === 'offline'}<button type="button" class="btn min-h-9 text-xs" onclick={check}>{t('action.retry')}</button>{/if}
@@ -103,7 +104,7 @@
 			<form bind:this={card} class="card w-full max-w-md p-6 shadow-xl sm:p-8" onsubmit={submit} onkeydown={keys} onkeyup={keys} {@attach enter}>
 				<img src={logo} alt="" width="48" height="48" class="mb-4" data-enter />
 				<p class="text-sm font-medium text-brand" data-enter>{t(`login.greeting.${greeting}`)}</p>
-				<h1 class="text-2xl font-bold tracking-tight" data-enter>{t(setup ? 'login.setup' : 'login.welcome')}</h1>
+				<h1 class="text-2xl font-bold tracking-tight">{t(setup ? 'login.setup' : 'login.welcome')}</h1>
 				<p class="mt-1 mb-5 text-sm text-dim" data-enter>{t(setup ? 'login.setupHint' : 'login.hint')}</p>
 
 				<div data-enter>
