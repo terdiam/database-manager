@@ -3,7 +3,7 @@
 Self-hosted database backup and restore with a web dashboard.
 Rust (server and agent), PostgreSQL and SvelteKit.
 
-Work in progress: backup and restore work by hand or on a schedule. Pages marked "sample data" show dummy content.
+Still young: try a restore before you rely on it.
 
 ## Features
 
