@@ -7,7 +7,7 @@ use axum::{
 };
 use dbm_shared::{
     e2ee,
-    jobs::{COMPRESSIONS, ENGINES, valid_target},
+    jobs::{COMPRESSIONS, ENGINES, supports_incremental, valid_target},
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -569,6 +569,9 @@ pub struct Backup {
     keep_daily: Option<i32>,
     keep_weekly: Option<i32>,
     keep_monthly: Option<i32>,
+    /// Set on incremental entries: the full entry they follow, and its name.
+    base_id: Option<Uuid>,
+    base: Option<String>,
 }
 
 pub async fn list_backups(
@@ -578,7 +581,8 @@ pub async fn list_backups(
     let rows = sqlx::query_as(
         "SELECT b.id, b.name, b.server_id, s.name AS server, b.database_name, b.destination_id,
                 d.name AS destination, b.compression, b.level, b.schedule, b.timezone, b.next_run_at,
-                b.retention_unit, b.retention_value, b.keep_daily, b.keep_weekly, b.keep_monthly
+                b.retention_unit, b.retention_value, b.keep_daily, b.keep_weekly, b.keep_monthly,
+                b.base_id, (SELECT f.name FROM backup_configs f WHERE f.id = b.base_id) AS base
          FROM backup_configs b
          JOIN database_servers s ON s.id = b.server_id
          JOIN destinations d ON d.id = b.destination_id
@@ -668,6 +672,90 @@ pub struct NewBackup {
     plan: Plan,
 }
 
+/// An incremental entry chooses only its name and when it runs.
+#[derive(Deserialize)]
+pub struct NewIncrement {
+    name: String,
+    base_id: Uuid,
+    schedule: Option<String>,
+    #[serde(default)]
+    timezone: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub enum BackupBody {
+    Increment(NewIncrement),
+    Full(NewBackup),
+}
+
+/// Everything the followers take from their full entry.
+const INHERIT: &str =
+    "UPDATE backup_configs c SET server_id = f.server_id, database_name = f.database_name,
+    destination_id = f.destination_id, compression = f.compression, level = f.level,
+    retention_unit = f.retention_unit, retention_value = f.retention_value
+    FROM backup_configs f WHERE c.base_id = f.id";
+
+/// Creates an incremental entry, or changes one when `id` is given.
+async fn save_increment(
+    app: &AppState,
+    body: &NewIncrement,
+    id: Option<Uuid>,
+) -> Result<String, Error> {
+    let name = named(&body.name, "name")?;
+    let (engine, unit, nested): (String, Option<String>, bool) = sqlx::query_as(
+        "SELECT s.engine, c.retention_unit, c.base_id IS NOT NULL FROM backup_configs c
+         JOIN database_servers s ON s.id = c.server_id WHERE c.id = $1",
+    )
+    .bind(body.base_id)
+    .fetch_optional(&app.db)
+    .await?
+    .ok_or(Error::Invalid("base"))?;
+    if nested || !supports_incremental(&engine) {
+        return Err(Error::Invalid("base"));
+    }
+    // Chains expire as a whole, which rotation by day, week and month cannot express.
+    if unit.as_deref() == Some("gfs") {
+        return Err(Error::Invalid("retention_chain"));
+    }
+    let planned = Plan {
+        schedule: body.schedule.clone(),
+        timezone: body.timezone.clone(),
+        ..Plan::default()
+    }
+    .check()?;
+    let mut tx = app.db.begin().await?;
+    let sql = match id {
+        None => {
+            "INSERT INTO backup_configs (name, base_id, schedule, timezone, next_run_at, server_id,
+                 database_name, destination_id, compression, level)
+             SELECT $1, f.id, $3, $4, $5, f.server_id, f.database_name, f.destination_id, f.compression, f.level
+             FROM backup_configs f WHERE f.id = $2 AND $6::uuid IS NULL RETURNING id"
+        }
+        // The kind of an entry never changes.
+        Some(_) => {
+            "UPDATE backup_configs SET name = $1, base_id = $2, schedule = $3, timezone = $4, next_run_at = $5
+             WHERE id = $6 AND base_id IS NOT NULL RETURNING id"
+        }
+    };
+    let saved: Uuid = sqlx::query_scalar(sql)
+        .bind(&name)
+        .bind(body.base_id)
+        .bind(&body.schedule)
+        .bind(planned.timezone)
+        .bind(planned.next_run_at)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(Error::NotFound)?;
+    sqlx::query(sqlx::AssertSqlSafe(format!("{INHERIT} AND c.id = $1")))
+        .bind(saved)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(name)
+}
+
 /// The rules a backup entry must meet, new or edited.
 async fn check_backup(app: &AppState, body: &NewBackup) -> Result<(String, Planned), Error> {
     let name = named(&body.name, "name")?;
@@ -704,9 +792,18 @@ pub async fn create_backup(
     State(app): State<AppState>,
     Auth(me): Auth,
     Ip(ip): Ip,
-    Json(body): Json<NewBackup>,
+    Json(body): Json<BackupBody>,
 ) -> Result<StatusCode, Error> {
     me.require_operator()?;
+    let body = match body {
+        BackupBody::Increment(body) => {
+            let name = save_increment(&app, &body, None).await?;
+            let target = format!("incremental backup {name}");
+            audit::record(&app.db, Some(&me), "create", &target, &ip, true).await?;
+            return Ok(StatusCode::CREATED);
+        }
+        BackupBody::Full(body) => body,
+    };
     let (name, planned) = check_backup(&app, &body).await?;
     sqlx::query(
         "INSERT INTO backup_configs (name, server_id, database_name, destination_id, compression, level,
@@ -742,10 +839,43 @@ pub async fn update_backup(
     Auth(me): Auth,
     Ip(ip): Ip,
     Path(id): Path<Uuid>,
-    Json(body): Json<NewBackup>,
+    Json(body): Json<BackupBody>,
 ) -> Result<StatusCode, Error> {
     me.require_operator()?;
+    let body = match body {
+        BackupBody::Increment(body) => {
+            let name = save_increment(&app, &body, Some(id)).await?;
+            let target = format!("incremental backup {name}");
+            audit::record(&app.db, Some(&me), "update", &target, &ip, true).await?;
+            return Ok(StatusCode::NO_CONTENT);
+        }
+        BackupBody::Full(body) => body,
+    };
     let (name, planned) = check_backup(&app, &body).await?;
+    let (incremental, followed): (bool, bool) = sqlx::query_as(
+        "SELECT base_id IS NOT NULL, EXISTS (SELECT 1 FROM backup_configs f WHERE f.base_id = c.id)
+         FROM backup_configs c WHERE c.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&app.db)
+    .await?
+    .ok_or(Error::NotFound)?;
+    if incremental {
+        return Err(Error::Invalid("base"));
+    }
+    if followed {
+        let engine: String =
+            sqlx::query_scalar("SELECT engine FROM database_servers WHERE id = $1")
+                .bind(body.server_id)
+                .fetch_one(&app.db)
+                .await?;
+        if !supports_incremental(&engine) {
+            return Err(Error::Invalid("base"));
+        }
+        if body.plan.retention_unit.as_deref() == Some("gfs") {
+            return Err(Error::Invalid("retention_chain"));
+        }
+    }
     let found = sqlx::query(
         "UPDATE backup_configs SET
              retention_since = CASE WHEN (server_id, database_name, destination_id, retention_unit,
@@ -778,6 +908,10 @@ pub async fn update_backup(
     if found.rows_affected() == 0 {
         return Err(Error::NotFound);
     }
+    sqlx::query(sqlx::AssertSqlSafe(format!("{INHERIT} AND f.id = $1")))
+        .bind(id)
+        .execute(&app.db)
+        .await?;
     let target = format!("backup {name}");
     audit::record(&app.db, Some(&me), "update", &target, &ip, true).await?;
     Ok(StatusCode::NO_CONTENT)

@@ -51,7 +51,7 @@ impl Tool {
     }
 }
 
-fn quiet(program: &str) -> Command {
+pub fn quiet(program: &str) -> Command {
     let mut command = Command::new(program);
     command
         .env_clear()
@@ -124,7 +124,7 @@ fn psql(secret: &DatabaseSecret, sql: &str) -> Result<String> {
 // ---------------------------------------------------------------- MySQL and MariaDB
 
 /// Oracle's tools for MySQL, MariaDB's for MariaDB: their options and dumps differ.
-fn mysql(program: &str, secret: &DatabaseSecret) -> Result<Command> {
+pub fn mysql(program: &str, secret: &DatabaseSecret) -> Result<Command> {
     let maria = secret.engine == "mariadb";
     let ssl: &[&str] = match (secret.ssl_mode.as_str(), maria) {
         ("disable", false) => &["--ssl-mode=DISABLED"],
@@ -163,7 +163,7 @@ fn mysql_programs(secret: &DatabaseSecret) -> (&'static str, &'static str) {
     }
 }
 
-fn mysql_query(secret: &DatabaseSecret, sql: &str) -> Result<String> {
+pub fn mysql_query(secret: &DatabaseSecret, sql: &str) -> Result<String> {
     let (client, _) = mysql_programs(secret);
     let mut command = mysql(client, secret)?;
     command.args([
@@ -310,8 +310,48 @@ pub fn test(secret: &DatabaseSecret) -> Result<String> {
     }
 }
 
-/// A command that writes the dump of `name` to standard output.
-pub fn dump(secret: &DatabaseSecret, name: &str) -> Result<Tool> {
+/// An incremental backup: the log files since the parent, fetched by the agent itself.
+pub fn dump_increment(secret: &DatabaseSecret, files: &[String]) -> Result<Tool> {
+    let mut command = helper(helper::BINLOG_DUMP, secret, "", "")?;
+    command.env(helper::ARGS, serde_json::to_string(files)?);
+    Ok(Tool::new(command, "log dump"))
+}
+
+/// Replays one incremental backup; it reads the file from standard input.
+pub fn restore_increment(
+    secret: &DatabaseSecret,
+    name: &str,
+    source: &str,
+    from: &str,
+    to: &str,
+    until: &str,
+) -> Result<Tool> {
+    let name = checked(secret, name)?;
+    let mut command = helper(helper::BINLOG_APPLY, secret, name, source)?;
+    command.env(helper::ARGS, serde_json::to_string(&[from, to, until])?);
+    command.stdin(Stdio::piped()).stdout(Stdio::null());
+    Ok(Tool::new(command, "log replay"))
+}
+
+/// A chain is replayed onto what its full backup creates, so nothing else may be there.
+pub fn require_empty(secret: &DatabaseSecret, name: &str) -> Result<()> {
+    let name = checked(secret, name)?;
+    // The name is restricted to [A-Za-z0-9_-], so quoting it cannot be escaped.
+    let tables = mysql_query(
+        secret,
+        &format!("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '{name}'"),
+    )?;
+    if tables != "0" {
+        return Err(
+            "the target database is not empty: a chain restores into a new or empty one".into(),
+        );
+    }
+    Ok(())
+}
+
+/// A command that writes the dump of `name` to standard output. `track` records the log
+/// position in it, for increments to start from.
+pub fn dump(secret: &DatabaseSecret, name: &str, track: bool) -> Result<Tool> {
     let name = checked(secret, name)?;
     Ok(match secret.engine.as_str() {
         "postgresql" => {
@@ -333,6 +373,14 @@ pub fn dump(secret: &DatabaseSecret, name: &str) -> Result<Tool> {
             ]);
             if secret.engine == "mysql" {
                 command.arg("--set-gtid-purged=OFF");
+            }
+            if track {
+                // Written as a comment: restoring the dump does not act on it.
+                command.arg(if secret.engine == "mysql" {
+                    "--source-data=2"
+                } else {
+                    "--master-data=2"
+                });
             }
             // Without --databases the dump can be restored under another name.
             command.arg(name);
@@ -494,7 +542,7 @@ mod tests {
             ("elasticsearch", "shop"),
             ("opensearch", "_all"),
         ] {
-            let tool = dump(&secret(engine), name).unwrap();
+            let tool = dump(&secret(engine), name, false).unwrap();
             let args: Vec<_> = tool.command.get_args().collect();
             assert!(
                 !args.iter().any(|a| a.to_string_lossy().contains("hunter2")),
@@ -503,7 +551,7 @@ mod tests {
         }
         let mut sneaky = secret("mysql");
         sneaky.host = "--plugin-dir=/tmp".into();
-        assert!(dump(&sneaky, "shop").is_err());
+        assert!(dump(&sneaky, "shop", false).is_err());
     }
 
     #[test]

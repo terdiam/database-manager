@@ -1,4 +1,5 @@
 mod api;
+mod binlog;
 mod engines;
 mod helper;
 mod manifest;
@@ -249,9 +250,11 @@ async fn execute(api: &Api, state: &State, job: Job) {
             }
         }
     };
+    let mut chain_broken = false;
     let (error, output) = match result {
         Ok(output) => (None, output),
         Err(error) => {
+            chain_broken = error.downcast_ref::<binlog::ChainBroken>().is_some();
             progress.log("error", error.to_string());
             (Some(error.to_string()), runner::Output::default())
         }
@@ -273,6 +276,9 @@ async fn execute(api: &Api, state: &State, job: Job) {
         sha256: output.sha256,
         manifest: output.manifest,
         result: output.result,
+        position_from: output.position_from,
+        position_to: output.position_to,
+        chain_broken,
     };
     // Losing this message would leave the job to expire, so try a few times.
     for attempt in 1..=5 {

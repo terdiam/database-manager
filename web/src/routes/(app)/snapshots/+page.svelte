@@ -58,6 +58,7 @@
 	{#snippet cell(s, i)}
 		{#if i === 0}<span class="whitespace-nowrap">{dateTime(s.created_at)}</span>
 		{:else if i === 1}<strong>{s.server_name}</strong> / {s.database_name}
+			{#if s.parent_id}<span class="block text-xs text-dim">{t('type.incremental')}</span>{/if}
 		{:else if i === 2}{s.destination}
 		{:else if i === 3}{bytes(s.size)}
 		{:else if i === 4}{s.expires_at ? dateTime(s.expires_at) : '-'}

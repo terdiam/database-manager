@@ -8,7 +8,8 @@ use axum::{
 use dbm_shared::{
     e2ee,
     jobs::{
-        Claim, Finish, Job, LEASE_SECS, LogLine, MAX_LOG_LINES, Report, ReportReply, Sealed, Task,
+        Claim, Finish, Increment, Job, LEASE_SECS, LogLine, MAX_LOG_LINES, Report, ReportReply,
+        Sealed, Task,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -19,7 +20,7 @@ use uuid::Uuid;
 use crate::{
     AppState, Error, agents, audit,
     auth::{Auth, Ip},
-    keys,
+    keys, snapshots,
 };
 
 const PAGE: i64 = 100;
@@ -39,6 +40,10 @@ pub struct NewJob {
     pub level: Option<i32>,
     pub key_id: Option<i32>,
     pub ssh_config_id: Option<Uuid>,
+    /// For an incremental backup: the snapshot it continues.
+    pub parent_id: Option<Uuid>,
+    /// For a restore of a chain: stop replaying here.
+    pub restore_until: Option<OffsetDateTime>,
 }
 
 impl NewJob {
@@ -58,6 +63,8 @@ impl NewJob {
             level: None,
             key_id: None,
             ssh_config_id: None,
+            parent_id: None,
+            restore_until: None,
         }
     }
 }
@@ -65,8 +72,9 @@ impl NewJob {
 pub async fn enqueue(db: &PgPool, job: NewJob) -> Result<Uuid, Error> {
     let id = sqlx::query_scalar(
         "INSERT INTO jobs (kind, agent_id, target, created_by, backup_config_id, server_id, destination_id,
-                           snapshot_id, database_name, object_key, compression, level, key_id, ssh_config_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id",
+                           snapshot_id, database_name, object_key, compression, level, key_id, ssh_config_id,
+                           parent_id, restore_until)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING id",
     )
     .bind(job.kind)
     .bind(job.agent_id)
@@ -82,6 +90,8 @@ pub async fn enqueue(db: &PgPool, job: NewJob) -> Result<Uuid, Error> {
     .bind(job.level)
     .bind(job.key_id)
     .bind(job.ssh_config_id)
+    .bind(job.parent_id)
+    .bind(job.restore_until)
     .fetch_one(db)
     .await?;
     Ok(id)
@@ -255,6 +265,35 @@ struct Claimed {
     level: Option<i32>,
     key_id: Option<i32>,
     ssh_config_id: Option<Uuid>,
+    backup_config_id: Option<Uuid>,
+    parent_id: Option<Uuid>,
+    restore_until: Option<OffsetDateTime>,
+}
+
+#[derive(sqlx::FromRow)]
+struct Link {
+    object_key: String,
+    sha256: String,
+    compression: String,
+    key_id: i32,
+    manifest: Option<String>,
+    database_name: String,
+    position_from: Option<String>,
+    position_to: Option<String>,
+}
+
+/// The form the database's own log tools take a time in; the agent runs them in UTC.
+fn utc_text(at: OffsetDateTime) -> String {
+    let at = at.to_offset(time::UtcOffset::UTC);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        at.year(),
+        u8::from(at.month()),
+        at.day(),
+        at.hour(),
+        at.minute(),
+        at.second()
+    )
 }
 
 async fn sealed_from(db: &PgPool, sql: &'static str, id: Option<Uuid>) -> Result<Sealed, Error> {
@@ -317,28 +356,73 @@ async fn task(app: &AppState, agent: Uuid, job: &Claimed) -> Result<Task, Error>
             level: job.level.ok_or_else(missing)?,
             recipients: keys::recipients(app, job.key_id.ok_or_else(missing)?).await?,
             object_key: job.object_key.clone().ok_or_else(missing)?,
+            since: match job.parent_id {
+                Some(parent) => Some(
+                    sqlx::query_scalar::<_, Option<String>>(
+                        "SELECT position_to FROM snapshots WHERE id = $1",
+                    )
+                    .bind(parent)
+                    .fetch_optional(&app.db)
+                    .await?
+                    .flatten()
+                    .ok_or_else(missing)?,
+                ),
+                None => None,
+            },
+            // Only a backup that others follow needs the extra rights of reading positions.
+            track: job.parent_id.is_none()
+                && sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM backup_configs WHERE base_id = $1)",
+                )
+                .bind(job.backup_config_id)
+                .fetch_one(&app.db)
+                .await?,
         },
         "restore" => {
-            let (sha256, compression, key_id, manifest, source): (
-                String, String, i32, Option<String>, String,
-            ) = sqlx::query_as(
-                    "SELECT sha256, compression, key_id, manifest, database_name FROM snapshots WHERE id = $1",
-                )
-                .bind(job.snapshot_id.ok_or_else(missing)?)
-                .fetch_optional(&app.db)
-                .await?
-                .ok_or_else(missing)?;
+            // The chain from its full backup to the chosen one; a plain snapshot is a chain
+            // of one.
+            let mut chain: Vec<Link> = sqlx::query_as(
+                "WITH RECURSIVE chain AS (
+                     SELECT s.*, 0 AS depth FROM snapshots s WHERE s.id = $1
+                     UNION ALL
+                     SELECT s.*, c.depth + 1 FROM snapshots s JOIN chain c ON s.id = c.parent_id
+                 )
+                 SELECT object_key, sha256, compression, key_id, manifest, database_name,
+                        position_from, position_to FROM chain ORDER BY depth DESC",
+            )
+            .bind(job.snapshot_id.ok_or_else(missing)?)
+            .fetch_all(&app.db)
+            .await?;
+            if chain.is_empty() {
+                return Err(missing());
+            }
+            let full = chain.remove(0);
+            let mut increments = Vec::with_capacity(chain.len());
+            for link in chain {
+                increments.push(Increment {
+                    identity: keys::seal_identity(app, link.key_id, agent, job.id).await?,
+                    object_key: link.object_key,
+                    sha256: link.sha256,
+                    manifest: link.manifest,
+                    compression: link.compression,
+                    from: link.position_from.ok_or_else(missing)?,
+                    to: link.position_to.ok_or_else(missing)?,
+                });
+            }
             Task::Restore {
                 ssh: tunnel().await?,
                 database: database().await?,
                 destination: destination().await?,
-                identity: keys::seal_identity(app, key_id, agent, job.id).await?,
-                object_key: job.object_key.clone().ok_or_else(missing)?,
-                sha256,
-                manifest,
-                compression,
+                identity: keys::seal_identity(app, full.key_id, agent, job.id).await?,
+                object_key: full.object_key,
+                sha256: full.sha256,
+                manifest: full.manifest,
+                compression: full.compression,
                 name: job.database_name.clone().ok_or_else(missing)?,
-                source,
+                source: full.database_name,
+                position: full.position_to,
+                increments,
+                until: job.restore_until.map(utc_text),
             }
         }
         "test_database" => Task::TestDatabase {
@@ -378,7 +462,7 @@ pub async fn claim(State(app): State<AppState>, headers: HeaderMap) -> Result<Js
          WHERE id = (SELECT id FROM jobs WHERE agent_id = $1 AND status = 'pending'
                      ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED)
          RETURNING id, lease, kind, server_id, destination_id, snapshot_id, database_name, object_key,
-                   compression, level, key_id, ssh_config_id",
+                   compression, level, key_id, ssh_config_id, backup_config_id, parent_id, restore_until",
     )
     .bind(agent)
     .bind(f64::from(LEASE_SECS))
@@ -482,22 +566,33 @@ pub async fn finish(
     if !failed && kind == "backup" {
         let sha256 = sha256.ok_or(Error::Invalid("sha256"))?;
         let manifest = body.manifest.as_deref().filter(|m| m.len() <= 128);
+        let position = |p: &Option<String>| p.clone().filter(|p| p.len() <= 255);
+        // An increment joins its parent's chain; a full backup with a position starts one.
         sqlx::query(
-            "INSERT INTO snapshots (job_id, backup_config_id, server_name, database_name, destination_id,
-                                    object_key, size, sha256, compression, key_id, manifest, expires_at, engine)
-             SELECT j.id, j.backup_config_id, j.target, j.database_name, j.destination_id, j.object_key,
+            "INSERT INTO snapshots (id, job_id, backup_config_id, server_name, database_name, destination_id,
+                                    object_key, size, sha256, compression, key_id, manifest, expires_at, engine,
+                                    parent_id, chain_id, position_from, position_to)
+             SELECT new.id, j.id, j.backup_config_id, j.target, j.database_name, j.destination_id, j.object_key,
                     j.bytes, $2, j.compression, j.key_id, $3,
                     CASE c.retention_unit
                         WHEN 'days' THEN now() + make_interval(days => c.retention_value)
                         WHEN 'months' THEN now() + make_interval(months => c.retention_value)
                     END,
-                    coalesce(s.engine, 'postgresql')
-             FROM jobs j LEFT JOIN backup_configs c ON c.id = j.backup_config_id
+                    coalesce(s.engine, 'postgresql'),
+                    j.parent_id,
+                    CASE WHEN j.parent_id IS NOT NULL
+                             THEN (SELECT p.chain_id FROM snapshots p WHERE p.id = j.parent_id)
+                         WHEN $5::text IS NOT NULL THEN new.id
+                    END,
+                    $4, $5
+             FROM (SELECT uuidv7() AS id) new, jobs j LEFT JOIN backup_configs c ON c.id = j.backup_config_id
              LEFT JOIN database_servers s ON s.id = j.server_id WHERE j.id = $1",
         )
         .bind(body.id)
         .bind(sha256)
         .bind(manifest)
+        .bind(position(&body.position_from))
+        .bind(position(&body.position_to))
         .execute(&mut *tx)
         .await?;
     }
@@ -524,6 +619,23 @@ pub async fn finish(
             .execute(&mut *tx)
             .await?;
     }
+    // The log the increment needed is gone: take a full backup now, so the chain starts over.
+    let restart: Option<Uuid> = if failed && !cancelled && body.chain_broken && kind == "backup" {
+        sqlx::query_scalar(
+            "SELECT c.base_id FROM jobs j JOIN backup_configs c ON c.id = j.backup_config_id WHERE j.id = $1",
+        )
+        .bind(body.id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten()
+    } else {
+        None
+    };
     tx.commit().await?;
+    if let Some(base) = restart
+        && let Err(error) = snapshots::queue_backup(&app, base, "chain restart").await
+    {
+        tracing::warn!("could not start a new chain: {}", error.detail());
+    }
     Ok(StatusCode::NO_CONTENT)
 }

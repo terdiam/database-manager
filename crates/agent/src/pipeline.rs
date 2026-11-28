@@ -60,7 +60,7 @@ impl Running {
         // These report their progress on stderr; for the other tools it means trouble.
         let usual = if matches!(
             self.name,
-            "redis dump" | "redis restore" | "index dump" | "index restore"
+            "redis dump" | "redis restore" | "index dump" | "index restore" | "log dump"
         ) {
             "info"
         } else {
@@ -160,8 +160,25 @@ fn decompress<'a>(kind: &str, from: impl Read + 'a) -> Result<Box<dyn Read + 'a>
     })
 }
 
-/// Blocking. Returns the stored file's SHA-256; on any failure nothing is committed and
-/// the caller aborts the upload.
+/// Keeps the first bytes that pass through: a dump says at its top where it was taken.
+struct Head<R> {
+    inner: R,
+    kept: Vec<u8>,
+}
+
+const HEAD: usize = 64 * 1024;
+
+impl<R: Read> Read for Head<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buffer)?;
+        let more = n.min(HEAD - self.kept.len());
+        self.kept.extend_from_slice(&buffer[..more]);
+        Ok(n)
+    }
+}
+
+/// Blocking. Returns the stored file's SHA-256 and the first bytes of the dump; on any
+/// failure nothing is committed and the caller aborts the upload.
 pub fn backup(
     mut dump: engines::Tool,
     compression: &str,
@@ -170,7 +187,7 @@ pub fn backup(
     sink: &mut Sink,
     handle: Handle,
     progress: &Progress,
-) -> Result<String> {
+) -> Result<(String, Vec<u8>)> {
     let recipients = recipients
         .iter()
         .map(|r| x25519::Recipient::from_str(r))
@@ -180,16 +197,19 @@ pub fn backup(
     let upload = Upload::new(sink, handle, progress.clone());
 
     let mut tool = Running::start(&mut dump.command, dump.name)?;
-    let mut stdout = tool
-        .child
-        .stdout
-        .take()
-        .ok_or("the dump tool has no output")?;
+    let mut stdout = Head {
+        inner: tool
+            .child
+            .stdout
+            .take()
+            .ok_or("the dump tool has no output")?,
+        kept: Vec::new(),
+    };
     let encrypted = encryptor.wrap_output(upload)?;
     let encrypted = compress(compression, level, &mut stdout, encrypted, progress)?;
     // End of output is not success: a dump that died halfway must not be committed.
     tool.wait(progress)?;
-    encrypted.finish()?.finish()
+    Ok((encrypted.finish()?.finish()?, stdout.kept))
 }
 
 /// Blocking. `file` has already been checked against the recorded SHA-256.

@@ -1963,6 +1963,225 @@ async fn a_backup_only_restores_into_its_own_engine(db: PgPool) {
 
 // ---------------------------------------------------------------- SSH tunnels and storage kinds
 
+/// A MySQL server with a full entry keeping 7 days; returns (server, destination, full).
+async fn chain_setup(app: &Router, cookie: &str, agent: &Agent) -> (String, String, String) {
+    let (_, destination, _) = add_resources(app, cookie, agent).await;
+    let server = uuid::Uuid::new_v4().to_string();
+    let body = json!({ "id": server, "name": "shop-db", "engine": "mysql", "agent_id": agent.id, "host": "db",
+        "port": 3306, "username": "u", "secret": sealed_for(agent, &server, "database", "{}") });
+    let reply = call(
+        app,
+        "POST",
+        "/api/database-servers",
+        Some(cookie),
+        Some(body),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::CREATED);
+    let body = json!({ "name": "full", "server_id": server, "database_name": "shop", "destination_id": destination,
+        "compression": "zstd", "level": 3, "retention_unit": "days", "retention_value": 7 });
+    let reply = call(app, "POST", "/api/backups", Some(cookie), Some(body)).await;
+    assert_eq!(reply.status, StatusCode::CREATED);
+    (server, destination, entry_id(app, cookie, "full").await)
+}
+
+async fn entry_id(app: &Router, cookie: &str, name: &str) -> String {
+    let list = call(app, "GET", "/api/backups", Some(cookie), None).await;
+    let entries = list.body.as_array().unwrap();
+    let entry = entries.iter().find(|b| b["name"] == name).unwrap();
+    entry["id"].as_str().unwrap().into()
+}
+
+/// Runs an entry and lets the agent finish it; returns the task it was given.
+async fn run_and_finish(
+    app: &Router,
+    cookie: &str,
+    agent: &Agent,
+    entry: &str,
+    extra: Value,
+) -> Value {
+    let reply = call(
+        app,
+        "POST",
+        &format!("/api/backups/{entry}/run"),
+        Some(cookie),
+        None,
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    finish_next(app, agent, extra).await["task"].clone()
+}
+
+#[sqlx::test]
+async fn increments_continue_a_chain_that_restores_and_expires_as_a_whole(db: PgPool) {
+    let state = state_for(db.clone(), false, Keypair::generate());
+    let app = app(state.clone());
+    let cookie = admin(&app).await;
+    let agent = enroll(&app, &cookie, "a1").await;
+    let (server, destination, full) = chain_setup(&app, &cookie, &agent).await;
+
+    let follow =
+        |name: &str, base: &str| json!({ "name": name, "base_id": base, "schedule": "0 * * * *" });
+    let create = |body: Value| call(&app, "POST", "/api/backups", Some(&cookie), Some(body));
+    // Only MySQL and MariaDB entries that are full can be followed.
+    let nightly = entry_id(&app, &cookie, "nightly").await;
+    assert_eq!(create(follow("x", &nightly)).await.body["error"], "base");
+    assert_eq!(
+        create(follow("inc", &full)).await.status,
+        StatusCode::CREATED
+    );
+    let inc = entry_id(&app, &cookie, "inc").await;
+    assert_eq!(create(follow("y", &inc)).await.body["error"], "base");
+    let list = call(&app, "GET", "/api/backups", Some(&cookie), None).await;
+    let entry = list
+        .body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["name"] == "inc")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        (
+            entry["base"].as_str(),
+            entry["database_name"].as_str(),
+            entry["retention_value"].as_i64()
+        ),
+        (Some("full"), Some("shop"), Some(7))
+    );
+    // Rotation by generations cannot expire chains, and a followed entry cannot go.
+    let gfs = json!({ "name": "full", "server_id": server, "database_name": "shop", "destination_id": destination,
+        "compression": "zstd", "level": 3, "retention_unit": "gfs", "keep_daily": 3 });
+    let path = format!("/api/backups/{full}");
+    let reply = call(&app, "PUT", &path, Some(&cookie), Some(gfs)).await;
+    assert_eq!(reply.body["error"], "retention_chain");
+    let reply = call(&app, "DELETE", &path, Some(&cookie), None).await;
+    assert_eq!(reply.body["error"], "in_use");
+
+    // Without a chain the increment takes the full backup, recording where it ends.
+    let task = run_and_finish(
+        &app,
+        &cookie,
+        &agent,
+        &inc,
+        json!({ "manifest": "m0", "position_to": "s|bin.1|100" }),
+    )
+    .await;
+    assert_eq!(
+        (task["track"].as_bool(), task["since"].as_str()),
+        (Some(true), None)
+    );
+    let task = run_and_finish(
+        &app,
+        &cookie,
+        &agent,
+        &inc,
+        json!({ "manifest": "m1", "position_from": "s|bin.1|100", "position_to": "s|bin.1|200" }),
+    )
+    .await;
+    assert_eq!(
+        (task["track"].as_bool(), task["since"].as_str()),
+        (Some(false), Some("s|bin.1|100"))
+    );
+    assert!(
+        task["object_key"]
+            .as_str()
+            .unwrap()
+            .ends_with(".binlog.zst.age")
+    );
+
+    let snapshots = call(&app, "GET", "/api/snapshots", Some(&cookie), None).await;
+    let rows = snapshots.body["items"].as_array().unwrap().clone();
+    let (increment, first) = (&rows[0], &rows[1]);
+    assert_eq!(increment["parent_id"], first["id"]);
+    assert!(increment["chain_started_at"].is_string() && first["parent_id"].is_null());
+    let id = increment["id"].as_str().unwrap();
+
+    // The parent stays while something continues it.
+    let reply = call(
+        &app,
+        "DELETE",
+        &format!("/api/snapshots/{}", first["id"].as_str().unwrap()),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(reply.body["error"], "has_increments");
+
+    let restore = format!("/api/snapshots/{id}/restore");
+    let late =
+        json!({ "server_id": server, "database_name": "copy", "until": "2999-01-01T00:00:00Z" });
+    assert_eq!(
+        call(&app, "POST", &restore, Some(&cookie), Some(late))
+            .await
+            .body["error"],
+        "until"
+    );
+    let body =
+        json!({ "server_id": server, "database_name": "copy", "until": increment["created_at"] });
+    assert_eq!(
+        call(&app, "POST", &restore, Some(&cookie), Some(body))
+            .await
+            .status,
+        StatusCode::OK
+    );
+    let task = finish_next(&app, &agent, json!({})).await["task"].clone();
+    assert_eq!(task["position"], "s|bin.1|100");
+    assert_eq!(task["object_key"], first["object_key"]);
+    assert_eq!(task["increments"].as_array().unwrap().len(), 1);
+    assert_eq!(task["increments"][0]["from"], "s|bin.1|100");
+    assert_eq!(task["until"].as_str().unwrap().len(), 19);
+
+    // A log the agent can no longer read starts a new chain by itself.
+    run_and_finish(
+        &app,
+        &cookie,
+        &agent,
+        &inc,
+        json!({ "error": "log gone", "chain_broken": true }),
+    )
+    .await;
+    let task = finish_next(
+        &app,
+        &agent,
+        json!({ "manifest": "m2", "position_to": "s|bin.9|4" }),
+    )
+    .await["task"]
+        .clone();
+    assert_eq!(task["track"], true);
+
+    // The old chain is expired but one link: nothing goes. Once all are, newest first.
+    sqlx::query(
+        "UPDATE snapshots SET expires_at = now() - interval '1 day' WHERE manifest IN ('m0', 'm2')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    state.schedule_once().await;
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) FROM jobs WHERE kind = 'delete_snapshot'"
+        )
+        .await,
+        0
+    );
+    sqlx::query("UPDATE snapshots SET expires_at = now() - interval '1 day'")
+        .execute(&db)
+        .await
+        .unwrap();
+    state.schedule_once().await;
+    finish_next(&app, &agent, json!({})).await;
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM snapshots WHERE manifest = 'm1'").await,
+        0
+    );
+    state.schedule_once().await;
+    finish_next(&app, &agent, json!({})).await;
+    // The newest chain stays, however old.
+    assert_eq!(count(&db, "SELECT count(*) FROM snapshots").await, 1);
+}
+
 #[sqlx::test]
 async fn redis_and_search_engines_name_what_they_back_up(db: PgPool) {
     let app = router(db.clone());

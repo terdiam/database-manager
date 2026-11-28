@@ -69,12 +69,18 @@ const IDLE: &str = "NOT EXISTS (SELECT 1 FROM jobs j WHERE j.snapshot_id = s.id
          OR (j.kind = 'delete_snapshot' AND j.created_at > now() - interval '6 hours')))";
 
 async fn retention(app: &AppState) -> Result<(), Error> {
-    // Days and months. The newest backup of a database in a destination always stays.
+    // Days and months. The newest backup of a database in a destination always stays. A chain
+    // goes only as a whole, newest increment first, and the newest chain never.
     let expired: Vec<Uuid> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT s.id FROM snapshots s WHERE s.expires_at <= now()
          AND EXISTS (SELECT 1 FROM snapshots n WHERE n.server_name = s.server_name
                      AND n.database_name = s.database_name AND n.destination_id = s.destination_id
-                     AND (n.created_at, n.id) > (s.created_at, s.id))
+                     AND (n.created_at, n.id) > (s.created_at, s.id)
+                     AND (s.chain_id IS NULL OR n.chain_id IS DISTINCT FROM s.chain_id))
+         AND NOT EXISTS (SELECT 1 FROM snapshots c WHERE c.chain_id = s.chain_id
+                         AND (c.expires_at IS NULL OR c.expires_at > now()))
+         AND NOT EXISTS (SELECT 1 FROM snapshots c WHERE c.parent_id = s.id)
+         AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.parent_id = s.id AND j.status IN ('pending', 'running'))
          AND {IDLE} LIMIT 100"
     )))
     .fetch_all(&app.db)
@@ -86,7 +92,8 @@ async fn retention(app: &AppState) -> Result<(), Error> {
              SELECT s.id, s.created_at, s.created_at AT TIME ZONE c.timezone AS local, c.id AS config,
                     c.keep_daily, c.keep_weekly, c.keep_monthly
              FROM snapshots s JOIN backup_configs c ON c.id = s.backup_config_id
-             WHERE c.retention_unit = 'gfs' AND s.created_at >= c.retention_since
+             -- Chains cannot use this rotation.
+             WHERE c.retention_unit = 'gfs' AND s.created_at >= c.retention_since AND s.chain_id IS NULL
          ), r AS (
              SELECT *,
                  row_number() OVER (PARTITION BY config ORDER BY created_at DESC) AS newest,

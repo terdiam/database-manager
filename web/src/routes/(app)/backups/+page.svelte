@@ -85,6 +85,7 @@
 <DataTable label={t('nav.backups')} columns={[t('col.name'), t('col.source'), t('col.destination'), t('col.schedule'), t('retention.title'), ...(canOperate() ? [t('col.actions')] : [])]} rows={backups}>
 	{#snippet cell(b, i)}
 		{#if i === 0}<strong>{b.name}</strong>
+			{#if b.base}<span class="block text-xs text-dim">{t('type.incremental')} · {b.base}</span>{/if}
 		{:else if i === 1}{b.server} / {b.database_name}
 		{:else if i === 2}{b.destination}
 		{:else if i === 3}

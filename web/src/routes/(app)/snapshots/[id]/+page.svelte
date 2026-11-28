@@ -44,6 +44,13 @@
 		}
 	}
 
+	let until = $state('');
+	/** The value a `datetime-local` field takes, in the browser's own time zone. */
+	function localInput(iso: string, addSeconds = 0): string {
+		const at = new Date(Date.parse(iso) + addSeconds * 1000);
+		return new Date(at.getTime() - at.getTimezoneOffset() * 60_000).toISOString().slice(0, 19);
+	}
+
 	// Restores run on the agent that can open the destination's credentials.
 	const targets = $derived(servers.filter((s) => s.agent_id === snapshot?.agent_id && s.engine === snapshot?.engine));
 	const targetName = $derived(servers.find((s) => s.id === target)?.name ?? '');
@@ -106,6 +113,7 @@
 	<section class="card">
 		<SplitTitle text={t('snapshots.detail')} class="mb-3 font-semibold" />
 		<dl class="grid grid-cols-[9rem_1fr] gap-2 text-sm">
+			<dt class="text-dim">{t('col.type')}</dt><dd>{t(snapshot.parent_id ? 'type.incremental' : 'type.full')}</dd>
 			<dt class="text-dim">{t('col.size')}</dt><dd>{bytes(snapshot.size)}</dd>
 			<dt class="text-dim">{t('col.destination')}</dt><dd>{snapshot.destination}</dd>
 			<dt class="text-dim">{t('snapshots.file')}</dt><dd><code class="text-xs break-all">{snapshot.object_key}</code></dd>
@@ -127,14 +135,17 @@
 			<SplitTitle text={t('restore.title')} class="mb-1 font-semibold" />
 			<form onsubmit={(e) => { e.preventDefault(); restoreConfirm?.open(); }}>
 				<FormField label={t('restore.server')}>{#snippet children(a)}<Select {...a} required bind:value={target} placeholder={t('restore.choose')} options={targets.map((s) => ({ value: s.id, label: s.name, brand: s.engine, description: s.engine === 'sqlite' ? `/${s.host}` : `${s.host}:${s.port}` }))} />{/snippet}</FormField>
-				<FormField label={t(snapshot.engine === 'redis' || snapshot.engine === 'elasticsearch' || snapshot.engine === 'opensearch' ? targetField(snapshot.engine).label : 'restore.database')} help={t(snapshot.engine === 'redis' ? 'restore.redisHint' : snapshot.database_name === '_all' ? 'restore.allHint' : 'restore.createHint')}>{#snippet children(a)}<input {...a} class="input min-h-11" maxlength="63" pattern={namePattern(snapshot?.engine)} readonly={snapshot?.engine === 'redis' || snapshot?.database_name === '_all'} required bind:value={database} />{/snippet}</FormField>
+				<FormField label={t(snapshot.engine === 'redis' || snapshot.engine === 'elasticsearch' || snapshot.engine === 'opensearch' ? targetField(snapshot.engine).label : 'restore.database')} help={t(snapshot.engine === 'redis' ? 'restore.redisHint' : snapshot.database_name === '_all' ? 'restore.allHint' : snapshot.parent_id ? 'restore.chainHint' : 'restore.createHint')}>{#snippet children(a)}<input {...a} class="input min-h-11" maxlength="63" pattern={namePattern(snapshot?.engine)} readonly={snapshot?.engine === 'redis' || snapshot?.database_name === '_all'} required bind:value={database} />{/snippet}</FormField>
+				{#if snapshot.parent_id && snapshot.chain_started_at}
+					<FormField label={t('restore.until')} help={t('restore.untilHint')}>{#snippet children(a)}<input {...a} class="input min-h-11" type="datetime-local" step="1" min={localInput(snapshot!.chain_started_at!, 1)} max={localInput(snapshot!.created_at)} bind:value={until} />{/snippet}</FormField>
+				{/if}
 				<button type="submit" class="btn btn-primary">{t('restore.start')}</button>
 			</form>
 		</section>
 	{/if}
 
-	<ConfirmDialog bind:this={restoreConfirm} title={t('restore.title')} message={t(snapshot?.engine === 'redis' ? 'restore.redisWarning' : database === '_all' ? 'restore.allWarning' : 'restore.warning', { database, server: targetName })} confirmLabel={t('restore.start')} expect={database}
-		onconfirm={() => queue('POST', `/snapshots/${snapshot!.id}/restore`, { server_id: target, database_name: database })} />
+	<ConfirmDialog bind:this={restoreConfirm} title={t('restore.title')} message={t(snapshot?.engine === 'redis' ? 'restore.redisWarning' : database === '_all' ? 'restore.allWarning' : snapshot?.parent_id ? 'restore.chainWarning' : 'restore.warning', { database, server: targetName })} confirmLabel={t('restore.start')} expect={database}
+		onconfirm={() => queue('POST', `/snapshots/${snapshot!.id}/restore`, { server_id: target, database_name: database, until: until ? new Date(until).toISOString() : undefined })} />
 	<ConfirmDialog bind:this={deleteConfirm} title={t('action.delete')} message={t('snapshots.confirmDelete')} confirmLabel={t('action.delete')} onconfirm={() => queue('DELETE', `/snapshots/${snapshot!.id}`)} />
 {/if}
 

@@ -10,7 +10,13 @@ use serde::de::DeserializeOwned;
 use tokio::{runtime::Handle, task};
 
 use crate::{
-    Result, engines, manifest, pipeline, progress::Progress, ssh::Tunnel, state::State, storage,
+    Result,
+    binlog::{self, Position},
+    engines, manifest, pipeline,
+    progress::Progress,
+    ssh::Tunnel,
+    state::State,
+    storage,
 };
 
 /// Opens a secret sealed to this agent. A server cannot read it, and cannot move it
@@ -71,12 +77,115 @@ fn text(error: Box<dyn std::error::Error>) -> String {
     error.to_string()
 }
 
+/// An error carried across threads without losing that the chain is broken.
+enum Kept {
+    Broken(binlog::ChainBroken),
+    Other(String),
+}
+
+impl From<Box<dyn std::error::Error>> for Kept {
+    fn from(error: Box<dyn std::error::Error>) -> Self {
+        match error.downcast::<binlog::ChainBroken>() {
+            Ok(broken) => Kept::Broken(*broken),
+            Err(other) => Kept::Other(other.to_string()),
+        }
+    }
+}
+
+impl Kept {
+    fn into_error(self) -> Box<dyn std::error::Error> {
+        match self {
+            Kept::Broken(broken) => broken.into(),
+            Kept::Other(other) => other.into(),
+        }
+    }
+}
+
 /// What a successful job hands back to the server.
 #[derive(Default)]
 pub struct Output {
     pub sha256: Option<String>,
     pub manifest: Option<String>,
     pub result: Option<String>,
+    pub position_from: Option<String>,
+    pub position_to: Option<String>,
+}
+
+/// Where a backup sits in the database's log.
+#[derive(Default)]
+struct Chain {
+    /// Log files to take, for an incremental backup; a full one dumps the database.
+    files: Option<Vec<String>>,
+    from: Option<String>,
+    to: Option<String>,
+    /// The server a full backup is dumped from.
+    server: Option<String>,
+}
+
+/// Looked up before the dump starts.
+fn chain(secret: &DatabaseSecret, track: bool, since: Option<&str>) -> Result<Chain> {
+    if let Some(since) = since {
+        let span = binlog::span(secret, &Position::parse(since)?)?;
+        return Ok(Chain {
+            files: Some(span.files),
+            from: Some(since.into()),
+            to: Some(span.to.to_string()),
+            server: None,
+        });
+    }
+    if !track {
+        return Ok(Chain::default());
+    }
+    if !dbm_shared::jobs::supports_incremental(&secret.engine) {
+        return Err("this engine has no incremental backups".into());
+    }
+    binlog::check(secret)?;
+    Ok(Chain {
+        server: Some(binlog::server(secret)?),
+        ..Chain::default()
+    })
+}
+
+/// Checks the signature before anything is downloaded or touched.
+fn trusted(
+    state: &State,
+    progress: &Progress,
+    object_key: &str,
+    sha256: &str,
+    compression: &str,
+    positions: manifest::Positions<'_>,
+    manifest: Option<&str>,
+) -> Result<()> {
+    match manifest {
+        Some(tag) => {
+            manifest::verify(state, object_key, sha256, compression, positions, tag)?;
+            progress.log("ok", "backup signature verified");
+        }
+        None if unsigned_allowed() && positions.is_none() => {
+            progress.log("warn", "restoring a backup without a signature");
+        }
+        None => {
+            return Err("this backup has no signature: set DBM_ALLOW_UNSIGNED_RESTORE=true on the agent to restore it".into());
+        }
+    }
+    Ok(())
+}
+
+/// Downloads a stored file whole and checks it, so a database never sees part of a bad one.
+async fn fetch(
+    store: &storage::Store,
+    object_key: &str,
+    sha256: &str,
+    progress: &Progress,
+) -> Result<tempfile::NamedTempFile> {
+    progress.log("info", format!("downloading {object_key}"));
+    let temporary = tempfile::NamedTempFile::new()?;
+    let mut file = tokio::fs::File::from_std(temporary.reopen()?);
+    if store.download(object_key, &mut file, progress).await? != sha256 {
+        return Err("checksum mismatch: the stored file is not the one that was backed up".into());
+    }
+    progress.log("ok", "checksum verified");
+    Ok(temporary)
 }
 
 /// Old snapshots carry no signature; restoring one has to be allowed on the agent itself.
@@ -119,18 +228,42 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
             recipients,
             object_key,
             ssh,
+            track,
+            since,
         } => {
             let (database, _tunnel) = database(state, &sealed, ssh.as_ref(), &progress).await?;
             let (store, _) = store(state, &destination).await?;
-            progress.log("info", format!("dumping {name}, compression {compression}"));
+            let database = std::sync::Arc::new(database);
+            let looked = database.clone();
+            let mut chain = task::spawn_blocking(move || {
+                chain(&looked, track, since.as_deref()).map_err(Kept::from)
+            })
+            .await?
+            .map_err(Kept::into_error)?;
+            match &chain.files {
+                Some(files) => progress.log(
+                    "info",
+                    format!(
+                        "taking {} log file(s) of {name}, compression {compression}",
+                        files.len()
+                    ),
+                ),
+                None => progress.log("info", format!("dumping {name}, compression {compression}")),
+            }
             let method = compression.clone();
+            let files = chain.files.take();
+            let tracking = chain.server.is_some();
 
             let mut sink = store.sink(&object_key).await?;
             let handle = Handle::current();
             let shared = progress.clone();
             // The pipeline blocks, so it gets its own thread and the reports keep flowing.
             let (sink, result) = task::spawn_blocking(move || {
-                let result = engines::dump(&database, &name)
+                let tool = match &files {
+                    Some(files) => engines::dump_increment(&database, files),
+                    None => engines::dump(&database, &name, tracking),
+                };
+                let result = tool
                     .and_then(|dump| {
                         pipeline::backup(
                             dump,
@@ -146,14 +279,42 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
                 (sink, result)
             })
             .await?;
-            match result {
+            let finished = result.and_then(|(sha256, head)| {
+                // The dump itself says where in the log it was taken.
+                if let Some(server) = chain.server.take() {
+                    let (file, offset) = binlog::dump_position(&head)
+                        .ok_or("the dump does not say where in the log it was taken")?;
+                    chain.to = Some(
+                        Position {
+                            server,
+                            file,
+                            offset,
+                        }
+                        .to_string(),
+                    );
+                }
+                Ok(sha256)
+            });
+            match finished {
                 Ok(sha256) => {
                     sink.commit().await?;
                     progress.log("ok", format!("stored {object_key}"));
+                    let positions = chain
+                        .to
+                        .as_deref()
+                        .map(|to| (chain.from.as_deref().unwrap_or_default(), to));
                     Ok(Output {
-                        manifest: Some(manifest::sign(state, &object_key, &sha256, &method)?),
+                        manifest: Some(manifest::sign(
+                            state,
+                            &object_key,
+                            &sha256,
+                            &method,
+                            positions,
+                        )?),
                         sha256: Some(sha256),
                         result: None,
+                        position_from: chain.from,
+                        position_to: chain.to,
                     })
                 }
                 Err(error) => {
@@ -178,43 +339,83 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
             name,
             source,
             ssh,
+            position,
+            increments,
+            until,
         } => {
-            // Checked before anything is downloaded or touched.
-            match &manifest {
-                Some(tag) => {
-                    manifest::verify(state, &object_key, &sha256, &compression, tag)?;
-                    progress.log("ok", "backup signature verified");
+            // Every signature first, and that each increment continues the one before.
+            trusted(
+                state,
+                &progress,
+                &object_key,
+                &sha256,
+                &compression,
+                position.as_deref().map(|to| ("", to)),
+                manifest.as_deref(),
+            )?;
+            let mut reached = position;
+            for link in &increments {
+                trusted(
+                    state,
+                    &progress,
+                    &link.object_key,
+                    &link.sha256,
+                    &link.compression,
+                    Some((&link.from, &link.to)),
+                    link.manifest.as_deref(),
+                )?;
+                if reached.as_deref() != Some(link.from.as_str()) {
+                    return Err("the chain has a gap: not restoring".into());
                 }
-                None if unsigned_allowed() => {
-                    progress.log("warn", "restoring a backup without a signature");
-                }
-                None => {
-                    return Err("this backup has no signature: set DBM_ALLOW_UNSIGNED_RESTORE=true on the agent to restore it".into());
-                }
+                reached = Some(link.to.clone());
             }
             let identity = String::from_utf8(open(state, &identity, "backup-key")?)?;
             let (store, _) = store(state, &destination).await?;
 
-            progress.log("info", format!("downloading {object_key}"));
-            let temporary = tempfile::NamedTempFile::new()?;
-            let mut file = tokio::fs::File::from_std(temporary.reopen()?);
-            if store.download(&object_key, &mut file, &progress).await? != sha256 {
-                return Err(
-                    "checksum mismatch: the stored file is not the one that was backed up".into(),
-                );
+            let temporary = fetch(&store, &object_key, &sha256, &progress).await?;
+            let mut replays = Vec::with_capacity(increments.len());
+            for link in increments {
+                let key = String::from_utf8(open(state, &link.identity, "backup-key")?)?;
+                let file = fetch(&store, &link.object_key, &link.sha256, &progress).await?;
+                replays.push((link, key, file));
             }
-            progress.log("ok", "checksum verified");
 
             let (database, _tunnel) = database(state, &sealed, ssh.as_ref(), &progress).await?;
             let file = temporary.reopen()?;
             let shared = progress.clone();
             blocking(move || {
+                if !replays.is_empty() {
+                    engines::require_empty(&database, &name)
+                        // A database that does not exist yet is as empty as it gets.
+                        .map_err(text)?;
+                }
                 let (tool, created) = engines::restore(&database, &name, &source).map_err(text)?;
                 if created {
                     shared.log("info", format!("created {name}"));
                 }
                 shared.log("info", format!("restoring into {name}"));
-                pipeline::restore(tool, &compression, &identity, file, &shared).map_err(text)
+                pipeline::restore(tool, &compression, &identity, file, &shared).map_err(text)?;
+                let until = until.unwrap_or_default();
+                let count = replays.len();
+                for (at, (link, key, file)) in replays.into_iter().enumerate() {
+                    shared.log("info", format!("replaying increment {} of {count}", at + 1));
+                    let tool = engines::restore_increment(
+                        &database, &name, &source, &link.from, &link.to, &until,
+                    )
+                    .map_err(text)?;
+                    pipeline::restore(
+                        tool,
+                        &link.compression,
+                        &key,
+                        file.reopen().map_err(|e| e.to_string())?,
+                        &shared,
+                    )
+                    .map_err(text)?;
+                }
+                if !until.is_empty() && count > 0 {
+                    shared.log("info", format!("replayed up to {until} UTC"));
+                }
+                Ok(())
             })
             .await?;
             progress.log("ok", "restore completed");

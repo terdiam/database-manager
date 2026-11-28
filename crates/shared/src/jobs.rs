@@ -50,6 +50,11 @@ pub fn dump_extension(engine: &str) -> &'static str {
     }
 }
 
+/// Engines whose backups can be followed by incremental ones.
+pub fn supports_incremental(engine: &str) -> bool {
+    matches!(engine, "mysql" | "mariadb")
+}
+
 /// What a job may name: a database, for SQLite a file name without a path, for Redis the
 /// whole instance, for the search engines an index or all of them.
 pub fn valid_target(engine: &str, name: &str) -> bool {
@@ -159,6 +164,19 @@ pub struct Sealed {
     pub data: String,
 }
 
+/// One incremental file of a chain.
+#[derive(Serialize, Deserialize)]
+pub struct Increment {
+    pub object_key: String,
+    pub sha256: String,
+    pub manifest: Option<String>,
+    pub compression: String,
+    /// age identity, sealed like the full backup's.
+    pub identity: Sealed,
+    pub from: String,
+    pub to: String,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Task {
@@ -173,6 +191,12 @@ pub enum Task {
         object_key: String,
         #[serde(default)]
         ssh: Option<Sealed>,
+        /// A full backup that increments will follow: record where it ends.
+        #[serde(default)]
+        track: bool,
+        /// An incremental backup: the position its parent ended at.
+        #[serde(default)]
+        since: Option<String>,
     },
     Restore {
         database: Sealed,
@@ -190,6 +214,15 @@ pub enum Task {
         source: String,
         #[serde(default)]
         ssh: Option<Sealed>,
+        /// Where the full backup ends, when increments follow it.
+        #[serde(default)]
+        position: Option<String>,
+        /// Applied after the full backup, oldest first.
+        #[serde(default)]
+        increments: Vec<Increment>,
+        /// Stop replaying here (`YYYY-MM-DD HH:MM:SS`, UTC).
+        #[serde(default)]
+        until: Option<String>,
     },
     TestDatabase {
         database: Sealed,
@@ -261,6 +294,14 @@ pub struct Finish {
     /// The download link, for presign jobs.
     #[serde(default)]
     pub result: Option<String>,
+    /// Log positions of a backup in a chain.
+    #[serde(default)]
+    pub position_from: Option<String>,
+    #[serde(default)]
+    pub position_to: Option<String>,
+    /// An incremental backup could not continue its parent: a full one is needed.
+    #[serde(default)]
+    pub chain_broken: bool,
 }
 
 #[cfg(test)]

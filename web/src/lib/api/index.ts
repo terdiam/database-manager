@@ -34,10 +34,10 @@ export const tlsModes = (engine: Engine) =>
 export const loginOptional = (engine: Engine) => engine === 'mongodb' || engine === 'redis' || search(engine);
 
 export const engines: Record<Engine, { label: string; port: number; incremental: boolean }> = {
-	postgresql: { label: 'PostgreSQL', port: 5432, incremental: true },
+	postgresql: { label: 'PostgreSQL', port: 5432, incremental: false },
 	mysql: { label: 'MySQL', port: 3306, incremental: true },
 	mariadb: { label: 'MariaDB', port: 3306, incremental: true },
-	mongodb: { label: 'MongoDB', port: 27017, incremental: true },
+	mongodb: { label: 'MongoDB', port: 27017, incremental: false },
 	sqlite: { label: 'SQLite', port: 0, incremental: false },
 	redis: { label: 'Redis', port: 6379, incremental: false },
 	opensearch: { label: 'OpenSearch', port: 9200, incremental: false },

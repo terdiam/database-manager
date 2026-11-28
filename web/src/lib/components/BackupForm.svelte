@@ -4,7 +4,7 @@
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 	import { request, type Backup, type DbServer, type Destination } from '#lib/api/http.ts';
-	import { namePattern, targetField } from '#lib/api/index.ts';
+	import { engines, namePattern, targetField } from '#lib/api/index.ts';
 	import { kinds } from '#lib/storage.ts';
 	import FormField from './FormField.svelte';
 	import PageHeader from './PageHeader.svelte';
@@ -39,13 +39,31 @@
 	let retention = $state(initial ? retentionOf(initial) : newRetention());
 	const server = $derived(servers.find((s) => s.id === form.server_id));
 	// The agent that dumps is the one that uploads.
+	// An incremental entry follows a full one and takes everything but its name and schedule.
+	let kind = $state(initial?.base_id ? 'incremental' : 'full');
+	let baseId = $state(initial?.base_id ?? '');
+	let backups = $state<Backup[]>([]);
+	const engineOf = (b: Backup) => servers.find((s) => s.id === b.server_id)?.engine;
+	const bases = $derived(
+		backups.filter((b) => {
+			const engine = engineOf(b);
+			return !b.base_id && b.retention_unit !== 'gfs' && !!engine && engines[engine].incremental;
+		})
+	);
+	const base = $derived(bases.find((b) => b.id === baseId));
+	const baseEngine = $derived(base && engineOf(base));
+
+	$effect(() => {
+		if (kind === 'incremental' && bases.length && !base) baseId = bases[0].id;
+	});
+
 	const usable = $derived(destinations.filter((d) => d.agent_id === server?.agent_id));
 	const target = $derived(targetField(server?.engine));
 	const maxLevel = $derived(form.compression === 'zstd' ? 19 : 9);
 
 	async function load() {
 		try {
-			[servers, destinations] = await Promise.all([request<DbServer[]>('GET', '/database-servers'), request<Destination[]>('GET', '/destinations')]);
+			[servers, destinations, backups] = await Promise.all([request<DbServer[]>('GET', '/database-servers'), request<Destination[]>('GET', '/destinations'), request<Backup[]>('GET', '/backups')]);
 			if (!servers.some((s) => s.id === form.server_id)) form.server_id = servers[0]?.id ?? '';
 			loadError = '';
 		} catch (e) {
@@ -54,7 +72,7 @@
 	}
 	onMount(() => {
 		load();
-		return live(['database_servers', 'destinations'], load);
+		return live(['database_servers', 'destinations', 'backup_configs'], load);
 	});
 
 	// Redis has no database names: the whole instance is the only choice.
@@ -70,7 +88,11 @@
 	async function save(event: SubmitEvent) {
 		event.preventDefault();
 		try {
-			const body = { ...form, level: Math.min(form.level, maxLevel), ...toPlan(schedule, timezone, retention) };
+			const plan = toPlan(schedule, timezone, retention);
+			const body =
+				kind === 'incremental'
+					? { name: form.name, base_id: baseId, schedule: plan.schedule, timezone: plan.timezone }
+					: { ...form, level: Math.min(form.level, maxLevel), ...plan };
 			if (initial) await request('PUT', `/backups/${initial.id}`, body);
 			else await request('POST', '/backups', body);
 			toast(t(initial ? 'toast.updated' : 'toast.created', { name: form.name }));
@@ -86,6 +108,20 @@
 
 <form class="card" onsubmit={save}>
 	<FormField label={t('col.name')}>{#snippet children(a)}<input {...a} class="input" maxlength="64" required bind:value={form.name} />{/snippet}</FormField>
+	<!-- The kind of an entry cannot change later. -->
+	{#if !initial}
+		<FormField label={t('backups.type')} help={t(`backups.type.${kind === 'full' ? 'full' : 'incremental'}`)}>{#snippet children(a)}<Select {...a} bind:value={kind} options={[{ value: 'full', label: t('type.full') }, { value: 'incremental', label: t('type.incremental') }]} />{/snippet}</FormField>
+	{/if}
+	{#if kind === 'incremental'}
+		{#if bases.length}
+			<FormField label={t('backups.base')} help={t('backups.baseHelp')}>{#snippet children(a)}<Select {...a} required bind:value={baseId} options={bases.map((b) => ({ value: b.id, label: b.name, brand: engineOf(b), description: `${b.server} / ${b.database_name}` }))} />{/snippet}</FormField>
+			<p class="mb-3 text-sm text-dim">{t('backups.inherits')}</p>
+			{#if baseEngine === 'mysql' || baseEngine === 'mariadb'}<p class="mb-3 rounded-lg bg-muted p-3 text-sm">{t(`requirement.${baseEngine}`)}</p>{/if}
+		{:else}
+			<p class="mb-3 text-sm text-warn" role="alert">{t('backups.noBase')}</p>
+		{/if}
+		<SchedulePicker legend={t('col.schedule')} bind:value={schedule} bind:timezone />
+	{:else}
 	<div class="grid gap-x-3 sm:grid-cols-2">
 		<FormField label={t('nav.databases')}>{#snippet children(a)}<Select {...a} required bind:value={form.server_id} options={servers.map((s) => ({ value: s.id, label: s.name, brand: s.engine, description: `${s.engine === 'sqlite' ? `/${s.host}` : `${s.host}:${s.port}`} · ${s.agent}` }))} />{/snippet}</FormField>
 		<FormField label={t(target.label)} help={t(target.help)}>{#snippet children(a)}<input {...a} class="input min-h-11" maxlength="63" pattern={namePattern(server?.engine)} readonly={server?.engine === 'redis'} required bind:value={form.database_name} />{/snippet}</FormField>
@@ -102,8 +138,9 @@
 	<RetentionPicker bind:value={retention} />
 	{#if initial}<p class="mb-3 text-xs text-dim">{t('retention.fromNow')}</p>{/if}
 	<p class="mb-3 rounded-lg bg-muted p-3 text-sm">{t('backups.phaseNote')}</p>
+	{/if}
 	<div class="flex justify-end gap-2">
 		<a class="btn" href={resolve('backups')}>{t('action.cancel')}</a>
-		<button type="submit" class="btn btn-primary">{t('action.save')}</button>
+		<button type="submit" class="btn btn-primary" disabled={kind === 'incremental' && !base}>{t('action.save')}</button>
 	</div>
 </form>

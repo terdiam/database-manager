@@ -28,11 +28,12 @@ Done:
 - [x] SSH tunnels to databases
 - [x] SFTP, FTP/FTPS and Samba storage
 - [x] Redis, Elasticsearch and OpenSearch
+- [x] Incremental backups for MySQL and MariaDB, restore to a point in time
 
 Planned:
 
 - [ ] Google Drive storage
-- [ ] Incremental backups
+- [ ] Incremental backups for MongoDB and PostgreSQL
 
 ## Run
 
@@ -81,6 +82,16 @@ the others; functions are not included, and the target should not be older than 
 
 For Elasticsearch and OpenSearch use one index name, or `_all`. Restoring deletes and
 recreates the index. Data streams, templates and users are not included.
+
+## Incremental backups
+
+For MySQL and MariaDB add a full backup, then an incremental one that follows it. The server
+needs the binary log on in ROW format, and the user `RELOAD`, `REPLICATION SLAVE` and
+`REPLICATION CLIENT` (MariaDB: `BINLOG MONITOR`). If the log was purged, a new full backup
+is taken. A restore goes into a new or empty database.
+
+The incremental files hold the binary log of the whole server. Schema changes made across
+databases while using the backed up one are replayed too.
 
 ## Backups
 

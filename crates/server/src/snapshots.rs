@@ -45,8 +45,46 @@ pub async fn run_backup(
     Ok(Json(Queued { job_id }))
 }
 
-/// Queues one run of a backup entry; returns the job and the entry's name.
+/// The newest snapshot of the newest chain of a full entry, if that chain still matches what
+/// the entry backs up. An increment continues it.
+async fn chain_end(app: &AppState, base: Uuid) -> Result<Option<Uuid>, Error> {
+    Ok(sqlx::query_scalar(
+        "WITH head AS (
+             SELECT s.id FROM snapshots s
+             JOIN backup_configs c ON c.id = s.backup_config_id
+             JOIN database_servers d ON d.id = c.server_id
+             WHERE c.id = $1 AND s.chain_id = s.id AND s.database_name = c.database_name
+                 AND s.destination_id = c.destination_id AND s.server_name = d.name
+             ORDER BY s.created_at DESC, s.id DESC LIMIT 1
+         )
+         SELECT s.id FROM snapshots s JOIN head ON s.chain_id = head.id
+         WHERE s.position_to IS NOT NULL
+             -- Not while it, or the chain, is being removed.
+             AND NOT EXISTS (SELECT 1 FROM jobs j JOIN snapshots x ON x.id = j.snapshot_id
+                             WHERE j.kind = 'delete_snapshot' AND x.chain_id = head.id
+                                 AND j.status IN ('pending', 'running'))
+         ORDER BY s.created_at DESC, s.id DESC LIMIT 1",
+    )
+    .bind(base)
+    .fetch_optional(&app.db)
+    .await?)
+}
+
+/// Queues one run of a backup entry; returns the job and the entry's name. An incremental
+/// entry without a chain to continue runs its full backup instead.
 pub async fn queue_backup(app: &AppState, id: Uuid, by: &str) -> Result<(Uuid, String), Error> {
+    let base: Option<Uuid> = sqlx::query_scalar("SELECT base_id FROM backup_configs WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&app.db)
+        .await?
+        .ok_or(Error::NotFound)?;
+    let (id, parent) = match base {
+        None => (id, None),
+        Some(base) => match chain_end(app, base).await? {
+            Some(parent) => (id, Some(parent)),
+            None => (base, None),
+        },
+    };
     let (name, server_id, server, agent, database, destination_id, compression, level, engine): (
         String, Uuid, String, Uuid, String, Uuid, String, i32, String,
     ) = sqlx::query_as(
@@ -72,7 +110,11 @@ pub async fn queue_backup(app: &AppState, id: Uuid, by: &str) -> Result<(Uuid, S
     let object_key = format!(
         "{}/{database}/{stamp}-{unique}{}{}.age",
         slug(&server),
-        dump_extension(&engine),
+        if parent.is_some() {
+            ".binlog"
+        } else {
+            dump_extension(&engine)
+        },
         extension(&compression)
     );
     let job = NewJob {
@@ -84,6 +126,7 @@ pub async fn queue_backup(app: &AppState, id: Uuid, by: &str) -> Result<(Uuid, S
         compression: Some(compression),
         level: Some(level),
         key_id: Some(keys::current(app).await?),
+        parent_id: parent,
         // The server's name: it becomes the snapshot's source.
         ..NewJob::new("backup", agent, server, by)
     };
@@ -113,10 +156,17 @@ pub struct Snapshot {
     /// `None` when kept until rotated or removed by hand.
     #[serde(with = "time::serde::rfc3339::option")]
     expires_at: Option<OffsetDateTime>,
+    /// Set on increments: the snapshot this one continues.
+    parent_id: Option<Uuid>,
+    /// On increments: when the chain's full backup was made, the earliest time to restore to.
+    #[serde(with = "time::serde::rfc3339::option")]
+    chain_started_at: Option<OffsetDateTime>,
 }
 
 const SELECT: &str = "SELECT s.id, s.server_name, s.database_name, d.name AS destination, d.agent_id, s.object_key,
-    s.size, s.sha256, s.compression, s.engine, d.kind AS storage, s.created_at, s.expires_at FROM snapshots s JOIN destinations d ON d.id = s.destination_id";
+    s.size, s.sha256, s.compression, s.engine, d.kind AS storage, s.created_at, s.expires_at, s.parent_id,
+    (SELECT f.created_at FROM snapshots f WHERE f.id = s.chain_id AND s.parent_id IS NOT NULL) AS chain_started_at
+    FROM snapshots s JOIN destinations d ON d.id = s.destination_id";
 
 #[derive(Deserialize)]
 pub struct Filter {
@@ -183,6 +233,9 @@ pub async fn get(
 pub struct Restore {
     server_id: Uuid,
     database_name: String,
+    /// For an increment: replay only up to this moment.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    until: Option<OffsetDateTime>,
 }
 
 pub async fn restore(
@@ -218,12 +271,27 @@ pub async fn restore(
     if !valid_target(&engine, &body.database_name) {
         return Err(Error::Invalid("database_name"));
     }
+    if let Some(until) = body.until {
+        // Between the chain's full backup and the chosen increment.
+        let inside: Option<bool> = sqlx::query_scalar(
+            "SELECT $2 BETWEEN f.created_at AND s.created_at FROM snapshots s
+             JOIN snapshots f ON f.id = s.chain_id WHERE s.id = $1 AND s.parent_id IS NOT NULL",
+        )
+        .bind(id)
+        .bind(until)
+        .fetch_optional(&app.db)
+        .await?;
+        if inside != Some(true) {
+            return Err(Error::Invalid("until"));
+        }
+    }
     let job = NewJob {
         server_id: Some(body.server_id),
         destination_id: Some(destination_id),
         snapshot_id: Some(id),
         database_name: Some(body.database_name.clone()),
         object_key: Some(object_key.clone()),
+        restore_until: body.until,
         ..NewJob::new(
             "restore",
             agent,
@@ -247,6 +315,17 @@ pub async fn queue_delete(app: &AppState, id: Uuid, by: &str) -> Result<(Uuid, S
     .fetch_optional(&app.db)
     .await?
     .ok_or(Error::NotFound)?;
+    // Without it the increments after it could not be restored.
+    let followed: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM snapshots WHERE parent_id = $1)
+             OR EXISTS (SELECT 1 FROM jobs WHERE parent_id = $1 AND status IN ('pending', 'running'))",
+    )
+    .bind(id)
+    .fetch_one(&app.db)
+    .await?;
+    if followed {
+        return Err(Error::Conflict("has_increments"));
+    }
     let job = NewJob {
         destination_id: Some(destination_id),
         snapshot_id: Some(id),
