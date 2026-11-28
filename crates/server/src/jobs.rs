@@ -452,6 +452,18 @@ async fn task(app: &AppState, agent: Uuid, job: &Claimed) -> Result<Task, Error>
     })
 }
 
+/// What the job list shows when a claimed job cannot be put together. Internal details
+/// stay in the server log.
+fn not_prepared(error: &Error) -> &'static str {
+    match error {
+        Error::Conflict("record_removed") => "a record this job needs is gone",
+        Error::Conflict("agent_without_key") => {
+            "the agent has no encryption key: revoke it and link it again"
+        }
+        _ => "the server could not prepare this job, see the server log",
+    }
+}
+
 pub async fn claim(State(app): State<AppState>, headers: HeaderMap) -> Result<Json<Claim>, Error> {
     let agent = agents::authenticate(&app, &headers).await?;
     expire_stale(&app.db).await?;
@@ -481,12 +493,14 @@ pub async fn claim(State(app): State<AppState>, headers: HeaderMap) -> Result<Js
         })),
         Err(error) => {
             sqlx::query(
-                "UPDATE jobs SET status = 'failed', error = 'a record this job needs is gone', finished_at = now(), lease = NULL
+                "UPDATE jobs SET status = 'failed', error = $2, finished_at = now(), lease = NULL
                  WHERE id = $1",
             )
             .bind(claimed.id)
+            .bind(not_prepared(&error))
             .execute(&app.db)
             .await?;
+            tracing::warn!("job {} not prepared: {}", claimed.id, error.detail());
             Err(error)
         }
     }
@@ -638,4 +652,20 @@ pub async fn finish(
         tracing::warn!("could not start a new chain: {}", error.detail());
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_job_that_cannot_be_prepared_says_why_without_internal_details() {
+        assert_eq!(
+            not_prepared(&Error::Conflict("record_removed")),
+            "a record this job needs is gone"
+        );
+        assert!(not_prepared(&Error::Conflict("agent_without_key")).contains("no encryption key"));
+        let internal = not_prepared(&Error::Internal("password authentication failed".into()));
+        assert!(internal.contains("server log") && !internal.contains("password"));
+    }
 }
