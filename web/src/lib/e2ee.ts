@@ -5,6 +5,13 @@ export const CONTENT_TYPE = 'application/dbm-e2ee';
 /** A response that never ends: a 32 byte seed, then length-prefixed sealed chunks. */
 export const STREAM_CONTENT_TYPE = 'application/dbm-e2ee-stream';
 
+/** Sent by a side that can read gzip bodies; without it nothing is compressed for it. */
+export const GZIP_HEADER = 'x-dbm-gzip';
+/** Smaller bodies gain little, and passwords and tokens travel in small ones. */
+const GZIP_MIN = 1024;
+/** Set in the status or the authorization length, inside the ciphertext: the body is gzip. */
+const GZIPPED = 0x8000;
+
 const KEY_ID = 1;
 // KEM 0x0020 (X25519), KDF 0x0001 (HKDF-SHA256), AEAD 0x0002 (AES-256-GCM)
 const SUITE = [0x00, 0x20, 0x00, 0x01, 0x00, 0x02];
@@ -33,6 +40,9 @@ export function decode(value: string): Bytes {
 	const binary = atob(value.replaceAll('-', '+').replaceAll('_', '/'));
 	return Uint8Array.from(binary, (c) => c.charCodeAt(0));
 }
+
+const through = async (data: Bytes, transform: CompressionStream | DecompressionStream): Promise<Bytes> =>
+	new Uint8Array(await new Response(new Blob([data]).stream().pipeThrough(transform)).arrayBuffer());
 
 /** Length prefixes keep field boundaries unambiguous. */
 function aad(...fields: string[]): Bytes {
@@ -73,13 +83,20 @@ export async function sealRequest(
 	method: string,
 	pathAndQuery: string,
 	body: string,
-	timestamp = Math.floor(Date.now() / 1000)
+	timestamp = Math.floor(Date.now() / 1000),
+	gzip = false
 ): Promise<Sealed> {
 	const context = await sender(decode(serverKey), concat(text('dbm/v1 request\0'), [KEY_ID], SUITE));
 	const enc = new Uint8Array(context.enc) as Bytes;
+	let content = text(body);
+	let flag = 0;
+	if (gzip && content.length >= GZIP_MIN) {
+		const small = await through(content, new CompressionStream('gzip'));
+		if (small.length < content.length) [content, flag] = [small, GZIPPED];
+	}
 	// Plaintext: authorization length (0, the browser uses cookies), then the body.
 	const sealed = new Uint8Array(
-		await context.seal(concat([0, 0], text(body)), aad(method, pathAndQuery, String(timestamp)))
+		await context.seal(concat([flag >> 8, 0], content), aad(method, pathAndQuery, String(timestamp)))
 	) as Bytes;
 	const secret = await context.export(text('dbm/v1 response'), 32);
 	const inHeader = method === 'GET';
@@ -123,10 +140,10 @@ export async function sealRequest(
 		async open(reply) {
 			const { key, iv } = await cipher(new Uint8Array(reply.slice(0, 32)), 'key', 'nonce');
 			const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, new Uint8Array(reply, 32));
-			return {
-				status: new DataView(plain).getUint16(0),
-				body: new TextDecoder().decode(new Uint8Array(plain, 2))
-			};
+			const field = new DataView(plain).getUint16(0);
+			let content: Bytes = new Uint8Array(plain, 2);
+			if (field & GZIPPED) content = await through(content, new DecompressionStream('gzip'));
+			return { status: field & ~GZIPPED, body: new TextDecoder().decode(content) };
 		}
 	};
 }

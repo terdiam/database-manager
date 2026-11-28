@@ -1,6 +1,9 @@
 use axum::{
     Json,
-    extract::{Query, State},
+    extract::{Query, Request, State},
+    http::header,
+    middleware::Next,
+    response::Response,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{PgExecutor, Postgres, QueryBuilder};
@@ -13,6 +16,23 @@ use crate::{
 };
 
 const PAGE: i64 = 100;
+/// Longest user agent kept; the caller chooses it.
+const MAX_AGENT: usize = 300;
+
+tokio::task_local! {
+    static USER_AGENT: String;
+}
+
+/// Keeps what the caller says it is at hand for `record`, whichever handler calls it.
+pub async fn remember_client(request: Request, next: Next) -> Response {
+    let agent = request
+        .headers()
+        .get(header::USER_AGENT)
+        .map(|v| String::from_utf8_lossy(v.as_bytes()))
+        .map(|v| v.chars().take(MAX_AGENT).collect())
+        .unwrap_or_default();
+    USER_AGENT.scope(agent, next.run(request)).await
+}
 
 /// Never pass secrets in `target`.
 pub async fn record(
@@ -23,13 +43,17 @@ pub async fn record(
     ip: &str,
     ok: bool,
 ) -> Result<(), Error> {
-    sqlx::query("INSERT INTO audit_logs (user_id, user_name, action, target, ip, ok) VALUES ($1, $2, $3, $4, $5, $6)")
+    // Empty for the console and the scheduler, which no request starts.
+    let agent = USER_AGENT.try_with(Clone::clone).unwrap_or_default();
+    sqlx::query("INSERT INTO audit_logs (user_id, user_name, action, target, ip, ok, user_email, user_agent) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)")
         .bind(user.map(|u| u.id))
         .bind(user.map_or("-", |u| u.name.as_str()))
         .bind(action)
         .bind(target)
         .bind(ip)
         .bind(ok)
+        .bind(user.map_or("", |u| u.email.as_str()))
+        .bind(agent)
         .execute(db)
         .await?;
     Ok(())
@@ -41,6 +65,8 @@ pub struct Entry {
     #[serde(with = "time::serde::rfc3339")]
     created_at: OffsetDateTime,
     user_name: String,
+    user_email: String,
+    user_agent: String,
     action: String,
     target: String,
     ip: String,
@@ -74,7 +100,7 @@ pub async fn list(
 ) -> Result<Json<Page>, Error> {
     me.require_admin()?;
     let mut sql = QueryBuilder::<Postgres>::new(
-        "SELECT id, created_at, user_name, action, target, ip, ok FROM audit_logs WHERE true",
+        "SELECT id, created_at, user_name, user_email, user_agent, action, target, ip, ok FROM audit_logs WHERE true",
     );
     if let Some(from) = filter.from {
         sql.push(" AND created_at >= ").push_bind(from);
@@ -92,6 +118,10 @@ pub async fn list(
         // strpos avoids LIKE wildcard escaping.
         let q = q.to_lowercase();
         sql.push(" AND (strpos(lower(target), ")
+            .push_bind(q.clone())
+            .push(") > 0 OR strpos(lower(user_email), ")
+            .push_bind(q.clone())
+            .push(") > 0 OR strpos(lower(user_agent), ")
             .push_bind(q.clone())
             .push(") > 0 OR strpos(ip, ")
             .push_bind(q)

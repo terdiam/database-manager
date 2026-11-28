@@ -2,8 +2,11 @@
 //! request/response encryption (response keys derived as in RFC 9458) and
 //! sealing secrets to an agent's public key. The browser mirrors this in `web/src/lib/e2ee.ts`.
 
+use std::{borrow::Cow, io::Read};
+
 use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use flate2::{Compression, read::GzDecoder, read::GzEncoder};
 use hkdf::Hkdf;
 use hpke::{
     Deserializable, Kem, OpModeR, OpModeS, Serializable, aead::AesGcm256, kdf::HkdfSha256,
@@ -18,6 +21,42 @@ pub const STREAM_CONTENT_TYPE: &str = "application/dbm-e2ee-stream";
 /// Accepted clock difference between client and server.
 pub const MAX_SKEW_SECS: i64 = 120;
 pub const KEY_ID: u8 = 1;
+/// Sent by a side that can read gzip bodies; without it nothing is compressed for it.
+pub const GZIP_HEADER: &str = "x-dbm-gzip";
+/// Smaller bodies gain little, and passwords and tokens travel in small ones.
+pub const GZIP_MIN: usize = 1024;
+/// Set in the status or the authorization length, inside the ciphertext: the body is gzip.
+const GZIPPED: u16 = 0x8000;
+/// Most a response may expand to.
+const MAX_INFLATED: usize = 64 * 1024 * 1024;
+
+/// Compresses before sealing, when asked to and when it helps.
+fn pack(body: &[u8], gzip: bool) -> (u16, Cow<'_, [u8]>) {
+    if gzip && body.len() >= GZIP_MIN {
+        let mut small = Vec::new();
+        let read = GzEncoder::new(body, Compression::fast()).read_to_end(&mut small);
+        if read.is_ok() && small.len() < body.len() {
+            return (GZIPPED, Cow::Owned(small));
+        }
+    }
+    (0, Cow::Borrowed(body))
+}
+
+/// `limit` stops a small request from expanding into all the memory.
+fn unpack(body: &[u8], gzipped: bool, limit: usize) -> Result<Vec<u8>, CryptoError> {
+    if !gzipped {
+        return Ok(body.to_vec());
+    }
+    let mut plain = Vec::new();
+    GzDecoder::new(body)
+        .take(limit as u64 + 1)
+        .read_to_end(&mut plain)
+        .map_err(|_| CryptoError)?;
+    if plain.len() > limit {
+        return Err(CryptoError);
+    }
+    Ok(plain)
+}
 
 const RESPONSE_LABEL: &[u8] = b"dbm/v1 response";
 /// KEM, KDF and AEAD identifiers from RFC 9180.
@@ -119,15 +158,20 @@ pub fn seal_request(
     aad: &[u8],
     authorization: &str,
     body: &[u8],
+    gzip: bool,
 ) -> Result<SealedRequest, CryptoError> {
     let public = <Dh as Kem>::PublicKey::from_bytes(server_public).map_err(|_| CryptoError)?;
     let (enc, mut sender) =
         setup_sender::<AesGcm256, HkdfSha256, Dh>(&OpModeS::Base, &public, &request_info())
             .map_err(|_| CryptoError)?;
     let length = u16::try_from(authorization.len()).map_err(|_| CryptoError)?;
-    let mut plain = length.to_be_bytes().to_vec();
+    if length >= GZIPPED {
+        return Err(CryptoError);
+    }
+    let (flag, body) = pack(body, gzip);
+    let mut plain = (flag | length).to_be_bytes().to_vec();
     plain.extend_from_slice(authorization.as_bytes());
-    plain.extend_from_slice(body);
+    plain.extend_from_slice(&body);
     let ciphertext = sender.seal(&plain, aad).map_err(|_| CryptoError)?;
     let mut secret = [0; 32];
     sender
@@ -147,6 +191,7 @@ pub fn open_request(
     enc: &[u8],
     aad: &[u8],
     ciphertext: &[u8],
+    limit: usize,
 ) -> Result<OpenedRequest, CryptoError> {
     let private = <Dh as Kem>::PrivateKey::from_bytes(server_private).map_err(|_| CryptoError)?;
     let encapped = <Dh as Kem>::EncappedKey::from_bytes(enc).map_err(|_| CryptoError)?;
@@ -164,15 +209,17 @@ pub fn open_request(
         .map_err(|_| CryptoError)?;
 
     let (length, rest) = plain.split_at_checked(2).ok_or(CryptoError)?;
-    let length = usize::from(u16::from_be_bytes([length[0], length[1]]));
-    let (authorization, body) = rest.split_at_checked(length).ok_or(CryptoError)?;
+    let field = u16::from_be_bytes([length[0], length[1]]);
+    let (authorization, body) = rest
+        .split_at_checked(usize::from(field & !GZIPPED))
+        .ok_or(CryptoError)?;
     Ok(OpenedRequest {
         exchange: Exchange {
             enc: enc.to_vec(),
             secret,
         },
         authorization: String::from_utf8(authorization.to_vec()).map_err(|_| CryptoError)?,
-        body: body.to_vec(),
+        body: unpack(body, field & GZIPPED != 0, limit)?,
     })
 }
 
@@ -200,12 +247,14 @@ pub fn seal_response(
     exchange: &Exchange,
     status: u16,
     body: &[u8],
+    gzip: bool,
 ) -> Result<Vec<u8>, CryptoError> {
     let mut seed = [0; 32];
     getrandom::fill(&mut seed).map_err(|_| CryptoError)?;
     let (cipher, nonce) = response_cipher(exchange, &seed);
-    let mut plain = status.to_be_bytes().to_vec();
-    plain.extend_from_slice(body);
+    let (flag, body) = pack(body, gzip);
+    let mut plain = (flag | status).to_be_bytes().to_vec();
+    plain.extend_from_slice(&body);
     let sealed = cipher
         .encrypt(&nonce.into(), plain.as_slice())
         .map_err(|_| CryptoError)?;
@@ -219,7 +268,9 @@ pub fn open_response(exchange: &Exchange, data: &[u8]) -> Result<(u16, Vec<u8>),
         .decrypt(&nonce.into(), sealed)
         .map_err(|_| CryptoError)?;
     let (status, body) = plain.split_at_checked(2).ok_or(CryptoError)?;
-    Ok((u16::from_be_bytes([status[0], status[1]]), body.to_vec()))
+    let field = u16::from_be_bytes([status[0], status[1]]);
+    let body = unpack(body, field & GZIPPED != 0, MAX_INFLATED)?;
+    Ok((field & !GZIPPED, body))
 }
 
 /// Seals or opens a long response chunk by chunk. The chunk number is part of the nonce,
@@ -335,9 +386,9 @@ mod tests {
     fn request_and_response_round_trip_and_reject_tampering() {
         let server = Keypair::generate();
         let aad = request_aad("POST", "/api/users", 100);
-        let sealed = seal_request(&server.public, &aad, "Bearer x", b"{\"a\":1}").unwrap();
+        let sealed = seal_request(&server.public, &aad, "Bearer x", b"{\"a\":1}", true).unwrap();
         let enc = sealed.exchange.enc.clone();
-        let opened = open_request(&server.private, &enc, &aad, &sealed.ciphertext).unwrap();
+        let opened = open_request(&server.private, &enc, &aad, &sealed.ciphertext, 64).unwrap();
         assert_eq!(opened.authorization, "Bearer x");
         assert_eq!(opened.body, b"{\"a\":1}");
 
@@ -346,16 +397,23 @@ mod tests {
             request_aad("POST", "/api/agents", 100),
             request_aad("POST", "/api/users", 101),
         ] {
-            assert!(open_request(&server.private, &enc, &other, &sealed.ciphertext).is_err());
+            assert!(open_request(&server.private, &enc, &other, &sealed.ciphertext, 64).is_err());
         }
         let mut flipped = sealed.ciphertext.clone();
         flipped[0] ^= 1;
-        assert!(open_request(&server.private, &enc, &aad, &flipped).is_err());
+        assert!(open_request(&server.private, &enc, &aad, &flipped, 64).is_err());
         assert!(
-            open_request(&Keypair::generate().private, &enc, &aad, &sealed.ciphertext).is_err()
+            open_request(
+                &Keypair::generate().private,
+                &enc,
+                &aad,
+                &sealed.ciphertext,
+                64
+            )
+            .is_err()
         );
 
-        let reply = seal_response(&opened.exchange, 201, b"done").unwrap();
+        let reply = seal_response(&opened.exchange, 201, b"done", true).unwrap();
         assert_eq!(
             open_response(&sealed.exchange, &reply).unwrap(),
             (201, b"done".to_vec())
@@ -366,10 +424,36 @@ mod tests {
     }
 
     #[test]
+    fn large_bodies_are_compressed_both_ways_and_cannot_expand_past_the_limit() {
+        let server = Keypair::generate();
+        let aad = request_aad("POST", "/api/agent/jobs/report", 100);
+        let body = b"line of a job log\n".repeat(500);
+        let sealed = seal_request(&server.public, &aad, "Bearer x", &body, true).unwrap();
+        assert!(sealed.ciphertext.len() < body.len() / 4);
+        let enc = &sealed.exchange.enc;
+        let open = |limit| open_request(&server.private, enc, &aad, &sealed.ciphertext, limit);
+        let opened = open(body.len()).unwrap();
+        assert_eq!(opened.authorization, "Bearer x");
+        assert_eq!(opened.body, body);
+        assert!(open(body.len() - 1).is_err());
+
+        let reply = seal_response(&opened.exchange, 200, &body, true).unwrap();
+        assert!(reply.len() < body.len() / 4);
+        assert_eq!(
+            open_response(&sealed.exchange, &reply).unwrap(),
+            (200, body.clone())
+        );
+        // Not asked for, or too small to be worth it: left as it is.
+        let plain = seal_response(&opened.exchange, 200, &body, false).unwrap();
+        assert!(plain.len() > body.len());
+        assert_eq!(pack(&body[..GZIP_MIN - 1], true).0, 0);
+    }
+
+    #[test]
     fn stream_chunks_open_only_in_order() {
         let server = Keypair::generate();
         let aad = request_aad("GET", "/api/events", 100);
-        let sealed = seal_request(&server.public, &aad, "", b"").unwrap();
+        let sealed = seal_request(&server.public, &aad, "", b"", false).unwrap();
         let mut writer = StreamCipher::new(&sealed.exchange, b"seed");
         let chunks = [
             writer.seal(b"jobs\n").unwrap(),

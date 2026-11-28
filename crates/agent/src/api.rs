@@ -1,6 +1,9 @@
 //! Calls to the server, encrypted when a server key is pinned.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use dbm_shared::{E2EE_PATH, E2eeInfo, e2ee};
 use reqwest::{Client, StatusCode, Url, header};
@@ -23,6 +26,8 @@ impl Reply {
 pub struct Api {
     client: Client,
     server: Url,
+    /// Whether the last encrypted reply said the server reads compressed requests.
+    server_gzip: AtomicBool,
 }
 
 impl Api {
@@ -32,7 +37,11 @@ impl Api {
             .timeout(Duration::from_secs(15))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        Ok(Self { client, server })
+        Ok(Self {
+            client,
+            server,
+            server_gzip: AtomicBool::new(false),
+        })
     }
 
     pub async fn e2ee_info(&self) -> Result<E2eeInfo> {
@@ -78,12 +87,14 @@ impl Api {
 
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
         let aad = e2ee::request_aad("POST", path, timestamp);
-        let sealed = e2ee::seal_request(server_key, &aad, &authorization, &body)?;
+        let gzip = self.server_gzip.load(Ordering::Relaxed);
+        let sealed = e2ee::seal_request(server_key, &aad, &authorization, &body, gzip)?;
         let value = format!("1.{timestamp}.{}", e2ee::encode(&sealed.exchange.enc));
         let response = self
             .client
             .post(url)
             .header(e2ee::HEADER, value)
+            .header(e2ee::GZIP_HEADER, "1")
             .header(header::CONTENT_TYPE, e2ee::CONTENT_TYPE)
             .body(sealed.ciphertext)
             .send()
@@ -93,6 +104,8 @@ impl Api {
             .get(header::CONTENT_TYPE)
             .is_some_and(|v| v.as_bytes() == e2ee::CONTENT_TYPE.as_bytes());
         let status = response.status();
+        let gzip = response.headers().contains_key(e2ee::GZIP_HEADER);
+        self.server_gzip.store(gzip, Ordering::Relaxed);
         let bytes = response.bytes().await?;
         if encrypted {
             let (status, body) = e2ee::open_response(&sealed.exchange, &bytes)?;

@@ -1,6 +1,6 @@
 import { goto } from '$app/navigation';
 import { resolve } from '$app/paths';
-import { CONTENT_TYPE, HEADER, STREAM_CONTENT_TYPE, sealRequest, type Sealed } from '../e2ee.ts';
+import { CONTENT_TYPE, GZIP_HEADER, HEADER, STREAM_CONTENT_TYPE, sealRequest, type Sealed } from '../e2ee.ts';
 import type { Plan } from '../schedule.ts';
 import type { Engine } from './index.ts';
 
@@ -51,18 +51,23 @@ async function plain(method: string, url: string, body: string): Promise<Raw> {
 	return { status: response.status, data: parse(await response.text()) };
 }
 
+/** Whether the last encrypted reply said the server reads compressed requests. */
+let serverGzip = false;
+
 async function encrypted(method: string, url: string, body: string, key: string): Promise<Raw> {
 	// WebCrypto only exists on https and localhost.
 	if (!window.isSecureContext) throw new ApiError('insecure_context');
-	const sealed = await sealRequest(key, method, url, body);
+	const sealed = await sealRequest(key, method, url, body, undefined, serverGzip);
 	const response = await send(method, url, {
 		headers: {
 			'x-dbm-csrf': '1',
 			[HEADER]: sealed.header,
+			[GZIP_HEADER]: '1',
 			...(sealed.body ? { 'content-type': CONTENT_TYPE } : {})
 		},
 		body: sealed.body
 	});
+	serverGzip = response.headers.has(GZIP_HEADER);
 	return reply(sealed, response);
 }
 
@@ -135,7 +140,7 @@ export type Role = 'admin' | 'operator' | 'viewer';
 export type User = { id: string; name: string; email: string; role: Role };
 export type AuthState = { setup_required: boolean; user: User | null; turnstile_site_key: string | null };
 export type Agent = { id: string; name: string; version: string; last_seen_at: string; online: boolean; fingerprint: string | null; key: string | null };
-export type AuditEntry = { id: number; created_at: string; user_name: string; action: string; target: string; ip: string; ok: boolean };
+export type AuditEntry = { id: number; created_at: string; user_name: string; user_email: string; user_agent: string; action: string; target: string; ip: string; ok: boolean };
 export type AuditPage = { items: AuditEntry[]; next: number | null };
 
 export type DbServer = { id: string; name: string; engine: Engine; agent_id: string; agent: string; host: string; port: number; username: string; ssl_mode: string | null; ssh_config_id: string | null; ssh: string | null };

@@ -10,7 +10,7 @@ use axum::{
     Json,
     body::{Body, Bytes, to_bytes},
     extract::{OriginalUri, Request, State},
-    http::{HeaderValue, header, response::Parts},
+    http::{HeaderValue, Method, header, response::Parts},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -188,7 +188,8 @@ pub async fn layer(State(app): State<AppState>, request: Request, next: Next) ->
         None => body.to_vec(),
         Some(_) => return Error::Invalid("e2ee_invalid").into_response(),
     };
-    let Ok(opened) = e2ee::open_request(&app.transport.key.private, &enc, &aad, &ciphertext) else {
+    let key = &app.transport.key.private;
+    let Ok(opened) = e2ee::open_request(key, &enc, &aad, &ciphertext, MAX_BODY) else {
         return Error::Invalid("e2ee_invalid").into_response();
     };
     let address = match Ip::from_request_parts(&mut parts, &app).await {
@@ -216,6 +217,10 @@ pub async fn layer(State(app): State<AppState>, request: Request, next: Next) ->
         parts.headers.insert(header::AUTHORIZATION, value);
     }
 
+    // Only what is read is compressed: no reply to a GET carries a password, token or key,
+    // so its length cannot give one away.
+    let gzip = parts.method == Method::GET && parts.headers.contains_key(e2ee::GZIP_HEADER);
+
     let response = next
         .run(Request::from_parts(parts, Body::from(opened.body)))
         .await;
@@ -226,12 +231,16 @@ pub async fn layer(State(app): State<AppState>, request: Request, next: Next) ->
     let Ok(plain) = to_bytes(body, usize::MAX).await else {
         return Error::Internal("response body".into()).into_response();
     };
-    let Ok(sealed) = e2ee::seal_response(&opened.exchange, head.status.as_u16(), &plain) else {
+    let status = head.status.as_u16();
+    let Ok(sealed) = e2ee::seal_response(&opened.exchange, status, &plain, gzip) else {
         return Error::Internal("response encryption".into()).into_response();
     };
     // The real status is inside; cookies stay on the outside for the browser to store.
     head.status = axum::http::StatusCode::OK;
     head.headers.remove(header::CONTENT_LENGTH);
+    // Tells the caller it may compress its next requests.
+    head.headers
+        .insert(e2ee::GZIP_HEADER, HeaderValue::from_static("1"));
     head.headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static(e2ee::CONTENT_TYPE),

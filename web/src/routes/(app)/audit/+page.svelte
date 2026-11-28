@@ -5,9 +5,10 @@
 	import DateFilter from '#lib/components/DateFilter.svelte';
 	import PageHeader from '#lib/components/PageHeader.svelte';
 	import Select from '#lib/components/Select.svelte';
+	import { device, network } from '#lib/client.ts';
 	import { bounds, emptyDate } from '#lib/daterange.ts';
 	import { errorText } from '#lib/errors.ts';
-	import { dateTime } from '#lib/format.ts';
+	import { exactTime } from '#lib/format.ts';
 	import { t, type Key } from '#lib/i18n/index.svelte.ts';
 	import { messages } from '#lib/i18n/messages.ts';
 	import { live } from '#lib/events.ts';
@@ -75,22 +76,36 @@
 	<DateFilter bind:value={date} />
 	<Select class="w-52" aria-label={t('audit.user')} bind:value={user} options={[{ value: '', label: t('audit.allUsers'), icon: 'users' as const }, ...users.map((u) => ({ value: u.id, label: u.name, description: u.email }))]} />
 	<Select class="w-56" aria-label={t('audit.action')} bind:value={action} options={[{ value: '', label: t('audit.allActions'), icon: 'list' as const }, ...actions.map((a) => ({ value: a, label: t(`audit.${a}`) }))]} />
-	<input class="input min-h-11 w-full sm:w-56" type="search" aria-label={t('audit.search')} placeholder={t('audit.search')} bind:value={query} />
+	<input class="input min-h-11 w-full sm:w-80" type="search" aria-label={t('audit.search')} placeholder={t('audit.search')} bind:value={query} />
 </search>
 
 <p class="mb-2 text-sm text-bad empty:hidden" role="alert">{error}</p>
 <p class="mb-2 text-xs text-dim" role="status">{t('audit.shown', { n: rows.length })}</p>
 
-<DataTable label={t('nav.audit')} columns={[t('audit.time'), t('audit.user'), t('audit.action'), t('col.target'), 'IP', t('audit.result')]} rows={rows.map((r) => ({ ...r, id: String(r.id) }))}>
+<DataTable label={t('nav.audit')} columns={[t('audit.time'), t('audit.user'), t('audit.action'), t('col.target'), t('audit.from'), t('audit.result')]} rows={rows.map((r) => ({ ...r, id: String(r.id) }))}>
 	{#snippet cell(log, i)}
-		{#if i === 0}<span class="whitespace-nowrap">{dateTime(log.created_at)}</span>
-		{:else if i === 1}{log.user_name}
+		{#if i === 0}<span class="whitespace-nowrap">{exactTime(log.created_at)}</span>
+		{:else if i === 1}
+			<div>
+				<span class="block">{log.user_name}</span>
+				{#if log.user_email}<span class="block text-xs break-all text-dim">{log.user_email}</span>{/if}
+			</div>
 		{:else if i === 2}{label(log.action)}
 		{:else if i === 3}{log.target}
-		{:else if i === 4}<code class="text-xs">{log.ip}</code>
+		{:else if i === 4}
+			{@const kind = network(log.ip)}
+			<div class="whitespace-nowrap">
+				{#if kind !== 'console' && kind !== 'system'}<code class="block text-xs">{log.ip}</code>{/if}
+				<span class="block text-xs text-dim">{t(`audit.net.${kind}`)}</span>
+				{#if log.user_agent}<span class="block text-xs text-dim" title={log.user_agent}>{device(log.user_agent)}</span>{/if}
+			</div>
 		{:else}<span class="inline-flex rounded-full bg-muted px-2 py-0.5 text-xs font-medium {log.ok ? 'text-ok' : 'text-bad'}">{log.ok ? '✓' : '✕'} {t(log.ok ? 'status.completed' : 'status.failed')}</span>{/if}
 	{/snippet}
 </DataTable>
+
+{#if rows.some((r) => network(r.ip) === 'private')}
+	<p class="mt-2 text-xs text-dim">{t('audit.privateNote')}</p>
+{/if}
 
 {#if next}
 	<button type="button" class="btn mt-3" onclick={() => load(params, next)}>{t('action.more')}</button>

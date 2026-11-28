@@ -180,7 +180,8 @@ pub fn app(state: AppState) -> Router {
         .route("/backup-keys/export", post(keys::export))
         .route("/events", get(events::stream))
         .layer(middleware::from_fn_with_state(state.clone(), e2ee::layer))
-        .layer(middleware::from_fn(csrf));
+        .layer(middleware::from_fn(csrf))
+        .layer(middleware::from_fn(audit::remember_client));
 
     // Agent API: bearer credential, no cookies.
     let agent = Router::new()
@@ -189,7 +190,8 @@ pub fn app(state: AppState) -> Router {
         .route("/agent/jobs/claim", post(jobs::claim))
         .route("/agent/jobs/report", post(jobs::report))
         .route("/agent/jobs/finish", post(jobs::finish))
-        .layer(middleware::from_fn_with_state(state.clone(), e2ee::layer));
+        .layer(middleware::from_fn_with_state(state.clone(), e2ee::layer))
+        .layer(middleware::from_fn(audit::remember_client));
 
     Router::new()
         .nest(

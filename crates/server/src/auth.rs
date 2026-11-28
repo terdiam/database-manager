@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -200,23 +200,31 @@ impl FromRequestParts<AppState> for Ip {
     type Rejection = Error;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Error> {
-        if state.config.trust_proxy {
-            // The last entry is the one our own proxy appended.
-            if let Some(ip) = parts
-                .headers
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.rsplit(',').next())
-            {
-                return Ok(Ip(ip.trim().to_owned()));
-            }
-        }
-        let peer = ConnectInfo::<SocketAddr>::from_request_parts(parts, state).await;
-        Ok(Ip(peer.map_or_else(
-            |_| "unknown".into(),
-            |c| c.0.ip().to_string(),
+        let peer = ConnectInfo::<SocketAddr>::from_request_parts(parts, state)
+            .await
+            .ok()
+            .map(|c| c.0.ip());
+        Ok(Ip(client_address(
+            &parts.headers,
+            peer,
+            state.config.trust_proxy,
         )))
     }
+}
+
+fn client_address(headers: &HeaderMap, peer: Option<IpAddr>, trust_proxy: bool) -> String {
+    // The last entry of the last header is the one our own proxy wrote; anything before
+    // it came from the caller. Something that is not an address is not believed.
+    let forwarded = trust_proxy
+        .then(|| headers.get_all("x-forwarded-for").iter().next_back())
+        .flatten()
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.rsplit(',').next())
+        .and_then(|v| v.trim().parse::<IpAddr>().ok());
+    // `to_canonical` writes an IPv4 caller on an IPv6 socket as IPv4.
+    forwarded
+        .or(peer)
+        .map_or_else(|| "unknown".into(), |ip| ip.to_canonical().to_string())
 }
 
 /// The signed-in user. Extracting it is what protects a route.
@@ -491,4 +499,23 @@ pub async fn confirm_password(
         return Err(Error::Invalid("wrong_password"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_address_our_proxy_wrote_is_believed() {
+        let peer = Some("::ffff:10.0.0.2".parse().unwrap());
+        let mut headers = HeaderMap::new();
+        assert_eq!(client_address(&headers, peer, true), "10.0.0.2");
+        assert_eq!(client_address(&headers, None, true), "unknown");
+        headers.append("x-forwarded-for", "6.6.6.6".parse().unwrap());
+        headers.append("x-forwarded-for", "7.7.7.7, 203.0.113.9".parse().unwrap());
+        assert_eq!(client_address(&headers, peer, true), "203.0.113.9");
+        assert_eq!(client_address(&headers, peer, false), "10.0.0.2");
+        headers.append("x-forwarded-for", "<script>".parse().unwrap());
+        assert_eq!(client_address(&headers, peer, true), "10.0.0.2");
+    }
 }

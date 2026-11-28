@@ -375,6 +375,29 @@ async fn agent_enrolls_once_heartbeats_and_can_be_revoked(db: PgPool) {
 }
 
 #[sqlx::test]
+async fn audit_lines_name_the_account_and_the_client(db: PgPool) {
+    let app = router(db);
+    let cookie = admin(&app).await;
+    let long = format!("TestBrowser/1.0 {}", "x".repeat(400));
+    let request = Request::post("/api/auth/login")
+        .header("x-dbm-csrf", "1")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::USER_AGENT, &long)
+        .body(Body::from(
+            json!({ "email": "nobody@example.com", "password": "wrong-password-1" }).to_string(),
+        ))
+        .unwrap();
+    send(&app, request).await;
+    let page = call(&app, "GET", "/api/audit", Some(&cookie), None).await;
+    let items = page.body["items"].as_array().unwrap();
+    assert_eq!(items[0]["user_agent"], long[..300]);
+    assert_eq!(items[0]["user_email"], "");
+    assert_eq!(items[0]["ip"], "10.0.0.1");
+    let setup = items.last().unwrap();
+    assert!(setup["user_email"].as_str().unwrap().contains('@'));
+}
+
+#[sqlx::test]
 async fn audit_log_cannot_be_changed(db: PgPool) {
     let app = router(db.clone());
     admin(&app).await;
@@ -483,7 +506,7 @@ async fn sealed(
     cookie: Option<&str>,
 ) -> (Reply, Option<Request<Body>>) {
     let aad = e2ee::request_aad(method, path, timestamp);
-    let sealed = e2ee::seal_request(&server.public, &aad, bearer, body).unwrap();
+    let sealed = e2ee::seal_request(&server.public, &aad, bearer, body, false).unwrap();
     let make = || {
         let mut header = format!("1.{timestamp}.{}", e2ee::encode(&sealed.exchange.enc));
         let mut request = Request::builder()
@@ -1199,7 +1222,7 @@ async fn events_are_encrypted_chunk_by_chunk(db: PgPool) {
 
     let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
     let aad = e2ee::request_aad("GET", "/api/events", timestamp);
-    let sealed = e2ee::seal_request(&key.public, &aad, "", b"").unwrap();
+    let sealed = e2ee::seal_request(&key.public, &aad, "", b"", false).unwrap();
     let header_value = format!(
         "1.{timestamp}.{}.{}",
         e2ee::encode(&sealed.exchange.enc),
@@ -1223,6 +1246,56 @@ async fn events_are_encrypted_chunk_by_chunk(db: PgPool) {
     // Length prefix, two bytes of text and the authentication tag.
     assert_eq!(first.len(), 4 + 2 + 16);
     assert_eq!(cipher.open(&first[4..]).unwrap(), b"*\n");
+}
+
+#[sqlx::test]
+async fn only_large_replies_to_a_get_that_asks_are_compressed(db: PgPool) {
+    let key = Keypair::generate();
+    let plain = app(state_for(db.clone(), false, key.clone()));
+    let cookie = admin(&plain).await;
+    // Enough audit lines to be worth compressing.
+    for _ in 0..4 {
+        for n in 0..4 {
+            login(
+                &plain,
+                &format!("nobody{n}@example.com"),
+                "wrong-password-1",
+            )
+            .await;
+        }
+    }
+    let app = app(state_for(db, true, key.clone()));
+    let read = async |path: &str, gzip: bool| {
+        let aad = e2ee::request_aad("GET", path, now());
+        let sealed = e2ee::seal_request(&key.public, &aad, "", b"", false).unwrap();
+        let value = format!(
+            "1.{}.{}.{}",
+            now(),
+            e2ee::encode(&sealed.exchange.enc),
+            e2ee::encode(&sealed.ciphertext)
+        );
+        let mut request = Request::get(path)
+            .header(header::COOKIE, &cookie)
+            .header(e2ee::HEADER, value);
+        if gzip {
+            request = request.header(e2ee::GZIP_HEADER, "1");
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.headers()[e2ee::GZIP_HEADER], "1");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let (status, body) = e2ee::open_response(&sealed.exchange, &bytes).unwrap();
+        assert_eq!(status, 200);
+        (bytes.len(), body)
+    };
+    let (whole, expected) = read("/api/audit", false).await;
+    let (small, body) = read("/api/audit", true).await;
+    assert!(expected.len() >= e2ee::GZIP_MIN);
+    assert!(small < whole / 2, "{small} of {whole}");
+    assert_eq!(body, expected);
 }
 
 // ---------------------------------------------------------------- schedules, retention, alerts
