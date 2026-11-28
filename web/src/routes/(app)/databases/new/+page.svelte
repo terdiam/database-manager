@@ -14,7 +14,7 @@
 	import { errorText } from '#lib/errors.ts';
 	import { t } from '#lib/i18n/index.svelte.ts';
 	import { live } from '#lib/events.ts';
-	import { sealFor } from '#lib/secrets.ts';
+	import { sealFor, tunnelOf } from '#lib/secrets.ts';
 
 	let step = $state(0);
 	let engine = $state<Engine>('postgresql');
@@ -54,11 +54,11 @@
 		const { name } = form;
 		const connection = connectionOf(engine, form);
 		try {
-			const secret = await sealFor(agent, 'database', id, { engine, ...connection });
-			const { host, port, username, ssl_mode } = connection;
 			// A tunnel of another agent is dropped: the choice follows the agent.
-			const ssh_config_id = tunnels.find((c) => c.id === form.ssh_config_id && c.agent_id === form.agent && engine !== 'sqlite')?.id;
-			await request('POST', '/database-servers', { id, name, engine, agent_id: form.agent, host, port, username, ssl_mode, secret, ssh_config_id });
+			const tunnel = engine === 'sqlite' ? undefined : tunnels.find((c) => c.id === form.ssh_config_id && c.agent_id === form.agent);
+			const secret = await sealFor(agent, 'database', id, { engine, ...connection, tunnel: tunnelOf(tunnel) });
+			const { host, port, username, ssl_mode } = connection;
+			await request('POST', '/database-servers', { id, name, engine, agent_id: form.agent, host, port, username, ssl_mode, secret, ssh_config_id: tunnel?.id });
 			toast(t('toast.created', { name }));
 			await goto(resolve('databases'));
 		} catch (e) {

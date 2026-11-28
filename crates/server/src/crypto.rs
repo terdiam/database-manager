@@ -30,14 +30,17 @@ impl MasterKey {
 
     /// Reads `DBM_MASTER_KEY`, or the file named by `DBM_MASTER_KEY_FILE`.
     pub fn from_env() -> Result<Self, String> {
-        let direct = std::env::var("DBM_MASTER_KEY")
-            .ok()
-            .filter(|v| !v.is_empty());
+        Self::from_variable("DBM_MASTER_KEY")
+    }
+
+    /// Reads the variable `name`, or the file named by `<name>_FILE`.
+    pub fn from_variable(name: &str) -> Result<Self, String> {
+        let direct = std::env::var(name).ok().filter(|v| !v.is_empty());
         let text = match direct {
             Some(text) => text,
             None => {
-                let path = std::env::var("DBM_MASTER_KEY_FILE")
-                    .map_err(|_| "DBM_MASTER_KEY is required (openssl rand -base64 32)")?;
+                let path = std::env::var(format!("{name}_FILE"))
+                    .map_err(|_| format!("{name} is required (openssl rand -base64 32)"))?;
                 std::fs::read_to_string(&path).map_err(|e| format!("cannot read {path}: {e}"))?
             }
         };

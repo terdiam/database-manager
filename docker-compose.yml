@@ -46,6 +46,8 @@ services:
       DBM_SERVER_URL: http://server:8080
       DBM_ALLOW_INSECURE: "true" # private compose network only
       DBM_ENROLL_TOKEN: ${DBM_ENROLL_TOKEN:-}
+      # After revoking the agent on the Agents page: its one-time token.
+      DBM_RELINK_TOKEN: ${DBM_RELINK_TOKEN:-}
       DBM_SERVER_FINGERPRINT: ${DBM_SERVER_FINGERPRINT:-}
       DBM_ALLOW_UNSIGNED_RESTORE: ${DBM_ALLOW_UNSIGNED_RESTORE:-false}
       DBM_SQLITE_ROOT: /sqlite

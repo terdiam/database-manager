@@ -29,6 +29,7 @@ Done:
 - [x] SFTP, FTP/FTPS and Samba storage
 - [x] Redis, Elasticsearch and OpenSearch
 - [x] Incremental backups for MySQL, MariaDB, MongoDB and PostgreSQL
+- [x] Key rotation and agent revocation
 
 Planned:
 
@@ -66,6 +67,8 @@ The agent connects to your database and storage, so use addresses it can reach
 Add the tunnel on the SSH Tunnel page, then choose it on a database. The database host and
 port are as seen from the SSH server. The first host key seen is remembered; a changed key
 stops the connection. Download links are only available for S3 destinations.
+The tunnel is saved with the database password: changing it, or editing the tunnel's host
+or user, asks for the password again.
 
 ## SQLite
 
@@ -142,6 +145,34 @@ All settings are in `.env`, see [.env.example](.env.example).
 | `DBM_SQLITE_DIR` | Host folder with SQLite files for the agent |
 | `DBM_PGDATA_DIR` | Host folder for PostgreSQL cluster restores |
 | `DBM_ALLOW_UNSIGNED_RESTORE` | Agent: `true` to restore backups made before signing existed |
+
+## Production
+
+- Serve it over HTTPS (above) and set `DBM_TRUST_PROXY=true` behind a proxy.
+- Back up the application database, for example
+  `docker compose exec -T db pg_dump -U dbm -Fc dbm > dbm.dump`, and keep `DBM_MASTER_KEY`
+  and the backup keys somewhere else.
+- Update with `git pull`, then `docker compose --profile https --profile agent up -d --build`.
+  Migrations run on start. Take a dump first.
+
+## Keys and agents
+
+To replace the master key, stop the server, then:
+
+```bash
+export DBM_NEW_MASTER_KEY=$(openssl rand -base64 32)
+```
+
+```bash
+docker compose run --rm -e DBM_NEW_MASTER_KEY server dbm-server rotate-master-key
+```
+
+Put the new key in `.env` and start the server again. `dbm-server rotate-transport-key`
+replaces the payload encryption key the same way; restart each agent once with the
+`DBM_SERVER_FINGERPRINT` it prints.
+
+If an agent's files may have leaked, revoke it on the Agents page, link the real one again
+with the token shown (`DBM_RELINK_TOKEN`), and change its database and storage passwords.
 
 ## Reset password
 

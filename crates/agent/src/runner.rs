@@ -4,7 +4,7 @@ use std::{path::PathBuf, time::Duration};
 
 use dbm_shared::{
     e2ee::{self, SecretContext},
-    jobs::{DatabaseSecret, Job, Sealed, SshSecret, StorageSecret, Task, WHOLE},
+    jobs::{DatabaseSecret, Job, Sealed, SshSecret, StorageSecret, Task, WHOLE, is_backup_key},
 };
 use serde::de::DeserializeOwned;
 use tokio::{runtime::Handle, task};
@@ -48,10 +48,14 @@ async fn database(
     progress: &Progress,
 ) -> Result<(DatabaseSecret, Option<Tunnel>)> {
     let mut secret: DatabaseSecret = open_json(state, sealed, "database")?;
-    let Some(sealed) = ssh else {
+    let login: Option<(&Sealed, SshSecret)> = match ssh {
+        Some(sealed) => Some((sealed, open_json(state, sealed, "ssh")?)),
+        None => None,
+    };
+    check_binding(&secret, login.as_ref().map(|(s, l)| (s.id.as_str(), l)))?;
+    let Some((sealed, login)) = login else {
         return Ok((secret, None));
     };
-    let login: SshSecret = open_json(state, sealed, "ssh")?;
     if secret.engine == "sqlite" {
         return Err("SQLite files cannot be reached through SSH".into());
     }
@@ -61,6 +65,37 @@ async fn database(
     secret.host = "127.0.0.1".into();
     secret.port = tunnel.port;
     Ok((secret, Some(tunnel)))
+}
+
+/// The tunnel the server hands over must be the one saved with the database's password.
+fn check_binding(secret: &DatabaseSecret, given: Option<(&str, &SshSecret)>) -> Result<()> {
+    let matches = match (&secret.tunnel, given) {
+        (None, None) => true,
+        (Some(bound), Some((id, login))) => {
+            bound.id == id
+                && bound.host == login.host
+                && bound.port == login.port
+                && bound.username == login.username
+        }
+        _ => false,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(
+            "the SSH tunnel is not the one saved with this database: enter its connection again"
+                .into(),
+        )
+    }
+}
+
+/// Refuses a name the agent would not have given a backup.
+fn backup_key(key: &str) -> Result<()> {
+    if is_backup_key(key) {
+        Ok(())
+    } else {
+        Err("that is not the name of a backup file".into())
+    }
 }
 
 async fn store(state: &State, sealed: &Sealed) -> Result<(storage::Store, StorageSecret)> {
@@ -315,6 +350,7 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
             track,
             since,
         } => {
+            backup_key(&object_key)?;
             let (database, _tunnel) = database(state, &sealed, ssh.as_ref(), &progress).await?;
             let (store, _) = store(state, &destination).await?;
             let database = std::sync::Arc::new(database);
@@ -452,6 +488,10 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
             increments,
             until,
         } => {
+            backup_key(&object_key)?;
+            for link in &increments {
+                backup_key(&link.object_key)?;
+            }
             // Every signature first, and that each increment continues the one before.
             trusted(
                 state,
@@ -553,6 +593,7 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
             destination,
             object_key,
         } => {
+            backup_key(&object_key)?;
             // Nothing can continue from a backup that is gone.
             let _ = basebackup::manifest_path(&object_key).map(std::fs::remove_file);
             store(state, &destination)
@@ -567,6 +608,7 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
             destination,
             object_key,
         } => {
+            backup_key(&object_key)?;
             let secret: StorageSecret = open_json(state, &destination, "destination")?;
             let link = storage::link(&secret, &object_key).await?;
             progress.log("ok", "download link created, valid for 5 minutes");
@@ -575,5 +617,37 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
                 ..Output::default()
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbm_shared::jobs::TunnelBinding;
+
+    #[test]
+    fn the_server_cannot_choose_another_tunnel() {
+        let mut secret: DatabaseSecret = serde_json::from_str(
+            r#"{"host":"db","port":1,"username":"u","password":"p","ssl_mode":"disable"}"#,
+        )
+        .unwrap();
+        let login = |host: &str| SshSecret {
+            host: host.into(),
+            port: 22,
+            username: "s".into(),
+            ..SshSecret::default()
+        };
+        assert!(check_binding(&secret, None).is_ok());
+        assert!(check_binding(&secret, Some(("t1", &login("evil")))).is_err());
+        secret.tunnel = Some(TunnelBinding {
+            id: "t1".into(),
+            host: "bastion".into(),
+            port: 22,
+            username: "s".into(),
+        });
+        assert!(check_binding(&secret, Some(("t1", &login("bastion")))).is_ok());
+        assert!(check_binding(&secret, None).is_err());
+        assert!(check_binding(&secret, Some(("t1", &login("evil")))).is_err());
+        assert!(check_binding(&secret, Some(("t2", &login("bastion")))).is_err());
     }
 }

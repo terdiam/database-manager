@@ -166,6 +166,56 @@ fn clipped(version: &str) -> String {
     version.chars().take(32).collect()
 }
 
+/// Ends an agent's credential at once and returns a one-time token that gives the real
+/// agent a new one. Its databases, destinations and backups stay.
+pub async fn revoke(
+    State(app): State<AppState>,
+    Auth(me): Auth,
+    Ip(ip): Ip,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Token>, Error> {
+    me.require_admin()?;
+    let mut tx = app.db.begin().await?;
+    // A hash nothing hashes to, until the agent is linked again.
+    let name: String =
+        sqlx::query_scalar("UPDATE agents SET token_hash = $2 WHERE id = $1 RETURNING name")
+            .bind(id)
+            .bind(token_hash(&new_token()))
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(Error::NotFound)?;
+    // Whoever held the credential may be working on these.
+    sqlx::query(
+        "UPDATE jobs SET status = 'failed', error = 'the agent credential was revoked', finished_at = now(), lease = NULL
+         WHERE agent_id = $1 AND status IN ('pending', 'running')",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    let token = new_token();
+    sqlx::query("DELETE FROM enrollment_tokens WHERE agent_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO enrollment_tokens (token_hash, agent_name, agent_id, expires_at)
+         VALUES ($1, $2, $3, now() + make_interval(mins => $4))",
+    )
+    .bind(token_hash(&token))
+    .bind(&name)
+    .bind(id)
+    .bind(TOKEN_MINUTES)
+    .execute(&mut *tx)
+    .await?;
+    let target = format!("agent {name} credential revoked");
+    audit::record(&mut *tx, Some(&me), "update", &target, &ip, true).await?;
+    tx.commit().await?;
+    Ok(Json(Token {
+        token,
+        expires_in_minutes: TOKEN_MINUTES,
+    }))
+}
+
 pub async fn enroll(
     State(app): State<AppState>,
     Ip(ip): Ip,
@@ -178,9 +228,9 @@ pub async fn enroll(
 
     let mut tx = app.db.begin().await?;
     // The UPDATE claims the token atomically, so it works exactly once.
-    let name: String = sqlx::query_scalar(
+    let (name, existing): (String, Option<Uuid>) = sqlx::query_as(
         "UPDATE enrollment_tokens SET used_at = now()
-         WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now() RETURNING agent_name",
+         WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now() RETURNING agent_name, agent_id",
     )
     .bind(token_hash(&body.token))
     .fetch_optional(&mut *tx)
@@ -188,6 +238,25 @@ pub async fn enroll(
     .ok_or(Error::Unauthorized)?;
 
     let secret = new_token();
+    if let Some(agent_id) = existing {
+        // Secrets are sealed to its key, so only the agent holding that key is linked again.
+        let linked = sqlx::query(
+            "UPDATE agents SET token_hash = $2, version = $3 WHERE id = $1 AND public_key = $4",
+        )
+        .bind(agent_id)
+        .bind(token_hash(&secret))
+        .bind(clipped(&body.version))
+        .bind(public_key)
+        .execute(&mut *tx)
+        .await?;
+        if linked.rows_affected() == 0 {
+            return Err(Error::Invalid("public_key"));
+        }
+        let target = format!("agent {name} linked again");
+        audit::record(&mut *tx, None, "update", &target, &ip, true).await?;
+        tx.commit().await?;
+        return Ok(Json(EnrollResponse { agent_id, secret }));
+    }
     let agent_id: Uuid = sqlx::query_scalar(
         "INSERT INTO agents (name, token_hash, version, public_key) VALUES ($1, $2, $3, $4)
          ON CONFLICT (name) DO NOTHING RETURNING id",

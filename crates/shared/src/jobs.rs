@@ -108,6 +108,45 @@ pub struct DatabaseSecret {
     pub username: String,
     pub password: String,
     pub ssl_mode: String,
+    /// The SSH tunnel the database is reached through, as the person who saved it chose it,
+    /// so the server cannot send the login through another one.
+    #[serde(default)]
+    pub tunnel: Option<TunnelBinding>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct TunnelBinding {
+    /// The SSH configuration's id.
+    pub id: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+}
+
+/// `<server>/<database>/<date>-<time>-<random>.<kind>[.<compression>].age`, the only names
+/// an agent writes, reads back, links to or deletes.
+pub fn is_backup_key(key: &str) -> bool {
+    let plain = |part: &str| {
+        !part.is_empty()
+            && !part.starts_with('.')
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    };
+    let mut parts = key.split('/');
+    let (Some(server), Some(database), Some(file), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let stamped = file.len() > 24
+        && file.bytes().take(25).enumerate().all(|(at, b)| match at {
+            8 | 15 => b == b'-',
+            24 => b == b'.',
+            16..24 => b.is_ascii_hexdigit(),
+            _ => b.is_ascii_digit(),
+        });
+    plain(server) && plain(database) && plain(file) && stamped && file.ends_with(".age")
 }
 
 fn postgresql() -> String {
@@ -319,6 +358,26 @@ mod tests {
         assert!(!valid_target("mysql", "app.db"));
         for bad in ["", ".env", "..", "a/b.db", "../x", "-readonly", "a b"] {
             assert!(!valid_target("sqlite", bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_backup_names_are_backup_keys() {
+        for good in [
+            "prod-pg/shop/20261128-051547-70ad90dc.dump.zst.age",
+            "a_b/app.db/20260101-000000-00000000.sql.age",
+        ] {
+            assert!(super::is_backup_key(good), "{good}");
+        }
+        for bad in [
+            ".ssh/authorized_keys",
+            "shop/20261128-051547-70ad90dc.dump.age",
+            "a/b/c/20261128-051547-70ad90dc.dump.age",
+            "a/../20261128-051547-70ad90dc.dump.age",
+            "a/b/report.pdf",
+            "a/b/20261128-051547-70ad90dc.dump",
+        ] {
+            assert!(!super::is_backup_key(bad), "{bad}");
         }
     }
 

@@ -1,8 +1,8 @@
 use std::{env, net::SocketAddr};
 
 use dbm_server::{
-    AppState, Config, MasterKey, TELEGRAM_API, Turnstile, VERIFY_URL, app, load_transport_key,
-    parse_recipient, reset_password,
+    AppState, Config, MasterKey, TELEGRAM_API, Turnstile, VERIFY_URL, app, hold_running_lock,
+    load_transport_key, parse_recipient, reset_password, rotate_master_key, rotate_transport_key,
 };
 use sqlx::postgres::PgPoolOptions;
 
@@ -34,8 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let url = env::var("DATABASE_URL").map_err(|_| "DATABASE_URL is required")?;
     let pool = PgPoolOptions::new()
-        // One of these is held by the change listener.
-        .max_connections(8)
+        // One of these is held by the change listener, one marks the database as in use.
+        .max_connections(9)
         .connect(&url)
         .await?;
     sqlx::migrate!().run(&pool).await?;
@@ -49,8 +49,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         [] => {}
         ["reset-password", email] => return reset(&pool, email).await,
-        _ => return Err("usage: dbm-server [reset-password <email>]".into()),
+        ["rotate-master-key"] => {
+            let new = MasterKey::from_variable("DBM_NEW_MASTER_KEY")?;
+            let count = rotate_master_key(&pool, &MasterKey::from_env()?, &new).await?;
+            println!(
+                "{count} values re-encrypted. Put the new key in DBM_MASTER_KEY, then start the server."
+            );
+            return Ok(());
+        }
+        ["rotate-transport-key"] => {
+            let fingerprint = rotate_transport_key(&pool, &MasterKey::from_env()?).await?;
+            println!(
+                "New server key {fingerprint}. Restart every agent once with DBM_SERVER_FINGERPRINT={fingerprint}."
+            );
+            return Ok(());
+        }
+        _ => {
+            return Err(
+                "usage: dbm-server [reset-password <email> | rotate-master-key | rotate-transport-key]"
+                    .into(),
+            );
+        }
     }
+    let _running = hold_running_lock(&pool).await?;
 
     let master = MasterKey::from_env()?;
     let transport_key = load_transport_key(&pool, &master).await?;

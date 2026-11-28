@@ -313,6 +313,7 @@ mod tests {
             username: "u".into(),
             password: "hunter2-secret".into(),
             ssl_mode: "disable".into(),
+            tunnel: None,
         }
     }
 

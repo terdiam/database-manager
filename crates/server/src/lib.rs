@@ -11,6 +11,7 @@ mod keys;
 mod notify;
 mod recover;
 mod resources;
+mod rotate;
 mod schedule;
 mod scheduler;
 mod snapshots;
@@ -43,6 +44,7 @@ pub fn parse_recipient(text: &str) -> Option<String> {
 }
 pub use error::Error;
 pub use recover::reset_password;
+pub use rotate::{hold_running_lock, rotate_master_key, rotate_transport_key};
 pub use turnstile::{Turnstile, VERIFY_URL};
 
 pub struct Config {
@@ -119,6 +121,7 @@ pub fn app(state: AppState) -> Router {
         .route("/agents", get(agents::list))
         .route("/agents/tokens", post(agents::create_token))
         .route("/agents/{id}", put(agents::rename).delete(agents::remove))
+        .route("/agents/{id}/revoke", post(agents::revoke))
         .route("/audit", get(audit::list))
         .route("/ssh-configs", get(ssh::list).post(ssh::create))
         .route("/ssh-configs/{id}", put(ssh::update).delete(ssh::delete))

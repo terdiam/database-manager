@@ -117,12 +117,59 @@ async fn run() -> Result<()> {
         Some(state) => state,
         None => enroll(&api, expected, path).await?,
     };
+    // The server's key was rotated: the operator names the new one, which is checked
+    // before it replaces the pinned one.
+    if repin_needed(state.server_key.as_deref(), expected)? {
+        state.server_key = server_key(&api, expected)
+            .await?
+            .map(|key| e2ee::encode(&key));
+        state::save(path, &state)?;
+        tracing::info!("pinned the server's new key");
+    }
+    relink(&api, path, &mut state).await?;
     tracing::info!(
         "agent key fingerprint {}",
         e2ee::fingerprint(&e2ee::decode(&state.public_key)?)
     );
 
     serve(&api, expected, path, &mut state).await
+}
+
+/// A pinned key that is not the one named in the install command.
+fn repin_needed(pinned: Option<&str>, expected: Option<&str>) -> Result<bool> {
+    Ok(match (pinned, expected) {
+        (Some(pinned), Some(expected)) => e2ee::fingerprint(&e2ee::decode(pinned)?) != expected,
+        _ => false,
+    })
+}
+
+/// After the credential was revoked: trade a one-time token for a new one, keeping the key
+/// that secrets are sealed to. A token already used is ignored, so it can stay set.
+async fn relink(api: &Api, path: &Path, state: &mut State) -> Result<()> {
+    let Some(token) = env::var("DBM_RELINK_TOKEN").ok().filter(|t| !t.is_empty()) else {
+        return Ok(());
+    };
+    let pinned = state.server_key.as_deref().map(e2ee::decode).transpose()?;
+    let request = EnrollRequest {
+        token,
+        version: VERSION.into(),
+        public_key: state.public_key.clone(),
+    };
+    let reply = api
+        .post(ENROLL_PATH, pinned.as_deref(), None, &request)
+        .await?;
+    if !(200..300).contains(&reply.status) {
+        tracing::warn!("DBM_RELINK_TOKEN was not accepted (used or expired)");
+        return Ok(());
+    }
+    let response: EnrollResponse = serde_json::from_slice(&reply.body)?;
+    if response.agent_id.to_string() != state.agent_id {
+        return Err("DBM_RELINK_TOKEN belongs to another agent".into());
+    }
+    state.secret = response.secret;
+    state::save(path, state)?;
+    tracing::info!("linked again with a new credential");
+    Ok(())
 }
 
 /// Heartbeat, then ask for work; one job at a time.
@@ -155,7 +202,7 @@ async fn serve(api: &Api, expected: Option<&str>, path: &Path, state: &mut State
                 }
             }
             Err(Failure::Revoked) => {
-                return Err("credential rejected: this agent was removed from the server".into());
+                return Err("credential rejected: this agent was removed from the server, or its credential revoked".into());
             }
             // Encryption was switched on after this agent enrolled: pin the key now.
             Err(Failure::Encryption) if state.server_key.is_none() => {
@@ -341,5 +388,21 @@ mod tests {
         assert!(server_url("http://localhost.evil.example", false).is_err());
         assert!(server_url("http://server:8080", true).is_ok());
         assert!(server_url("ftp://server", true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod repin_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_different_named_key_replaces_the_pinned_one() {
+        let key = Keypair::generate();
+        let pinned = e2ee::encode(&key.public);
+        let own = e2ee::fingerprint(&key.public);
+        assert!(!repin_needed(Some(&pinned), Some(&own)).unwrap());
+        assert!(repin_needed(Some(&pinned), Some("aaaa:bbbb")).unwrap());
+        assert!(!repin_needed(Some(&pinned), None).unwrap());
+        assert!(!repin_needed(None, Some(&own)).unwrap());
     }
 }

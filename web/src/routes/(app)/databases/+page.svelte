@@ -2,7 +2,7 @@
 	import IconButton from '#lib/components/IconButton.svelte';
 	import { onMount } from 'svelte';
 	import { resolve } from '$app/paths';
-	import { request, type Agent, type DbServer, type Queued, type SshConfig } from '#lib/api/http.ts';
+	import { ApiError, request, type Agent, type DbServer, type Queued, type SshConfig } from '#lib/api/http.ts';
 	import { connectionOf, engines } from '#lib/api/index.ts';
 	import BrandIcon from '#lib/components/BrandIcon.svelte';
 	import ConfirmDialog from '#lib/components/ConfirmDialog.svelte';
@@ -17,7 +17,7 @@
 	import { errorText } from '#lib/errors.ts';
 	import { t } from '#lib/i18n/index.svelte.ts';
 	import { live } from '#lib/events.ts';
-	import { sealFor } from '#lib/secrets.ts';
+	import { sealFor, tunnelOf } from '#lib/secrets.ts';
 	import { canOperate } from '#lib/session.svelte.ts';
 
 	let servers = $state<DbServer[]>([]);
@@ -49,6 +49,12 @@
 		}
 	}
 
+	// The tunnel is sealed with the password: changing it means entering the connection again.
+	const tunnelMoved = $derived(!!editing && form.ssh_config_id !== (editing.ssh_config_id ?? ''));
+	$effect(() => {
+		if (tunnelMoved) form.reconnect = true;
+	});
+
 	async function save(close: () => void) {
 		const { name, reconnect } = form;
 		const { id, engine } = editing!;
@@ -57,7 +63,9 @@
 			let connection;
 			if (reconnect) {
 				const values = connectionOf(engine, form);
-				const secret = await sealFor(agent, 'database', id, { engine, ...values });
+				const tunnel = tunnelOf(tunnels.find((c) => c.id === form.ssh_config_id));
+				if (form.ssh_config_id && !tunnel) throw new ApiError('not_found');
+				const secret = await sealFor(agent, 'database', id, { engine, ...values, tunnel });
 				const { host, port, username, ssl_mode } = values;
 				connection = { host, port, username, ssl_mode, secret };
 			}
@@ -134,8 +142,9 @@
 	{#snippet children(close)}
 		<form onsubmit={(e) => { e.preventDefault(); save(close); }}>
 			<FormField label={t('col.name')}>{#snippet children(a)}<input {...a} class="input" maxlength="64" required bind:value={form.name} />{/snippet}</FormField>
-			<label class="mb-1 flex items-center gap-2 text-sm font-medium"><input type="checkbox" bind:checked={form.reconnect} />{t('field.changeConnection')}</label>
+			<label class="mb-1 flex items-center gap-2 text-sm font-medium"><input type="checkbox" bind:checked={form.reconnect} disabled={tunnelMoved} />{t('field.changeConnection')}</label>
 			<p class="mb-3 text-xs text-dim">{t('help.changeConnection', { agent: editing?.agent ?? '' })}</p>
+			{#if tunnelMoved}<p class="mb-3 text-sm text-warn" role="status">{t('help.tunnelMoved')}</p>{/if}
 			{#if form.reconnect && editing}<ConnectionFields engine={editing.engine} bind:form />{/if}
 			{#if editing && editing.engine !== 'sqlite'}<FormField label="SSH tunnel" help={t('help.tunnel')}>{#snippet children(a)}<Select {...a} bind:value={form.ssh_config_id} options={[{ value: '', label: t('field.noTunnel') }, ...tunnels.filter((c) => c.agent_id === editing?.agent_id).map((c) => ({ value: c.id, label: c.name, icon: 'key' as const, description: `${c.username}@${c.host}` }))]} />{/snippet}</FormField>{/if}
 			<p class="text-sm text-bad empty:hidden" role="alert">{formError}</p>

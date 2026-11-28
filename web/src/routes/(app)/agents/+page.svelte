@@ -24,6 +24,10 @@
 	let formError = $state('');
 	let serverFingerprint = $state('');
 	let removing = $state<Agent>();
+	let revoking = $state<Agent>();
+	let relink = $state('');
+	let revokeConfirm: ConfirmDialog;
+	let relinkModal: Modal;
 	let renaming = $state<Agent>();
 	let newName = $state('');
 	let renameError = $state('');
@@ -92,6 +96,16 @@
 		}
 	}
 
+	async function revoke() {
+		try {
+			relink = (await request<{ token: string }>('POST', `/agents/${revoking!.id}/revoke`)).token;
+			actionError = '';
+			relinkModal.open();
+		} catch (e) {
+			actionError = errorText(e);
+		}
+	}
+
 	async function remove() {
 		try {
 			await request('DELETE', `/agents/${removing!.id}`);
@@ -123,6 +137,7 @@
 			{:else if i === 4}<code class="text-xs">{agent.fingerprint ?? t('agents.noKey')}</code>
 			{:else}<span class="flex flex-wrap justify-end gap-1">
 				<IconButton icon="edit" label={t('action.edit')} onclick={() => rename(agent)} />
+				<IconButton icon="logout" label={t('agents.revoke')} onclick={() => { revoking = agent; revokeConfirm.open(); }} danger />
 				<IconButton icon="trash" label={t('action.delete')} onclick={() => { removing = agent; confirm.open(); }} danger />
 			</span>{/if}
 		{/snippet}
@@ -165,4 +180,15 @@
 	{/snippet}
 </Modal>
 
+<Modal bind:this={relinkModal} title={t('agents.relinkTitle', { name: revoking?.name ?? '' })}>
+	{#snippet children(close)}
+		<p class="mb-2 text-sm">{t('agents.relinkHelp')}</p>
+		<pre class="overflow-x-auto rounded-lg bg-muted p-3 text-xs">DBM_RELINK_TOKEN={relink} docker compose --profile agent up -d agent</pre>
+		<div class="mt-4 flex justify-end">
+			<button type="button" class="btn btn-primary" onclick={() => { relink = ''; close(); }}>{t('action.close')}</button>
+		</div>
+	{/snippet}
+</Modal>
+
+<ConfirmDialog bind:this={revokeConfirm} title={t('agents.revoke')} message={t('agents.revokeWarning', { name: revoking?.name ?? '' })} confirmLabel={t('agents.revoke')} onconfirm={revoke} />
 <ConfirmDialog bind:this={confirm} title={t('action.delete')} message={t('agents.confirmDelete', { name: removing?.name ?? '' })} confirmLabel={t('action.delete')} onconfirm={remove} />

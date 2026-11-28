@@ -21,17 +21,66 @@ use dbm_shared::{
 use futures_util::{StreamExt, future, stream};
 use time::OffsetDateTime;
 
-use crate::{AppState, Error};
+use axum::extract::FromRequestParts;
+
+use crate::{AppState, Error, auth::Ip};
 
 const MAX_BODY: usize = 1024 * 1024;
 const MAX_REMEMBERED: usize = 100_000;
+/// Far above what a browser or an agent sends in the replay window.
+const MAX_PER_ADDRESS: usize = 20_000;
+
+#[derive(Default)]
+struct Seen {
+    keys: HashMap<Vec<u8>, (Instant, String)>,
+    per_address: HashMap<String, usize>,
+    pruned: Option<Instant>,
+}
+
+impl Seen {
+    fn full(&self, address: &str) -> bool {
+        self.keys.len() >= MAX_REMEMBERED
+            || self
+                .per_address
+                .get(address)
+                .is_some_and(|&n| n >= MAX_PER_ADDRESS)
+    }
+
+    /// `false` when the key was already accepted or there is no room for this address.
+    fn add(&mut self, enc: &[u8], address: &str, window: Duration) -> bool {
+        // Forgetting looks at everything, so a flood must not trigger it every time.
+        if self.full(address)
+            && self
+                .pruned
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(1))
+        {
+            self.keys.retain(|_, (at, _)| at.elapsed() <= window);
+            self.per_address.clear();
+            for (_, from) in self.keys.values() {
+                *self.per_address.entry(from.clone()).or_default() += 1;
+            }
+            self.pruned = Some(Instant::now());
+        }
+        let replayed = self
+            .keys
+            .get(enc)
+            .is_some_and(|(at, _)| at.elapsed() <= window);
+        if replayed || self.full(address) {
+            return false;
+        }
+        self.keys
+            .insert(enc.to_vec(), (Instant::now(), address.to_owned()));
+        *self.per_address.entry(address.to_owned()).or_default() += 1;
+        true
+    }
+}
 
 pub struct Transport {
     key: Keypair,
     /// Refuse requests that are not encrypted. Encrypted ones are accepted either way.
     required: bool,
     /// Encapsulated keys already used, so a captured request cannot be sent twice.
-    seen: Mutex<HashMap<Vec<u8>, Instant>>,
+    seen: Mutex<Seen>,
 }
 
 impl Transport {
@@ -43,19 +92,11 @@ impl Transport {
         }
     }
 
-    /// `false` when this request was already accepted (or the memory is full).
-    fn remember(&self, enc: &[u8]) -> bool {
+    /// `false` when this request was already accepted (or there is no room for the sender).
+    fn remember(&self, enc: &[u8], address: &str) -> bool {
         // A timestamp may be this far in the past or the future.
         let window = Duration::from_secs(2 * MAX_SKEW_SECS as u64);
-        let mut seen = self.seen.lock().unwrap();
-        if seen.len() >= MAX_REMEMBERED {
-            seen.retain(|_, at| at.elapsed() <= window);
-        }
-        if seen.len() >= MAX_REMEMBERED || seen.get(enc).is_some_and(|at| at.elapsed() <= window) {
-            return false;
-        }
-        seen.insert(enc.to_vec(), Instant::now());
-        true
+        self.seen.lock().unwrap().add(enc, address, window)
     }
 }
 
@@ -150,7 +191,11 @@ pub async fn layer(State(app): State<AppState>, request: Request, next: Next) ->
     let Ok(opened) = e2ee::open_request(&app.transport.key.private, &enc, &aad, &ciphertext) else {
         return Error::Invalid("e2ee_invalid").into_response();
     };
-    if !app.transport.remember(&enc) {
+    let address = match Ip::from_request_parts(&mut parts, &app).await {
+        Ok(Ip(address)) => address,
+        Err(error) => return error.into_response(),
+    };
+    if !app.transport.remember(&enc, &address) {
         return Error::Invalid("e2ee_replay").into_response();
     }
 
@@ -194,4 +239,22 @@ pub async fn layer(State(app): State<AppState>, request: Request, next: Next) ->
     head.headers
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Response::from_parts(head, Body::from(sealed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replays_are_refused_and_one_address_cannot_use_all_the_room() {
+        let window = Duration::from_secs(60);
+        let mut seen = Seen::default();
+        assert!(seen.add(b"a", "1.1.1.1", window));
+        assert!(!seen.add(b"a", "2.2.2.2", window));
+        for n in 0..MAX_PER_ADDRESS - 1 {
+            assert!(seen.add(&n.to_le_bytes(), "1.1.1.1", window));
+        }
+        assert!(!seen.add(b"one more", "1.1.1.1", window));
+        assert!(seen.add(b"one more", "2.2.2.2", window));
+    }
 }

@@ -164,6 +164,10 @@ pub fn mysql(program: &str, secret: &DatabaseSecret) -> Result<Command> {
         .arg(format!("--user={}", secret.username))
         .arg("--protocol=TCP")
         .args(ssl);
+    // A hostile server must not be able to ask a client for the agent's files.
+    if matches!(program, "mysql" | "mariadb") {
+        command.arg("--local-infile=0");
+    }
     Ok(command)
 }
 
@@ -565,6 +569,7 @@ mod tests {
             username: "u".into(),
             password: "hunter2-secret".into(),
             ssl_mode: "disable".into(),
+            tunnel: None,
         }
     }
 

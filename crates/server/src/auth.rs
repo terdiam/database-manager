@@ -92,9 +92,16 @@ impl LoginGuard {
             .is_some_and(|(count, _)| *count >= MAX_FAILURES)
     }
 
-    fn fail(&self, key: String) {
+    /// Counts a try before it is checked; `false` once there were too many.
+    fn attempt(&self, key: &str) -> bool {
         let mut map = self.failures.lock().unwrap();
-        map.entry(key).or_insert((0, Instant::now())).0 += 1;
+        map.retain(|_, (_, since)| since.elapsed() < LOCK_WINDOW);
+        let (count, _) = map.entry(key.to_owned()).or_insert((0, Instant::now()));
+        if *count >= MAX_FAILURES {
+            return false;
+        }
+        *count += 1;
+        true
     }
 
     fn clear(&self, key: &str) {
@@ -377,6 +384,9 @@ pub async fn login(
     }
     // Before any password work, so bots cost neither argon2 time nor lockouts of real users.
     check_human(&app, body.turnstile_token.as_deref(), "login", &ip).await?;
+    if !app.guard.attempt(&key) {
+        return Err(Error::TooManyAttempts);
+    }
 
     #[derive(sqlx::FromRow)]
     struct Row {
@@ -397,7 +407,6 @@ pub async fn login(
         None => hash_password(&app, body.password).await.map(|_| false)?,
     };
     let Some(row) = row.filter(|_| ok) else {
-        app.guard.fail(key);
         audit::record(&app.db, None, "login", &email, &ip, false).await?;
         return Err(Error::BadCredentials);
     };
@@ -438,7 +447,7 @@ pub async fn change_password(
 ) -> Result<(CookieJar, StatusCode), Error> {
     check_password_rules(&body.new)?;
     let key = format!("{ip}|{}", user.email);
-    if app.guard.locked(&key) {
+    if !app.guard.attempt(&key) {
         return Err(Error::TooManyAttempts);
     }
     let current: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
@@ -446,7 +455,6 @@ pub async fn change_password(
         .fetch_one(&app.db)
         .await?;
     if body.current.len() > 1024 || !verify_password(&app, body.current, current).await? {
-        app.guard.fail(key);
         return Err(Error::Invalid("wrong_password"));
     }
     let hash = hash_password(&app, body.new).await?;
@@ -472,7 +480,7 @@ pub async fn confirm_password(
     password: String,
 ) -> Result<(), Error> {
     let key = format!("{ip}|{}", user.email);
-    if app.guard.locked(&key) {
+    if !app.guard.attempt(&key) {
         return Err(Error::TooManyAttempts);
     }
     let hash: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
@@ -480,7 +488,6 @@ pub async fn confirm_password(
         .fetch_one(&app.db)
         .await?;
     if password.len() > 1024 || !verify_password(app, password, hash).await? {
-        app.guard.fail(key);
         return Err(Error::Invalid("wrong_password"));
     }
     Ok(())

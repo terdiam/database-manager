@@ -212,13 +212,19 @@ pub async fn update_server(
 ) -> Result<StatusCode, Error> {
     me.require_operator()?;
     let name = named(&body.name, "name")?;
-    let (agent, engine): (Uuid, String) =
-        sqlx::query_as("SELECT agent_id, engine FROM database_servers WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&app.db)
-            .await?
-            .ok_or(Error::NotFound)?;
+    let (agent, engine, tunnel): (Uuid, String, Option<Uuid>) = sqlx::query_as(
+        "SELECT agent_id, engine, ssh_config_id FROM database_servers WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&app.db)
+    .await?
+    .ok_or(Error::NotFound)?;
     check_tunnel(&app, body.ssh_config_id, agent, &engine).await?;
+    let moved = body.ssh_config_id != tunnel;
+    // The tunnel is sealed with the password, so the agent would refuse a bare change.
+    if moved && body.connection.is_none() {
+        return Err(Error::Invalid("tunnel_password"));
+    }
     let mut tx = app.db.begin().await?;
     sqlx::query("UPDATE database_servers SET name = $2, ssh_config_id = $3 WHERE id = $1")
         .bind(id)
@@ -242,10 +248,10 @@ pub async fn update_server(
         .execute(&mut *tx)
         .await?;
     }
-    let what = if body.connection.is_some() {
-        " and connection"
-    } else {
-        ""
+    let what = match (moved, body.connection.is_some()) {
+        (true, _) => " and SSH tunnel",
+        (false, true) => " and connection",
+        (false, false) => "",
     };
     let target = format!("database {name}{what}");
     audit::record(&mut *tx, Some(&me), "update", &target, &ip, true).await?;

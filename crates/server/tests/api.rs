@@ -4,7 +4,10 @@ use axum::{
     extract::connect_info::MockConnectInfo,
     http::{Request, StatusCode, header},
 };
-use dbm_server::{AppState, Config, MasterKey, Turnstile, app, load_transport_key, reset_password};
+use dbm_server::{
+    AppState, Config, MasterKey, Turnstile, app, hold_running_lock, load_transport_key,
+    reset_password, rotate_master_key, rotate_transport_key,
+};
 use dbm_shared::e2ee::{self, Keypair};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -2355,6 +2358,118 @@ async fn a_whole_postgresql_cluster_is_followed_and_restored_to_a_folder(db: PgP
 }
 
 #[sqlx::test]
+async fn keys_rotate_only_with_the_right_key_and_the_server_stopped(db: PgPool) {
+    let old = MasterKey::parse("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap();
+    let new = MasterKey::parse("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=").unwrap();
+    let key = load_transport_key(&db, &old).await.unwrap();
+    let channel = uuid::Uuid::new_v4().to_string();
+    let sealed = old
+        .seal("notification_channels", "secret", &channel, b"token")
+        .unwrap();
+    sqlx::query("INSERT INTO notification_channels (id, name, kind, target, secret, events) VALUES ($1::uuid, 'c', 'telegram', 't', $2, '{}')")
+        .bind(&channel)
+        .bind(sealed)
+        .execute(&db)
+        .await
+        .unwrap();
+
+    {
+        let _running = hold_running_lock(&db).await.unwrap();
+        let refused = rotate_master_key(&db, &old, &new).await.unwrap_err();
+        assert!(refused.contains("stop the server"), "{refused}");
+        sqlx::query("SELECT pg_advisory_unlock_all()")
+            .execute(&mut *{ _running })
+            .await
+            .unwrap();
+    }
+    assert!(
+        rotate_master_key(&db, &new, &old).await.is_err(),
+        "wrong old key"
+    );
+    assert!(
+        load_transport_key(&db, &old).await.is_ok(),
+        "nothing changed"
+    );
+
+    assert_eq!(rotate_master_key(&db, &old, &new).await.unwrap(), 2);
+    assert!(load_transport_key(&db, &old).await.is_err());
+    assert_eq!(
+        load_transport_key(&db, &new).await.unwrap().public,
+        key.public
+    );
+    let stored: Vec<u8> = sqlx::query_scalar("SELECT secret FROM notification_channels")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(
+        new.open("notification_channels", "secret", &channel, &stored)
+            .unwrap(),
+        b"token"
+    );
+
+    assert!(rotate_transport_key(&db, &old).await.is_err());
+    let fingerprint = rotate_transport_key(&db, &new).await.unwrap();
+    let replaced = load_transport_key(&db, &new).await.unwrap();
+    assert_ne!(replaced.public, key.public);
+    assert_eq!(e2ee::fingerprint(&replaced.public), fingerprint);
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM audit_logs WHERE ip = 'console'").await,
+        2
+    );
+}
+
+#[sqlx::test]
+async fn a_revoked_agent_is_shut_out_until_linked_again_with_its_own_key(db: PgPool) {
+    let app = router(db.clone());
+    let cookie = admin(&app).await;
+    let agent = enroll(&app, &cookie, "a1").await;
+    let (_, _, backup) = add_resources(&app, &cookie, &agent).await;
+    call(
+        &app,
+        "POST",
+        &format!("/api/backups/{backup}/run"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+
+    let path = format!("/api/agents/{}/revoke", agent.id);
+    let reply = call(&app, "POST", &path, Some(&cookie), None).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let token = reply.body["token"].as_str().unwrap().to_owned();
+    let refused = as_agent(&app, &agent, "/api/agent/jobs/claim", json!({})).await;
+    assert_eq!(refused.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM jobs WHERE status = 'failed'").await,
+        1
+    );
+
+    let link = |key: &[u8]| {
+        let body = json!({ "token": token, "version": "2", "public_key": e2ee::encode(key) });
+        call(&app, "POST", "/api/agent/enroll", None, Some(body))
+    };
+    // Someone else's key is refused and does not spend the token.
+    assert_eq!(
+        link(&Keypair::generate().public).await.body["error"],
+        "public_key"
+    );
+    let linked = link(&agent.keys.public).await;
+    assert_eq!(linked.status, StatusCode::OK);
+    assert_eq!(linked.body["agent_id"], agent.id.as_str());
+    let again = Agent {
+        id: agent.id.clone(),
+        bearer: format!("Bearer {}", linked.body["secret"].as_str().unwrap()),
+        keys: Keypair::generate(),
+    };
+    let claimed = as_agent(&app, &again, "/api/agent/jobs/claim", json!({})).await;
+    assert_eq!(claimed.status, StatusCode::OK);
+    assert_eq!(
+        link(&agent.keys.public).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[sqlx::test]
 async fn redis_and_search_engines_name_what_they_back_up(db: PgPool) {
     let app = router(db.clone());
     let cookie = admin(&app).await;
@@ -2484,15 +2599,15 @@ async fn tunnels_belong_to_their_agent_and_go_with_the_job(db: PgPool) {
     assert_eq!(list.body[0]["used"], 1);
     assert!(!list.body.to_string().contains("secret"));
 
-    // Editing without a tunnel connects directly.
-    let reply = call(
-        &app,
-        "PUT",
-        &format!("/api/database-servers/{server}"),
-        Some(&cookie),
-        Some(json!({ "name": "through" })),
-    )
-    .await;
+    // The tunnel is sealed with the password, so taking it away needs the password again.
+    let path = format!("/api/database-servers/{server}");
+    let bare = json!({ "name": "through" });
+    let reply = call(&app, "PUT", &path, Some(&cookie), Some(bare)).await;
+    assert_eq!(reply.body["error"], "tunnel_password");
+    let connection = json!({ "host": "db", "port": 5432, "username": "u", "ssl_mode": "disable",
+        "secret": sealed_for(&agent, &server, "database", "{}") });
+    let body = json!({ "name": "through", "connection": connection });
+    let reply = call(&app, "PUT", &path, Some(&cookie), Some(body)).await;
     assert_eq!(reply.status, StatusCode::NO_CONTENT);
     let list = call(&app, "GET", "/api/database-servers", Some(&cookie), None).await;
     assert!(list.body[0]["ssh_config_id"].is_null());
