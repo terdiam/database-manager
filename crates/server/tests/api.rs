@@ -2470,6 +2470,50 @@ async fn a_revoked_agent_is_shut_out_until_linked_again_with_its_own_key(db: PgP
 }
 
 #[sqlx::test]
+async fn each_person_has_their_own_place_in_the_notifications(db: PgPool) {
+    let app = router(db.clone());
+    let admin = admin(&app).await;
+    let body =
+        json!({ "name": "V", "email": "v@example.com", "role": "viewer", "password": PASSWORD });
+    let reply = call(&app, "POST", "/api/users", Some(&admin), Some(body)).await;
+    assert_eq!(reply.status, StatusCode::CREATED);
+    let viewer = login(&app, "v@example.com", PASSWORD).await.cookie.unwrap();
+    sqlx::query("UPDATE users SET notices_read_at = '2026-01-01T00:00:00Z'")
+        .execute(&db)
+        .await
+        .unwrap();
+
+    let path = "/api/notifications/read";
+    let read = |cookie: &str| {
+        let (app, cookie) = (&app, cookie.to_owned());
+        async move { call(app, "GET", path, Some(&cookie), None).await.body["read_at"].clone() }
+    };
+    let mark = |cookie: &str, at: &str| {
+        let (app, cookie, body) = (&app, cookie.to_owned(), json!({ "read_at": at }));
+        async move { call(app, "POST", path, Some(&cookie), Some(body)).await }
+    };
+
+    assert_eq!(
+        mark(&viewer, "2026-03-01T10:00:00Z").await.status,
+        StatusCode::OK
+    );
+    assert_eq!(read(&viewer).await, "2026-03-01T10:00:00Z");
+    assert_eq!(
+        read(&admin).await,
+        "2026-01-01T00:00:00Z",
+        "the other account is untouched"
+    );
+    // It does not move back, and a far future value stops at the present.
+    mark(&viewer, "2026-02-01T00:00:00Z").await;
+    assert_eq!(read(&viewer).await, "2026-03-01T10:00:00Z");
+    mark(&viewer, "2999-01-01T00:00:00Z").await;
+    assert!(!read(&viewer).await.as_str().unwrap().starts_with("2999"));
+
+    let reply = call(&app, "GET", path, None, None).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test]
 async fn redis_and_search_engines_name_what_they_back_up(db: PgPool) {
     let app = router(db.clone());
     let cookie = admin(&app).await;

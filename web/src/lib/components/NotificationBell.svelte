@@ -11,7 +11,8 @@
 	let panel: HTMLElement;
 	const unread = $derived(notices.jobs.filter(isUnread).length);
 
-	onMount(() => live(['jobs'], refresh, { now: true }));
+	// `users` also changes when this account marks them read elsewhere.
+	onMount(() => live(['jobs', 'users'], refresh, { now: true }));
 </script>
 
 <button type="button" class="btn relative min-h-10 px-2.5" popovertarget="{id}-bell" aria-label={t('bell.label', { n: unread })}>

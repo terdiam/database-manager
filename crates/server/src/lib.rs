@@ -8,6 +8,7 @@ mod error;
 mod events;
 mod jobs;
 mod keys;
+mod notices;
 mod notify;
 mod recover;
 mod resources;
@@ -172,6 +173,7 @@ pub fn app(state: AppState) -> Router {
             put(notify::update).delete(notify::delete),
         )
         .route("/notification-channels/{id}/test", post(notify::test))
+        .route("/notifications/read", get(notices::get).post(notices::mark))
         .route("/jobs", get(jobs::list))
         .route("/jobs/{id}", get(jobs::get))
         .route("/jobs/{id}/cancel", post(jobs::cancel))
