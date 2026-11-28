@@ -145,13 +145,13 @@ pub fn dump(
     copied
 }
 
-/// Messages of a server that can no longer continue from the parent backup.
+/// Whether the server refused to start an increment from the parent backup. The server's
+/// own message follows its `lc_messages`, so this matches what `pg_basebackup` says
+/// around it, which stays English (`LC_MESSAGES=C` above).
 pub fn cannot_continue(message: &str) -> bool {
     [
-        "system identifier",
-        "WAL summaries are required",
-        "timeline",
-        "manifest requires WAL",
+        "could not upload manifest",
+        "could not initiate base backup",
     ]
     .iter()
     .any(|part| message.contains(part))
@@ -264,6 +264,23 @@ mod tests {
         assert!(target(root.path(), "empty").is_ok());
         for bad in ["used", "link", "..", "a/b", ""] {
             assert!(target(root.path(), bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_broken_chain_is_seen_whatever_language_the_server_speaks() {
+        for broken in [
+            "pg_basebackup: error: could not initiate base backup: FEHLER:  WAL-Zusammenfassungen auf Zeitleiste 1 von 0/17000028 bis 0/19000028 werden benötigt",
+            "pg_basebackup: error: could not initiate base backup: ОШИБКА:  требуются обобщения WAL для линии времени 1",
+            "pg_basebackup: error: could not upload manifest: ERREUR:  system identifier in backup manifest is 1, but database system identifier is 2",
+        ] {
+            assert!(cannot_continue(broken), "{broken}");
+        }
+        for other in [
+            "pg_basebackup: error: connection to server at \"db\", port 5432 failed: timeout expired",
+            "upload failed: connection reset",
+        ] {
+            assert!(!cannot_continue(other), "{other}");
         }
     }
 }
