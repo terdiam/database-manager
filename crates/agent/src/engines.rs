@@ -118,6 +118,10 @@ pub fn postgres(program: &str, secret: &DatabaseSecret, database: &str) -> Resul
         .env("PGDATABASE", database)
         .env("PGCONNECT_TIMEOUT", "10")
         .arg("--no-password");
+    // Without it libpq only looks for ~/.postgresql/root.crt.
+    if secret.ssl_mode == "verify-full" {
+        command.env("PGSSLROOTCERT", "system");
+    }
     Ok(command)
 }
 
@@ -134,6 +138,10 @@ fn psql(secret: &DatabaseSecret, sql: &str) -> Result<String> {
 }
 
 // ---------------------------------------------------------------- MySQL and MariaDB
+
+/// The system's trusted roots, where the agent image keeps them. MySQL's tools verify
+/// nothing unless told where to look.
+const CA_FILE: &str = "/etc/ssl/certs/ca-certificates.crt";
 
 /// Oracle's tools for MySQL, MariaDB's for MariaDB: their options and dumps differ.
 pub fn mysql(program: &str, secret: &DatabaseSecret) -> Result<Command> {
@@ -164,6 +172,9 @@ pub fn mysql(program: &str, secret: &DatabaseSecret) -> Result<Command> {
         .arg(format!("--user={}", secret.username))
         .arg("--protocol=TCP")
         .args(ssl);
+    if !maria && secret.ssl_mode.starts_with("verify-") {
+        command.arg(format!("--ssl-ca={CA_FILE}"));
+    }
     // A hostile server must not be able to ask a client for the agent's files.
     if matches!(program, "mysql" | "mariadb") {
         command.arg("--local-infile=0");
@@ -308,7 +319,8 @@ pub fn test(secret: &DatabaseSecret) -> Result<String> {
         "mongodb" => {
             // Dumping a database that does not exist needs a connection and a login, nothing else.
             let (mut command, _file) = mongo("mongodump", secret)?;
-            command.args(["--quiet", "--db=dbm_connection_test", "--archive=/dev/null"]);
+            // Not --quiet here or in a backup: it would also hide why it failed.
+            command.args(["--db=dbm_connection_test", "--archive=/dev/null"]);
             output(command, "mongodump")?;
             Ok("MongoDB".into())
         }
@@ -422,7 +434,7 @@ pub fn dump(secret: &DatabaseSecret, name: &str, track: bool) -> Result<Tool> {
         }
         "mongodb" => {
             let (mut command, file) = mongo("mongodump", secret)?;
-            command.arg("--quiet").arg("--archive");
+            command.arg("--archive");
             if name != WHOLE {
                 command.arg(format!("--db={name}"));
             }
@@ -570,6 +582,27 @@ mod tests {
             password: "hunter2-secret".into(),
             ssl_mode: "disable".into(),
             tunnel: None,
+        }
+    }
+
+    #[test]
+    fn verify_full_is_told_where_the_trusted_roots_are() {
+        let mut pg = secret("postgresql");
+        pg.ssl_mode = "verify-full".into();
+        let command = postgres("psql", &pg, "shop").unwrap();
+        assert!(
+            command
+                .get_envs()
+                .any(|(k, v)| k == "PGSSLROOTCERT" && v.is_some_and(|v| v == "system"))
+        );
+        for (engine, wanted) in [("mysql", true), ("mariadb", false)] {
+            let mut server = secret(engine);
+            server.ssl_mode = "verify-full".into();
+            let command = mysql("mysqldump", &server).unwrap();
+            let told = command
+                .get_args()
+                .any(|a| a.to_string_lossy().starts_with("--ssl-ca="));
+            assert_eq!(told, wanted, "{engine}");
         }
     }
 

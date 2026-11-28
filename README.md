@@ -69,6 +69,8 @@ port are as seen from the SSH server. The first host key seen is remembered; a c
 stops the connection. Download links are only available for S3 destinations.
 The tunnel is saved with the database password: changing it, or editing the tunnel's host
 or user, asks for the password again.
+Through a tunnel the agent connects to `127.0.0.1`, so `verify-full` fails unless the
+database certificate also names that address; use `require` there.
 
 ## SQLite
 
@@ -89,11 +91,18 @@ recreates the index. Data streams, templates and users are not included.
 
 For MySQL and MariaDB add a full backup, then an incremental one that follows it. The server
 needs the binary log on in ROW format, and the user `RELOAD`, `REPLICATION SLAVE` and
-`REPLICATION CLIENT` (MariaDB: `BINLOG MONITOR`). If the log was purged, a new full backup
-is taken. A restore goes into a new or empty database.
+`REPLICATION CLIENT` (MariaDB: `BINLOG MONITOR`). MySQL has to be 8.4 or newer. If the log
+was purged, a new full backup is taken. A restore goes into a new or empty database.
+Replaying also needs `BINLOG_ADMIN` (MariaDB: `BINLOG REPLAY`) for the restoring user.
+
+Restoring MySQL or MariaDB triggers and functions with a user who is not an administrator
+needs `log_bin_trust_function_creators=ON` when the binary log is on, and for objects
+created by someone else `SET_ANY_DEFINER` (MySQL 8.0: `SET_USER_ID`, MariaDB: `SET USER`),
+plus `SYSTEM_USER` if that creator has it.
 
 For MongoDB the full backup takes the whole instance (database name `_all`) from a replica
-set, and the incremental ones keep its oplog. Restoring writes every database back but
+set, and the incremental ones keep its oplog. The backup user needs the `backup` role; replaying
+increments needs `root` on the target. Restoring writes every database back but
 leaves the target's accounts alone; restore an incremental snapshot to get a single moment.
 
 For PostgreSQL 17, 18 or 19 the full backup `_all` is a physical copy of the whole cluster.

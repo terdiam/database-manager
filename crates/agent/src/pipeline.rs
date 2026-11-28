@@ -66,6 +66,7 @@ impl Running {
                 | "index restore"
                 | "log dump"
                 | "log replay"
+                | "mongodump"
                 | "mongorestore"
                 | "base backup"
         ) {

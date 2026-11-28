@@ -87,8 +87,17 @@ pub fn server(secret: &DatabaseSecret) -> Result<String> {
     engines::mysql_query(secret, sql)
 }
 
+/// The bundled mysqldump asks for the position with a statement MySQL has since 8.2.
+fn too_old(version: &str) -> bool {
+    let mut numbers = version.split('.').map(|n| n.parse::<u32>().unwrap_or(0));
+    (numbers.next(), numbers.next()) < (Some(8), Some(2))
+}
+
 /// Refuses early when the server does not keep a usable log.
 pub fn check(secret: &DatabaseSecret) -> Result<()> {
+    if !maria(secret) && too_old(&engines::mysql_query(secret, "SELECT VERSION()")?) {
+        return Err("incremental backups need MySQL 8.4 or newer".into());
+    }
     let settings = engines::mysql_query(secret, "SELECT @@log_bin, @@binlog_format")?;
     if settings.split_whitespace().collect::<Vec<_>>() != ["1", "ROW"] {
         return Err("incremental backups need the binary log on, in ROW format".into());
@@ -315,6 +324,13 @@ mod tests {
             ssl_mode: "disable".into(),
             tunnel: None,
         }
+    }
+
+    #[test]
+    fn old_mysql_cannot_be_followed() {
+        assert!(too_old("8.0.43"));
+        assert!(!too_old("8.4.6"));
+        assert!(!too_old("9.1.0-commercial"));
     }
 
     #[test]

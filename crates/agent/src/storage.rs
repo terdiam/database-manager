@@ -1,6 +1,7 @@
 //! Where backup files are kept: S3 and FTP through OpenDAL, SFTP through OpenSSH, and
-//! SMB through `smbclient`. Nothing is visible under its final name before it is whole,
-//! except on S3 multipart (invisible until completed) and FTP (removed when it fails).
+//! SMB through `smbclient`; FTPS uploads have their own module. Nothing is visible under
+//! its final name before it is whole, except on S3 multipart (invisible until completed)
+//! and plain FTP (removed when it fails).
 
 use std::{
     io::{self, Write},
@@ -20,14 +21,19 @@ use tokio::{
     runtime::Handle,
 };
 
-use crate::{Result, progress::Progress, ssh};
+use crate::{Result, ftps, progress::Progress, ssh};
 
 /// Multipart size. S3 allows 10,000 parts, so files up to about 160 GB fit.
 const PART: usize = 16 * 1024 * 1024;
 
 pub enum Store {
-    /// S3 and FTP.
+    /// S3 and plain FTP.
     Object(Operator),
+    Ftps {
+        operator: Operator,
+        login: Arc<ftps::Login>,
+        folder: String,
+    },
     Sftp {
         session: Arc<SftpSession>,
         folder: String,
@@ -122,7 +128,20 @@ pub async fn open(secret: &StorageSecret, id: &str) -> Result<Store> {
                 .root(&format!("/{}", folder(secret)?.trim_start_matches('/')))
                 .user(&secret.username)
                 .password(&secret.password);
-            Store::Object(Operator::new(builder)?)
+            let operator = Operator::new(builder)?;
+            if !secret.tls {
+                return Ok(Store::Object(operator));
+            }
+            Store::Ftps {
+                operator,
+                login: Arc::new(ftps::Login {
+                    host: secret.host.clone(),
+                    port: secret.port,
+                    username: secret.username.clone(),
+                    password: secret.password.clone(),
+                }),
+                folder: folder(secret)?.trim_start_matches('/').to_owned(),
+            }
         }
         "sftp" => {
             let login = SshSecret {
@@ -159,6 +178,11 @@ impl Store {
                 operator: operator.clone(),
                 key: key.to_owned(),
             },
+            Store::Ftps { login, folder, .. } => {
+                let path = format!("/{}", joined(folder, key));
+                let upload = ftps::Upload::start(login.clone(), &parents(&path), path).await?;
+                Sink::Ftps(Box::new(upload))
+            }
             Store::Sftp {
                 session, folder, ..
             } => {
@@ -213,7 +237,7 @@ impl Store {
         let mut hasher = Sha256::new();
         let mut child = None;
         let mut source: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match self {
-            Store::Object(operator) => {
+            Store::Object(operator) | Store::Ftps { operator, .. } => {
                 let mut stream = operator
                     .reader_with(key)
                     .chunk(PART)
@@ -272,7 +296,7 @@ impl Store {
     pub async fn delete(&self, key: &str) -> Result<()> {
         let key = safe(key)?;
         match self {
-            Store::Object(operator) => operator.delete(key).await?,
+            Store::Object(operator) | Store::Ftps { operator, .. } => operator.delete(key).await?,
             Store::Sftp {
                 session, folder, ..
             } => {
@@ -414,6 +438,7 @@ pub enum Sink {
         operator: Operator,
         key: String,
     },
+    Ftps(Box<ftps::Upload>),
     Sftp {
         session: Arc<SftpSession>,
         file: Box<russh_sftp::client::fs::File>,
@@ -432,6 +457,7 @@ impl Sink {
     pub async fn write(&mut self, data: Vec<u8>) -> Result<()> {
         match self {
             Sink::Object { writer, .. } => writer.write(data).await?,
+            Sink::Ftps(upload) => upload.write(&data).await?,
             Sink::Sftp { file, .. } => file.write_all(&data).await?,
             Sink::Smb { input, .. } => {
                 let input = input.as_mut().ok_or("the upload is closed")?;
@@ -450,6 +476,7 @@ impl Sink {
             Sink::Object { mut writer, .. } => {
                 writer.close().await?;
             }
+            Sink::Ftps(upload) => upload.commit().await?,
             Sink::Sftp {
                 session,
                 mut file,
@@ -491,6 +518,7 @@ impl Sink {
                     operator.delete(&key).await?;
                 }
             }
+            Sink::Ftps(upload) => upload.abort().await?,
             Sink::Sftp {
                 session,
                 mut file,

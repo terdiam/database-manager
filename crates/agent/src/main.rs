@@ -2,6 +2,7 @@ mod api;
 mod basebackup;
 mod binlog;
 mod engines;
+mod ftps;
 mod helper;
 mod manifest;
 mod oplog;

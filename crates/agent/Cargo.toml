@@ -18,9 +18,11 @@ redis = { version = "1", default-features = false, features = ["tls-rustls", "tl
 reqwest = { version = "0.13.5", features = ["json"] }
 russh-sftp = "4"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+rustls-native-certs = "0.8"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["raw_value"] }
 sha2 = "0.11.2"
+suppaftp = { version = "10.0.2", default-features = false, features = ["tokio-rustls-ring"] }
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["rt", "macros", "signal", "time", "sync", "io-util", "process"] }
 tracing = "0.1.44"
