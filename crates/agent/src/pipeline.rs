@@ -67,6 +67,7 @@ impl Running {
                 | "log dump"
                 | "log replay"
                 | "mongorestore"
+                | "base backup"
         ) {
             "info"
         } else {

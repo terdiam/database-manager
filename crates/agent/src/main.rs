@@ -1,4 +1,5 @@
 mod api;
+mod basebackup;
 mod binlog;
 mod engines;
 mod helper;

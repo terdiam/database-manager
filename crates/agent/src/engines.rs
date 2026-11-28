@@ -7,7 +7,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use dbm_shared::jobs::{DatabaseSecret, MONGO_ALL, SEARCH_ALL, valid_target};
+use dbm_shared::jobs::{DatabaseSecret, SEARCH_ALL, WHOLE, valid_target};
 use tempfile::{NamedTempFile, TempPath};
 
 use crate::{
@@ -104,7 +104,7 @@ const SSL_MODES: [&str; 6] = [
     "verify-full",
 ];
 
-fn postgres(program: &str, secret: &DatabaseSecret, database: &str) -> Result<Command> {
+pub fn postgres(program: &str, secret: &DatabaseSecret, database: &str) -> Result<Command> {
     if !SSL_MODES.contains(&secret.ssl_mode.as_str()) {
         return Err("unknown ssl mode".into());
     }
@@ -329,6 +329,14 @@ pub fn dump_increment(secret: &DatabaseSecret, files: &[String]) -> Result<Tool>
     Ok(Tool::new(command, "log dump"))
 }
 
+/// A physical backup of a whole PostgreSQL cluster. Its manifest is left in `keep`;
+/// `since` is the parent's manifest for an incremental one.
+pub fn dump_cluster(secret: &DatabaseSecret, keep: &Path, since: Option<&Path>) -> Result<Tool> {
+    let mut command = helper(helper::BASE_DUMP, secret, "", "")?;
+    command.env(helper::ARGS, serde_json::to_string(&(keep, since))?);
+    Ok(Tool::new(command, "base backup"))
+}
+
 /// MongoDB's incremental backup: the oplog between two positions.
 pub fn dump_oplog(secret: &DatabaseSecret, since: &str, to: &str) -> Result<Tool> {
     oplog::dump(secret, Timestamp::parse(since)?, Timestamp::parse(to)?)
@@ -411,7 +419,7 @@ pub fn dump(secret: &DatabaseSecret, name: &str, track: bool) -> Result<Tool> {
         "mongodb" => {
             let (mut command, file) = mongo("mongodump", secret)?;
             command.arg("--quiet").arg("--archive");
-            if name != MONGO_ALL {
+            if name != WHOLE {
                 command.arg(format!("--db={name}"));
             }
             Tool::holding(command, "mongodump", file)
@@ -483,15 +491,15 @@ pub fn restore(secret: &DatabaseSecret, name: &str, source: &str) -> Result<(Too
             if !valid_target("mongodb", source) {
                 return Err("the source database name is missing".into());
             }
-            if (source == MONGO_ALL) != (name == MONGO_ALL) {
+            if (source == WHOLE) != (name == WHOLE) {
                 return Err(
-                    format!("a backup of the whole instance is restored to {MONGO_ALL}").into(),
+                    format!("a backup of the whole instance is restored to {WHOLE}").into(),
                 );
             }
             let (mut command, file) = mongo("mongorestore", secret)?;
             // Not --quiet: it would also hide why a restore failed.
             command.args(["--archive", "--drop", "--stopOnError"]);
-            if source == MONGO_ALL {
+            if source == WHOLE {
                 // Accounts and the server's own records are the target's: replacing them
                 // would end the session that is restoring.
                 command

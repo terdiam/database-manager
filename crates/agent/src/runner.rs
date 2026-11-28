@@ -1,16 +1,16 @@
 //! Carries out one job.
 
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 use dbm_shared::{
     e2ee::{self, SecretContext},
-    jobs::{DatabaseSecret, Job, Sealed, SshSecret, StorageSecret, Task},
+    jobs::{DatabaseSecret, Job, Sealed, SshSecret, StorageSecret, Task, WHOLE},
 };
 use serde::de::DeserializeOwned;
 use tokio::{runtime::Handle, task};
 
 use crate::{
-    Result,
+    Result, basebackup,
     binlog::{self, Position},
     engines, manifest,
     oplog::{self, Timestamp},
@@ -103,6 +103,32 @@ impl Kept {
     }
 }
 
+/// Unpacks a cluster's chain beside the target, so the result moves into place at once.
+fn restore_cluster(
+    name: &str,
+    parts: Vec<(String, String, tempfile::NamedTempFile)>,
+    progress: &Progress,
+) -> Result<()> {
+    let root = basebackup::root()?;
+    let target = basebackup::target(&root, name)?;
+    let work = tempfile::Builder::new()
+        .prefix(".dbm-restore-")
+        .tempdir_in(&root)
+        .map_err(|e| format!("cannot write in DBM_PGDATA_ROOT: {e}"))?;
+    let mut folders = Vec::with_capacity(parts.len());
+    for (at, (compression, identity, file)) in parts.into_iter().enumerate() {
+        let folder = work.path().join(format!("part{at}"));
+        progress.log("info", format!("unpacking backup {} of the chain", at + 1));
+        let tool = basebackup::unpack(&folder)?;
+        pipeline::restore(tool, &compression, &identity, file.reopen()?, progress)?;
+        folders.push(folder);
+    }
+    progress.log("info", "building the data directory");
+    basebackup::combine(&folders, work.path(), &target)?;
+    progress.log("ok", format!("data directory ready in {name}"));
+    Ok(())
+}
+
 /// What a successful job hands back to the server.
 #[derive(Default)]
 pub struct Output {
@@ -119,6 +145,8 @@ enum Take {
     Logs(Vec<String>),
     /// MongoDB oplog entries between two positions.
     Oplog { since: String, to: String },
+    /// PostgreSQL blocks changed since the backup with this manifest.
+    Blocks(PathBuf),
 }
 
 /// Where a backup sits in the database's log.
@@ -133,12 +161,40 @@ struct Chain {
 }
 
 /// Looked up before the dump starts.
-fn chain(secret: &DatabaseSecret, name: &str, track: bool, since: Option<&str>) -> Result<Chain> {
+fn chain(
+    secret: &DatabaseSecret,
+    name: &str,
+    object_key: &str,
+    track: bool,
+    since: Option<&str>,
+) -> Result<Chain> {
     if !track && since.is_none() {
         return Ok(Chain::default());
     }
     if !dbm_shared::jobs::can_follow(&secret.engine, name) {
         return Err("this backup cannot be followed by incremental ones".into());
+    }
+    // A PostgreSQL position is the object whose manifest the next increment needs.
+    if secret.engine == "postgresql" {
+        let take = match since {
+            Some(parent) => {
+                let manifest = basebackup::manifest_path(parent)?;
+                if !manifest.is_file() {
+                    return Err(binlog::ChainBroken(
+                        "this agent no longer has the manifest of the last backup".into(),
+                    )
+                    .into());
+                }
+                Some(Take::Blocks(manifest))
+            }
+            None => None,
+        };
+        return Ok(Chain {
+            take,
+            from: since.map(Into::into),
+            to: Some(object_key.into()),
+            server: None,
+        });
     }
     let mongo = secret.engine == "mongodb";
     if let Some(since) = since {
@@ -263,9 +319,9 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
             let (store, _) = store(state, &destination).await?;
             let database = std::sync::Arc::new(database);
             let looked = database.clone();
-            let named = name.clone();
+            let (named, key) = (name.clone(), object_key.clone());
             let mut chain = task::spawn_blocking(move || {
-                chain(&looked, &named, track, since.as_deref()).map_err(Kept::from)
+                chain(&looked, &named, &key, track, since.as_deref()).map_err(Kept::from)
             })
             .await?
             .map_err(Kept::into_error)?;
@@ -273,13 +329,21 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
                 Some(_) => progress.log(
                     "info",
                     format!(
-                        "taking the log of {name} since the last backup, compression {compression}"
+                        "taking what changed in {name} since the last backup, compression {compression}"
                     ),
                 ),
                 None => progress.log("info", format!("dumping {name}, compression {compression}")),
             }
             let method = compression.clone();
             let take = chain.take.take();
+            // A whole PostgreSQL cluster: its manifest is kept only once the upload is.
+            let cluster = database.engine == "postgresql" && name == WHOLE;
+            let incremental = matches!(take, Some(Take::Blocks(_)));
+            let manifest = cluster
+                .then(|| basebackup::manifest_path(&object_key))
+                .transpose()?;
+            let unfinished = manifest.as_ref().map(|path| path.with_extension("part"));
+            let writes = unfinished.clone();
 
             let mut sink = store.sink(&object_key).await?;
             let handle = Handle::current();
@@ -289,7 +353,14 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
                 let tool = match &take {
                     Some(Take::Logs(files)) => engines::dump_increment(&database, files),
                     Some(Take::Oplog { since, to }) => engines::dump_oplog(&database, since, to),
-                    None => engines::dump(&database, &name, track),
+                    Some(Take::Blocks(parent)) => match &writes {
+                        Some(keep) => engines::dump_cluster(&database, keep, Some(parent)),
+                        None => Err("increments continue a whole cluster only".into()),
+                    },
+                    None => match &writes {
+                        Some(keep) => engines::dump_cluster(&database, keep, None),
+                        None => engines::dump(&database, &name, track),
+                    },
                 };
                 let result = tool
                     .and_then(|dump| {
@@ -326,6 +397,9 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
             match finished {
                 Ok(sha256) => {
                     sink.commit().await?;
+                    if let (Some(from), Some(to)) = (&unfinished, &manifest) {
+                        std::fs::rename(from, to)?;
+                    }
                     progress.log("ok", format!("stored {object_key}"));
                     let positions = chain
                         .to
@@ -351,6 +425,13 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
                         Ok(Ok(()))
                     ) {
                         progress.log("warn", "could not remove the unfinished upload");
+                    }
+                    if let Some(part) = &unfinished {
+                        let _ = std::fs::remove_file(part);
+                    }
+                    // The server can no longer build on the parent: say so, to start over.
+                    if incremental && basebackup::cannot_continue(&error) {
+                        return Err(binlog::ChainBroken(error).into());
                     }
                     Err(error.into())
                 }
@@ -408,6 +489,24 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
                 replays.push((link, key, file));
             }
 
+            // A whole cluster is written to a folder; no database is connected to.
+            let secret: DatabaseSecret = open_json(state, &sealed, "database")?;
+            if secret.engine == "postgresql" && source == WHOLE {
+                let shared = progress.clone();
+                blocking(move || {
+                    let mut parts = vec![(compression, identity, temporary)];
+                    parts.extend(
+                        replays
+                            .into_iter()
+                            .map(|(link, key, file)| (link.compression, key, file)),
+                    );
+                    restore_cluster(&name, parts, &shared).map_err(text)
+                })
+                .await?;
+                progress.log("ok", "restore completed");
+                return Ok(Output::default());
+            }
+
             let (database, _tunnel) = database(state, &sealed, ssh.as_ref(), &progress).await?;
             let file = temporary.reopen()?;
             let shared = progress.clone();
@@ -454,6 +553,8 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
             destination,
             object_key,
         } => {
+            // Nothing can continue from a backup that is gone.
+            let _ = basebackup::manifest_path(&object_key).map(std::fs::remove_file);
             store(state, &destination)
                 .await?
                 .0

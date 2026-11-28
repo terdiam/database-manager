@@ -25,10 +25,12 @@ export const targetField = (engine?: Engine) =>
 	: engine === 'redis' ? ({ label: 'field.databaseName', help: 'help.redisAll' } as const)
 	: search(engine) ? ({ label: 'field.indexName', help: 'help.indexName' } as const)
 	: engine === 'mongodb' ? ({ label: 'field.databaseName', help: 'help.mongoDatabase' } as const)
+	: engine === 'postgresql' ? ({ label: 'field.databaseName', help: 'help.pgDatabase' } as const)
 	: ({ label: 'field.databaseName', help: 'help.databaseName' } as const);
 
 /** Whether incremental backups can follow a full one; mirrors the server's rule. */
-export const canFollow = (engine: Engine, database: string) => engines[engine].incremental && (engine !== 'mongodb' || database === '_all');
+export const canFollow = (engine: Engine, database: string) =>
+	engines[engine].incremental && ((engine !== 'mongodb' && engine !== 'postgresql') || database === '_all');
 
 /** TLS choices. Only the SQL servers can fall back to plain text. */
 export const tlsModes = (engine: Engine) =>
@@ -38,7 +40,7 @@ export const tlsModes = (engine: Engine) =>
 export const loginOptional = (engine: Engine) => engine === 'mongodb' || engine === 'redis' || search(engine);
 
 export const engines: Record<Engine, { label: string; port: number; incremental: boolean }> = {
-	postgresql: { label: 'PostgreSQL', port: 5432, incremental: false },
+	postgresql: { label: 'PostgreSQL', port: 5432, incremental: true },
 	mysql: { label: 'MySQL', port: 3306, incremental: true },
 	mariadb: { label: 'MariaDB', port: 3306, incremental: true },
 	mongodb: { label: 'MongoDB', port: 27017, incremental: true },

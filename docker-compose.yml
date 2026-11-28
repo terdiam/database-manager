@@ -49,10 +49,13 @@ services:
       DBM_SERVER_FINGERPRINT: ${DBM_SERVER_FINGERPRINT:-}
       DBM_ALLOW_UNSIGNED_RESTORE: ${DBM_ALLOW_UNSIGNED_RESTORE:-false}
       DBM_SQLITE_ROOT: /sqlite
+      DBM_PGDATA_ROOT: /pgdata
     volumes:
       - agent:/data
       # SQLite files the agent may back up and restore; a host folder or the named volume.
       - ${DBM_SQLITE_DIR:-sqlite}:/sqlite
+      # PostgreSQL cluster restores are written here as data directories.
+      - ${DBM_PGDATA_DIR:-pgdata}:/pgdata
     depends_on: [server]
     restart: on-failure
 
@@ -80,4 +83,5 @@ volumes:
   db:
   agent:
   sqlite:
+  pgdata:
   hanoey:

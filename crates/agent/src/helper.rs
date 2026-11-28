@@ -1,11 +1,11 @@
 //! The agent as its own dump or restore tool: stdin and stdout carry the data, stderr the
 //! messages for the job log, the exit status says whether it worked.
 
-use std::{env, process::ExitCode};
+use std::{env, path::PathBuf, process::ExitCode};
 
 use dbm_shared::jobs::DatabaseSecret;
 
-use crate::{Result, binlog, oplog, redis, search};
+use crate::{Result, basebackup, binlog, oplog, redis, search};
 
 pub const TASK: &str = "DBM_HELPER";
 pub const SECRET: &str = "DBM_HELPER_SECRET";
@@ -21,6 +21,7 @@ pub const SEARCH_RESTORE: &str = "search-restore";
 pub const BINLOG_DUMP: &str = "binlog-dump";
 pub const BINLOG_APPLY: &str = "binlog-apply";
 pub const OPLOG_APPLY: &str = "oplog-apply";
+pub const BASE_DUMP: &str = "base-dump";
 
 fn task(task: &str) -> Result<()> {
     let secret: DatabaseSecret = serde_json::from_str(&env::var(SECRET)?)?;
@@ -53,6 +54,10 @@ fn task(task: &str) -> Result<()> {
         OPLOG_APPLY => {
             let [_, _, until]: [String; 3] = serde_json::from_str(&env::var(ARGS)?)?;
             oplog::apply(&secret, &until, std::io::stdin().lock())
+        }
+        BASE_DUMP => {
+            let (keep, since): (PathBuf, Option<PathBuf>) = serde_json::from_str(&env::var(ARGS)?)?;
+            basebackup::dump(&secret, &keep, since.as_deref(), std::io::stdout().lock())
         }
         other => Err(format!("unknown helper {other}").into()),
     }

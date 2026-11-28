@@ -50,13 +50,14 @@ pub fn dump_extension(engine: &str) -> &'static str {
     }
 }
 
-/// A MongoDB backup of the whole instance. Only that one can be followed by incrementals:
-/// the oplog it continues with cannot be replayed for one database.
-pub const MONGO_ALL: &str = "_all";
+/// A backup of a whole MongoDB instance or PostgreSQL cluster. Only that one can be
+/// followed by incrementals: what they continue with cannot be applied to one database.
+pub const WHOLE: &str = "_all";
 
 /// Backups that incremental ones can follow.
 pub fn can_follow(engine: &str, database: &str) -> bool {
-    matches!(engine, "mysql" | "mariadb") || (engine == "mongodb" && database == MONGO_ALL)
+    matches!(engine, "mysql" | "mariadb")
+        || (matches!(engine, "mongodb" | "postgresql") && database == WHOLE)
 }
 
 /// What a job may name: a database, for SQLite a file name without a path, for Redis the

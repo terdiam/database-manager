@@ -4,7 +4,7 @@ use axum::{
     Json,
     extract::{Path, Query, State},
 };
-use dbm_shared::jobs::{MONGO_ALL, dump_extension, extension, valid_target};
+use dbm_shared::jobs::{WHOLE, dump_extension, extension, valid_target};
 use serde::{Deserialize, Serialize};
 use sqlx::{Postgres, QueryBuilder};
 use time::OffsetDateTime;
@@ -111,6 +111,8 @@ pub async fn queue_backup(app: &AppState, id: Uuid, by: &str) -> Result<(Uuid, S
         "{}/{database}/{stamp}-{unique}{}{}.age",
         slug(&server),
         match (parent, engine.as_str()) {
+            // A whole PostgreSQL cluster and its increments are tar streams.
+            (_, "postgresql") if database == WHOLE => ".tar",
             (None, _) => dump_extension(&engine),
             (Some(_), "mongodb") => ".oplog",
             (Some(_), _) => ".binlog",
@@ -277,8 +279,13 @@ pub async fn restore(
         return Err(Error::Invalid("database_name"));
     }
     // A whole instance goes back as one; a single database cannot become an instance.
-    if engine == "mongodb" && (source == MONGO_ALL) != (body.database_name == MONGO_ALL) {
+    if engine == "mongodb" && (source == WHOLE) != (body.database_name == WHOLE) {
         return Err(Error::Invalid("instance"));
+    }
+    // A PostgreSQL cluster is written to a folder as it was at the snapshot: there is no
+    // log to stop in the middle of.
+    if engine == "postgresql" && body.until.is_some() {
+        return Err(Error::Invalid("until"));
     }
     if let Some(until) = body.until {
         // Between the chain's full backup and the chosen increment.

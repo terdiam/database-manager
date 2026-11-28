@@ -51,6 +51,9 @@
 		return new Date(at.getTime() - at.getTimezoneOffset() * 60_000).toISOString().slice(0, 19);
 	}
 
+	// A whole PostgreSQL cluster is written to a folder on the agent, not into a server.
+	const cluster = $derived(snapshot?.engine === 'postgresql' && snapshot.database_name === '_all');
+
 	// Restores run on the agent that can open the destination's credentials.
 	const targets = $derived(servers.filter((s) => s.agent_id === snapshot?.agent_id && s.engine === snapshot?.engine));
 	const targetName = $derived(servers.find((s) => s.id === target)?.name ?? '');
@@ -63,6 +66,7 @@
 				snapshot = s;
 				servers = list;
 				database =
+					s.engine === 'postgresql' && s.database_name === '_all' ? `restore-${s.created_at.slice(0, 10)}` :
 					// A whole instance or all indices go back under their own names.
 					s.engine === 'redis' || s.database_name === '_all' ? s.database_name
 					: s.engine === 'sqlite' ? `restore-${s.database_name}`.slice(0, 63)
@@ -135,8 +139,8 @@
 			<SplitTitle text={t('restore.title')} class="mb-1 font-semibold" />
 			<form onsubmit={(e) => { e.preventDefault(); restoreConfirm?.open(); }}>
 				<FormField label={t('restore.server')}>{#snippet children(a)}<Select {...a} required bind:value={target} placeholder={t('restore.choose')} options={targets.map((s) => ({ value: s.id, label: s.name, brand: s.engine, description: s.engine === 'sqlite' ? `/${s.host}` : `${s.host}:${s.port}` }))} />{/snippet}</FormField>
-				<FormField label={t(snapshot.engine === 'redis' || snapshot.engine === 'elasticsearch' || snapshot.engine === 'opensearch' ? targetField(snapshot.engine).label : 'restore.database')} help={t(snapshot.engine === 'redis' ? 'restore.redisHint' : snapshot.engine === 'mongodb' && snapshot.database_name === '_all' ? 'restore.instanceHint' : snapshot.database_name === '_all' ? 'restore.allHint' : snapshot.parent_id ? 'restore.chainHint' : 'restore.createHint')}>{#snippet children(a)}<input {...a} class="input min-h-11" maxlength="63" pattern={namePattern(snapshot?.engine)} readonly={snapshot?.engine === 'redis' || snapshot?.database_name === '_all'} required bind:value={database} />{/snippet}</FormField>
-				{#if snapshot.parent_id && snapshot.chain_started_at}
+				<FormField label={t(cluster ? 'restore.folder' : snapshot.engine === 'redis' || snapshot.engine === 'elasticsearch' || snapshot.engine === 'opensearch' ? targetField(snapshot.engine).label : 'restore.database')} help={t(cluster ? 'restore.pgPhysical' : snapshot.engine === 'redis' ? 'restore.redisHint' : snapshot.engine === 'mongodb' && snapshot.database_name === '_all' ? 'restore.instanceHint' : snapshot.database_name === '_all' ? 'restore.allHint' : snapshot.parent_id ? 'restore.chainHint' : 'restore.createHint')}>{#snippet children(a)}<input {...a} class="input min-h-11" maxlength="63" pattern={namePattern(snapshot?.engine)} readonly={snapshot?.engine === 'redis' || snapshot?.database_name === '_all'} required bind:value={database} />{/snippet}</FormField>
+				{#if snapshot.parent_id && snapshot.chain_started_at && snapshot.engine !== 'postgresql'}
 					<FormField label={t('restore.until')} help={t('restore.untilHint')}>{#snippet children(a)}<input {...a} class="input min-h-11" type="datetime-local" step="1" min={localInput(snapshot!.chain_started_at!, 1)} max={localInput(snapshot!.created_at)} bind:value={until} />{/snippet}</FormField>
 				{/if}
 				<button type="submit" class="btn btn-primary">{t('restore.start')}</button>
@@ -144,7 +148,7 @@
 		</section>
 	{/if}
 
-	<ConfirmDialog bind:this={restoreConfirm} title={t('restore.title')} message={t(snapshot?.engine === 'redis' ? 'restore.redisWarning' : snapshot?.engine === 'mongodb' && database === '_all' ? 'restore.instanceWarning' : database === '_all' ? 'restore.allWarning' : snapshot?.parent_id ? 'restore.chainWarning' : 'restore.warning', { database, server: targetName })} confirmLabel={t('restore.start')} expect={database}
+	<ConfirmDialog bind:this={restoreConfirm} title={t('restore.title')} message={t(cluster ? 'restore.folderWarning' : snapshot?.engine === 'redis' ? 'restore.redisWarning' : snapshot?.engine === 'mongodb' && database === '_all' ? 'restore.instanceWarning' : database === '_all' ? 'restore.allWarning' : snapshot?.parent_id ? 'restore.chainWarning' : 'restore.warning', { database, server: targetName })} confirmLabel={t('restore.start')} expect={database}
 		onconfirm={() => queue('POST', `/snapshots/${snapshot!.id}/restore`, { server_id: target, database_name: database, until: until ? new Date(until).toISOString() : undefined })} />
 	<ConfirmDialog bind:this={deleteConfirm} title={t('action.delete')} message={t('snapshots.confirmDelete')} confirmLabel={t('action.delete')} onconfirm={() => queue('DELETE', `/snapshots/${snapshot!.id}`)} />
 {/if}

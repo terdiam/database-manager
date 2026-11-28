@@ -34,6 +34,11 @@ FROM mongo:8.0 AS mongo-tools
 # Same Debian release as the agent image; the newest Redis 8 is only built for it.
 FROM redis:8-trixie AS redis-tools
 
+# Combining a PostgreSQL incremental needs the tool of the server's own major version.
+FROM postgres:19-trixie AS postgres-tools
+RUN mkdir -p /etc/postgresql-common && echo 'create_main_cluster = false' > /etc/postgresql-common/createcluster.conf \
+    && apt-get update && apt-get install -y --no-install-recommends postgresql-17 postgresql-18
+
 # The agent needs the database client tools: a dump tool must be at least as new as the
 # databases it backs up.
 FROM postgres:19-trixie AS agent
@@ -43,15 +48,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # MySQL's own tools in /usr/local/bin come before MariaDB's compatibility names.
 COPY --from=mysql-tools /usr/bin/mysql /usr/bin/mysqldump /usr/bin/mysqlbinlog /usr/local/bin/
 COPY --from=mongo-tools /usr/bin/mongodump /usr/bin/mongorestore /usr/local/bin/
+COPY --from=postgres-tools /usr/lib/postgresql/17/bin/pg_combinebackup /usr/lib/postgresql/17/bin/
+COPY --from=postgres-tools /usr/lib/postgresql/18/bin/pg_combinebackup /usr/lib/postgresql/18/bin/
 # redis-server loads a snapshot during a restore; redis-cli takes one.
 COPY --from=redis-tools /usr/local/bin/redis-server /usr/local/bin/redis-cli /usr/local/bin/
 # Fails the build if a copied tool cannot start here.
 RUN mysql --version && mysqldump --version && mysqlbinlog --version && mariadb-binlog --version && mongodump --version && mongorestore --version \
     && mariadb-dump --version && sqlite3 --version && ssh -V && smbclient --version \
-    && redis-server --version && redis-cli --version
+    && redis-server --version && redis-cli --version \
+    && for v in 17 18 19; do /usr/lib/postgresql/$v/bin/pg_combinebackup --version; done
 RUN useradd --system --uid 10001 --create-home dbm
 COPY --from=build /app/target/release/dbm-agent /usr/local/bin/
-RUN mkdir /data /sqlite && chown dbm /data /sqlite
+RUN mkdir /data /sqlite /pgdata && chown dbm /data /sqlite /pgdata
 USER dbm
 ENV DBM_STATE_FILE=/data/agent-state
 ENTRYPOINT []

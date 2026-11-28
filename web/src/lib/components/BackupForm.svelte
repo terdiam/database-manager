@@ -116,7 +116,7 @@
 		{#if bases.length}
 			<FormField label={t('backups.base')} help={t('backups.baseHelp')}>{#snippet children(a)}<Select {...a} required bind:value={baseId} options={bases.map((b) => ({ value: b.id, label: b.name, brand: engineOf(b), description: `${b.server} / ${b.database_name}` }))} />{/snippet}</FormField>
 			<p class="mb-3 text-sm text-dim">{t('backups.inherits')}</p>
-			{#if baseEngine === 'mysql' || baseEngine === 'mariadb' || baseEngine === 'mongodb'}<p class="mb-3 rounded-lg bg-muted p-3 text-sm">{t(`requirement.${baseEngine}`)}</p>{/if}
+			{#if baseEngine === 'mysql' || baseEngine === 'mariadb' || baseEngine === 'mongodb' || baseEngine === 'postgresql'}<p class="mb-3 rounded-lg bg-muted p-3 text-sm">{t(`requirement.${baseEngine}`)}</p>{/if}
 		{:else}
 			<p class="mb-3 text-sm text-warn" role="alert">{t('backups.noBase')}</p>
 		{/if}

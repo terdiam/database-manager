@@ -2268,6 +2268,93 @@ async fn only_a_whole_mongodb_instance_has_incrementals(db: PgPool) {
 }
 
 #[sqlx::test]
+async fn a_whole_postgresql_cluster_is_followed_and_restored_to_a_folder(db: PgPool) {
+    let app = router(db.clone());
+    let cookie = admin(&app).await;
+    let agent = enroll(&app, &cookie, "a1").await;
+    // `nightly` is a single database of this server: nothing can follow it.
+    let (server, destination, one) = add_resources(&app, &cookie, &agent).await;
+    let follow = |name: &str, base: &str| json!({ "name": name, "base_id": base });
+    let reply = call(
+        &app,
+        "POST",
+        "/api/backups",
+        Some(&cookie),
+        Some(follow("a", &one)),
+    )
+    .await;
+    assert_eq!(reply.body["error"], "base");
+    let body = json!({ "name": "cluster", "server_id": server, "database_name": "_all",
+        "destination_id": destination, "compression": "zstd", "level": 3 });
+    let reply = call(&app, "POST", "/api/backups", Some(&cookie), Some(body)).await;
+    assert_eq!(reply.status, StatusCode::CREATED);
+    let whole = entry_id(&app, &cookie, "cluster").await;
+    let reply = call(
+        &app,
+        "POST",
+        "/api/backups",
+        Some(&cookie),
+        Some(follow("inc", &whole)),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::CREATED);
+
+    let inc = entry_id(&app, &cookie, "inc").await;
+    let task = run_and_finish(
+        &app,
+        &cookie,
+        &agent,
+        &inc,
+        json!({ "manifest": "m", "position_to": "k1" }),
+    )
+    .await;
+    assert!(
+        task["object_key"]
+            .as_str()
+            .unwrap()
+            .ends_with(".tar.zst.age")
+    );
+    let task = run_and_finish(
+        &app,
+        &cookie,
+        &agent,
+        &inc,
+        json!({ "manifest": "n", "position_from": "k1", "position_to": "k2" }),
+    )
+    .await;
+    assert_eq!(task["since"], "k1");
+
+    let snapshots = call(&app, "GET", "/api/snapshots", Some(&cookie), None).await;
+    let increment = snapshots.body["items"][0].clone();
+    let restore = format!(
+        "/api/snapshots/{}/restore",
+        increment["id"].as_str().unwrap()
+    );
+    // A cluster has no log to stop in the middle of.
+    let timed = json!({ "server_id": server, "database_name": "restore-1", "until": increment["created_at"] });
+    assert_eq!(
+        call(&app, "POST", &restore, Some(&cookie), Some(timed))
+            .await
+            .body["error"],
+        "until"
+    );
+    let escaping = json!({ "server_id": server, "database_name": "../x" });
+    assert_eq!(
+        call(&app, "POST", &restore, Some(&cookie), Some(escaping))
+            .await
+            .body["error"],
+        "database_name"
+    );
+    let folder = json!({ "server_id": server, "database_name": "restore-1" });
+    assert_eq!(
+        call(&app, "POST", &restore, Some(&cookie), Some(folder))
+            .await
+            .status,
+        StatusCode::OK
+    );
+}
+
+#[sqlx::test]
 async fn redis_and_search_engines_name_what_they_back_up(db: PgPool) {
     let app = router(db.clone());
     let cookie = admin(&app).await;

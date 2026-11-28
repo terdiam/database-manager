@@ -28,12 +28,11 @@ Done:
 - [x] SSH tunnels to databases
 - [x] SFTP, FTP/FTPS and Samba storage
 - [x] Redis, Elasticsearch and OpenSearch
-- [x] Incremental backups for MySQL, MariaDB and MongoDB, restore to a point in time
+- [x] Incremental backups for MySQL, MariaDB, MongoDB and PostgreSQL
 
 Planned:
 
 - [ ] Google Drive storage
-- [ ] Incremental backups for PostgreSQL
 
 ## Run
 
@@ -94,6 +93,13 @@ For MongoDB the full backup takes the whole instance (database name `_all`) from
 set, and the incremental ones keep its oplog. Restoring writes every database back but
 leaves the target's accounts alone; restore an incremental snapshot to get a single moment.
 
+For PostgreSQL 17, 18 or 19 the full backup `_all` is a physical copy of the whole cluster.
+The server needs `summarize_wal=on`, and the user the `REPLICATION` attribute with a
+replication line in `pg_hba.conf`. Restoring writes a data directory into the agent's restore
+folder (`DBM_PGDATA_DIR`, or the Docker volume); give it to the `postgres` user and start a
+server of the same major version on it. Only one tablespace is supported. MySQL, MariaDB and
+MongoDB can also restore to a point in time.
+
 The MySQL and MariaDB incremental files hold the binary log of the whole server. Schema changes made across
 databases while using the backed up one are replayed too.
 
@@ -134,6 +140,7 @@ All settings are in `.env`, see [.env.example](.env.example).
 | `DBM_TURNSTILE_HOSTNAMES` | Allowed hostnames, for example `localhost` |
 | `DBM_COOKIE_SECURE` | `false` only for plain HTTP on a trusted machine |
 | `DBM_SQLITE_DIR` | Host folder with SQLite files for the agent |
+| `DBM_PGDATA_DIR` | Host folder for PostgreSQL cluster restores |
 | `DBM_ALLOW_UNSIGNED_RESTORE` | Agent: `true` to restore backups made before signing existed |
 
 ## Reset password
