@@ -12,7 +12,9 @@ use tokio::{runtime::Handle, task};
 use crate::{
     Result,
     binlog::{self, Position},
-    engines, manifest, pipeline,
+    engines, manifest,
+    oplog::{self, Timestamp},
+    pipeline,
     progress::Progress,
     ssh::Tunnel,
     state::State,
@@ -111,33 +113,59 @@ pub struct Output {
     pub position_to: Option<String>,
 }
 
+/// What an incremental backup takes instead of a dump.
+enum Take {
+    /// MySQL and MariaDB binary log files.
+    Logs(Vec<String>),
+    /// MongoDB oplog entries between two positions.
+    Oplog { since: String, to: String },
+}
+
 /// Where a backup sits in the database's log.
 #[derive(Default)]
 struct Chain {
-    /// Log files to take, for an incremental backup; a full one dumps the database.
-    files: Option<Vec<String>>,
+    /// Set for an incremental backup; a full one dumps the database.
+    take: Option<Take>,
     from: Option<String>,
     to: Option<String>,
-    /// The server a full backup is dumped from.
+    /// The server a full MySQL backup is dumped from; its position is read from the dump.
     server: Option<String>,
 }
 
 /// Looked up before the dump starts.
-fn chain(secret: &DatabaseSecret, track: bool, since: Option<&str>) -> Result<Chain> {
+fn chain(secret: &DatabaseSecret, name: &str, track: bool, since: Option<&str>) -> Result<Chain> {
+    if !track && since.is_none() {
+        return Ok(Chain::default());
+    }
+    if !dbm_shared::jobs::can_follow(&secret.engine, name) {
+        return Err("this backup cannot be followed by incremental ones".into());
+    }
+    let mongo = secret.engine == "mongodb";
     if let Some(since) = since {
-        let span = binlog::span(secret, &Position::parse(since)?)?;
+        let (take, to) = if mongo {
+            let to = oplog::span(secret, Timestamp::parse(since)?)?.to_string();
+            let take = Take::Oplog {
+                since: since.into(),
+                to: to.clone(),
+            };
+            (take, to)
+        } else {
+            let span = binlog::span(secret, &Position::parse(since)?)?;
+            (Take::Logs(span.files), span.to.to_string())
+        };
         return Ok(Chain {
-            files: Some(span.files),
+            take: Some(take),
             from: Some(since.into()),
-            to: Some(span.to.to_string()),
+            to: Some(to),
             server: None,
         });
     }
-    if !track {
-        return Ok(Chain::default());
-    }
-    if !dbm_shared::jobs::supports_incremental(&secret.engine) {
-        return Err("this engine has no incremental backups".into());
+    if mongo {
+        // Replaying an entry twice changes nothing, so starting before the dump is safe.
+        return Ok(Chain {
+            to: Some(oplog::current(secret)?.to_string()),
+            ..Chain::default()
+        });
     }
     binlog::check(secret)?;
     Ok(Chain {
@@ -235,33 +263,33 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
             let (store, _) = store(state, &destination).await?;
             let database = std::sync::Arc::new(database);
             let looked = database.clone();
+            let named = name.clone();
             let mut chain = task::spawn_blocking(move || {
-                chain(&looked, track, since.as_deref()).map_err(Kept::from)
+                chain(&looked, &named, track, since.as_deref()).map_err(Kept::from)
             })
             .await?
             .map_err(Kept::into_error)?;
-            match &chain.files {
-                Some(files) => progress.log(
+            match &chain.take {
+                Some(_) => progress.log(
                     "info",
                     format!(
-                        "taking {} log file(s) of {name}, compression {compression}",
-                        files.len()
+                        "taking the log of {name} since the last backup, compression {compression}"
                     ),
                 ),
                 None => progress.log("info", format!("dumping {name}, compression {compression}")),
             }
             let method = compression.clone();
-            let files = chain.files.take();
-            let tracking = chain.server.is_some();
+            let take = chain.take.take();
 
             let mut sink = store.sink(&object_key).await?;
             let handle = Handle::current();
             let shared = progress.clone();
             // The pipeline blocks, so it gets its own thread and the reports keep flowing.
             let (sink, result) = task::spawn_blocking(move || {
-                let tool = match &files {
-                    Some(files) => engines::dump_increment(&database, files),
-                    None => engines::dump(&database, &name, tracking),
+                let tool = match &take {
+                    Some(Take::Logs(files)) => engines::dump_increment(&database, files),
+                    Some(Take::Oplog { since, to }) => engines::dump_oplog(&database, since, to),
+                    None => engines::dump(&database, &name, track),
                 };
                 let result = tool
                     .and_then(|dump| {
@@ -384,7 +412,8 @@ pub async fn run(state: &State, job: Job, progress: Progress) -> Result<Output> 
             let file = temporary.reopen()?;
             let shared = progress.clone();
             blocking(move || {
-                if !replays.is_empty() {
+                // MongoDB replaces what the backup holds; replaying SQL needs a clean start.
+                if !replays.is_empty() && database.engine != "mongodb" {
                     engines::require_empty(&database, &name)
                         // A database that does not exist yet is as empty as it gets.
                         .map_err(text)?;

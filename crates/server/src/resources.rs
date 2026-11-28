@@ -7,7 +7,7 @@ use axum::{
 };
 use dbm_shared::{
     e2ee,
-    jobs::{COMPRESSIONS, ENGINES, supports_incremental, valid_target},
+    jobs::{COMPRESSIONS, ENGINES, can_follow, valid_target},
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -703,15 +703,15 @@ async fn save_increment(
     id: Option<Uuid>,
 ) -> Result<String, Error> {
     let name = named(&body.name, "name")?;
-    let (engine, unit, nested): (String, Option<String>, bool) = sqlx::query_as(
-        "SELECT s.engine, c.retention_unit, c.base_id IS NOT NULL FROM backup_configs c
+    let (engine, database, unit, nested): (String, String, Option<String>, bool) = sqlx::query_as(
+        "SELECT s.engine, c.database_name, c.retention_unit, c.base_id IS NOT NULL FROM backup_configs c
          JOIN database_servers s ON s.id = c.server_id WHERE c.id = $1",
     )
     .bind(body.base_id)
     .fetch_optional(&app.db)
     .await?
     .ok_or(Error::Invalid("base"))?;
-    if nested || !supports_incremental(&engine) {
+    if nested || !can_follow(&engine, &database) {
         return Err(Error::Invalid("base"));
     }
     // Chains expire as a whole, which rotation by day, week and month cannot express.
@@ -869,7 +869,7 @@ pub async fn update_backup(
                 .bind(body.server_id)
                 .fetch_one(&app.db)
                 .await?;
-        if !supports_incremental(&engine) {
+        if !can_follow(&engine, &body.database_name) {
             return Err(Error::Invalid("base"));
         }
         if body.plan.retention_unit.as_deref() == Some("gfs") {

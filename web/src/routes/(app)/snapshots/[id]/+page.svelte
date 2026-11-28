@@ -135,7 +135,7 @@
 			<SplitTitle text={t('restore.title')} class="mb-1 font-semibold" />
 			<form onsubmit={(e) => { e.preventDefault(); restoreConfirm?.open(); }}>
 				<FormField label={t('restore.server')}>{#snippet children(a)}<Select {...a} required bind:value={target} placeholder={t('restore.choose')} options={targets.map((s) => ({ value: s.id, label: s.name, brand: s.engine, description: s.engine === 'sqlite' ? `/${s.host}` : `${s.host}:${s.port}` }))} />{/snippet}</FormField>
-				<FormField label={t(snapshot.engine === 'redis' || snapshot.engine === 'elasticsearch' || snapshot.engine === 'opensearch' ? targetField(snapshot.engine).label : 'restore.database')} help={t(snapshot.engine === 'redis' ? 'restore.redisHint' : snapshot.database_name === '_all' ? 'restore.allHint' : snapshot.parent_id ? 'restore.chainHint' : 'restore.createHint')}>{#snippet children(a)}<input {...a} class="input min-h-11" maxlength="63" pattern={namePattern(snapshot?.engine)} readonly={snapshot?.engine === 'redis' || snapshot?.database_name === '_all'} required bind:value={database} />{/snippet}</FormField>
+				<FormField label={t(snapshot.engine === 'redis' || snapshot.engine === 'elasticsearch' || snapshot.engine === 'opensearch' ? targetField(snapshot.engine).label : 'restore.database')} help={t(snapshot.engine === 'redis' ? 'restore.redisHint' : snapshot.engine === 'mongodb' && snapshot.database_name === '_all' ? 'restore.instanceHint' : snapshot.database_name === '_all' ? 'restore.allHint' : snapshot.parent_id ? 'restore.chainHint' : 'restore.createHint')}>{#snippet children(a)}<input {...a} class="input min-h-11" maxlength="63" pattern={namePattern(snapshot?.engine)} readonly={snapshot?.engine === 'redis' || snapshot?.database_name === '_all'} required bind:value={database} />{/snippet}</FormField>
 				{#if snapshot.parent_id && snapshot.chain_started_at}
 					<FormField label={t('restore.until')} help={t('restore.untilHint')}>{#snippet children(a)}<input {...a} class="input min-h-11" type="datetime-local" step="1" min={localInput(snapshot!.chain_started_at!, 1)} max={localInput(snapshot!.created_at)} bind:value={until} />{/snippet}</FormField>
 				{/if}
@@ -144,7 +144,7 @@
 		</section>
 	{/if}
 
-	<ConfirmDialog bind:this={restoreConfirm} title={t('restore.title')} message={t(snapshot?.engine === 'redis' ? 'restore.redisWarning' : database === '_all' ? 'restore.allWarning' : snapshot?.parent_id ? 'restore.chainWarning' : 'restore.warning', { database, server: targetName })} confirmLabel={t('restore.start')} expect={database}
+	<ConfirmDialog bind:this={restoreConfirm} title={t('restore.title')} message={t(snapshot?.engine === 'redis' ? 'restore.redisWarning' : snapshot?.engine === 'mongodb' && database === '_all' ? 'restore.instanceWarning' : database === '_all' ? 'restore.allWarning' : snapshot?.parent_id ? 'restore.chainWarning' : 'restore.warning', { database, server: targetName })} confirmLabel={t('restore.start')} expect={database}
 		onconfirm={() => queue('POST', `/snapshots/${snapshot!.id}/restore`, { server_id: target, database_name: database, until: until ? new Date(until).toISOString() : undefined })} />
 	<ConfirmDialog bind:this={deleteConfirm} title={t('action.delete')} message={t('snapshots.confirmDelete')} confirmLabel={t('action.delete')} onconfirm={() => queue('DELETE', `/snapshots/${snapshot!.id}`)} />
 {/if}

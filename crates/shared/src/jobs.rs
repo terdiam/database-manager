@@ -50,9 +50,13 @@ pub fn dump_extension(engine: &str) -> &'static str {
     }
 }
 
-/// Engines whose backups can be followed by incremental ones.
-pub fn supports_incremental(engine: &str) -> bool {
-    matches!(engine, "mysql" | "mariadb")
+/// A MongoDB backup of the whole instance. Only that one can be followed by incrementals:
+/// the oplog it continues with cannot be replayed for one database.
+pub const MONGO_ALL: &str = "_all";
+
+/// Backups that incremental ones can follow.
+pub fn can_follow(engine: &str, database: &str) -> bool {
+    matches!(engine, "mysql" | "mariadb") || (engine == "mongodb" && database == MONGO_ALL)
 }
 
 /// What a job may name: a database, for SQLite a file name without a path, for Redis the

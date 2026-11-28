@@ -2183,6 +2183,91 @@ async fn increments_continue_a_chain_that_restores_and_expires_as_a_whole(db: Pg
 }
 
 #[sqlx::test]
+async fn only_a_whole_mongodb_instance_has_incrementals(db: PgPool) {
+    let app = router(db.clone());
+    let cookie = admin(&app).await;
+    let agent = enroll(&app, &cookie, "a1").await;
+    let (_, destination, _) = add_resources(&app, &cookie, &agent).await;
+    let server = uuid::Uuid::new_v4().to_string();
+    let body = json!({ "id": server, "name": "mongo", "engine": "mongodb", "agent_id": agent.id, "host": "db",
+        "port": 27017, "username": "u", "secret": sealed_for(&agent, &server, "database", "{}") });
+    let reply = call(
+        &app,
+        "POST",
+        "/api/database-servers",
+        Some(&cookie),
+        Some(body),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::CREATED);
+    for (name, database) in [("one", "shop"), ("whole", "_all")] {
+        let body = json!({ "name": name, "server_id": server, "database_name": database,
+            "destination_id": destination, "compression": "zstd", "level": 3 });
+        let reply = call(&app, "POST", "/api/backups", Some(&cookie), Some(body)).await;
+        assert_eq!(reply.status, StatusCode::CREATED);
+    }
+    let follow = |name: &str, base: &str| json!({ "name": name, "base_id": base });
+    let one = entry_id(&app, &cookie, "one").await;
+    let reply = call(
+        &app,
+        "POST",
+        "/api/backups",
+        Some(&cookie),
+        Some(follow("a", &one)),
+    )
+    .await;
+    assert_eq!(reply.body["error"], "base");
+    let whole = entry_id(&app, &cookie, "whole").await;
+    let reply = call(
+        &app,
+        "POST",
+        "/api/backups",
+        Some(&cookie),
+        Some(follow("inc", &whole)),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::CREATED);
+
+    let inc = entry_id(&app, &cookie, "inc").await;
+    let task = run_and_finish(
+        &app,
+        &cookie,
+        &agent,
+        &inc,
+        json!({ "manifest": "m", "position_to": "100:1" }),
+    )
+    .await;
+    assert_eq!(task["track"], true);
+    let task = run_and_finish(
+        &app,
+        &cookie,
+        &agent,
+        &inc,
+        json!({ "manifest": "n", "position_from": "100:1", "position_to": "200:1" }),
+    )
+    .await;
+    assert!(
+        task["object_key"]
+            .as_str()
+            .unwrap()
+            .ends_with(".oplog.zst.age")
+    );
+
+    let snapshots = call(&app, "GET", "/api/snapshots", Some(&cookie), None).await;
+    let id = snapshots.body["items"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let restore = format!("/api/snapshots/{id}/restore");
+    let renamed = json!({ "server_id": server, "database_name": "copy" });
+    let reply = call(&app, "POST", &restore, Some(&cookie), Some(renamed)).await;
+    assert_eq!(reply.body["error"], "instance");
+    let whole = json!({ "server_id": server, "database_name": "_all" });
+    let reply = call(&app, "POST", &restore, Some(&cookie), Some(whole)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+}
+
+#[sqlx::test]
 async fn redis_and_search_engines_name_what_they_back_up(db: PgPool) {
     let app = router(db.clone());
     let cookie = admin(&app).await;

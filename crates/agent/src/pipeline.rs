@@ -60,7 +60,13 @@ impl Running {
         // These report their progress on stderr; for the other tools it means trouble.
         let usual = if matches!(
             self.name,
-            "redis dump" | "redis restore" | "index dump" | "index restore" | "log dump"
+            "redis dump"
+                | "redis restore"
+                | "index dump"
+                | "index restore"
+                | "log dump"
+                | "log replay"
+                | "mongorestore"
         ) {
             "info"
         } else {

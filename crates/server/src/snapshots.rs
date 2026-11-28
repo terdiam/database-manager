@@ -4,7 +4,7 @@ use axum::{
     Json,
     extract::{Path, Query, State},
 };
-use dbm_shared::jobs::{dump_extension, extension, valid_target};
+use dbm_shared::jobs::{MONGO_ALL, dump_extension, extension, valid_target};
 use serde::{Deserialize, Serialize};
 use sqlx::{Postgres, QueryBuilder};
 use time::OffsetDateTime;
@@ -110,10 +110,10 @@ pub async fn queue_backup(app: &AppState, id: Uuid, by: &str) -> Result<(Uuid, S
     let object_key = format!(
         "{}/{database}/{stamp}-{unique}{}{}.age",
         slug(&server),
-        if parent.is_some() {
-            ".binlog"
-        } else {
-            dump_extension(&engine)
+        match (parent, engine.as_str()) {
+            (None, _) => dump_extension(&engine),
+            (Some(_), "mongodb") => ".oplog",
+            (Some(_), _) => ".binlog",
         },
         extension(&compression)
     );
@@ -246,15 +246,20 @@ pub async fn restore(
     Json(body): Json<Restore>,
 ) -> Result<Json<Queued>, Error> {
     me.require_operator()?;
-    let (destination_id, source_agent, object_key, engine): (Uuid, Uuid, String, String) =
-        sqlx::query_as(
-            "SELECT s.destination_id, d.agent_id, s.object_key, s.engine
+    let (destination_id, source_agent, object_key, engine, source): (
+        Uuid,
+        Uuid,
+        String,
+        String,
+        String,
+    ) = sqlx::query_as(
+        "SELECT s.destination_id, d.agent_id, s.object_key, s.engine, s.database_name
          FROM snapshots s JOIN destinations d ON d.id = s.destination_id WHERE s.id = $1",
-        )
-        .bind(id)
-        .fetch_optional(&app.db)
-        .await?
-        .ok_or(Error::NotFound)?;
+    )
+    .bind(id)
+    .fetch_optional(&app.db)
+    .await?
+    .ok_or(Error::NotFound)?;
     let (server, agent, target_engine): (String, Uuid, String) =
         sqlx::query_as("SELECT name, agent_id, engine FROM database_servers WHERE id = $1")
             .bind(body.server_id)
@@ -270,6 +275,10 @@ pub async fn restore(
     }
     if !valid_target(&engine, &body.database_name) {
         return Err(Error::Invalid("database_name"));
+    }
+    // A whole instance goes back as one; a single database cannot become an instance.
+    if engine == "mongodb" && (source == MONGO_ALL) != (body.database_name == MONGO_ALL) {
+        return Err(Error::Invalid("instance"));
     }
     if let Some(until) = body.until {
         // Between the chain's full backup and the chosen increment.

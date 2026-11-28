@@ -7,10 +7,14 @@ use std::{
     process::{Command, Stdio},
 };
 
-use dbm_shared::jobs::{DatabaseSecret, SEARCH_ALL, valid_target};
+use dbm_shared::jobs::{DatabaseSecret, MONGO_ALL, SEARCH_ALL, valid_target};
 use tempfile::{NamedTempFile, TempPath};
 
-use crate::{Result, helper, redis, search};
+use crate::{
+    Result, helper,
+    oplog::{self, Timestamp},
+    redis, search,
+};
 
 /// A command ready to run, and what has to live or happen around it.
 pub struct Tool {
@@ -23,6 +27,14 @@ pub struct Tool {
 }
 
 impl Tool {
+    /// A command whose login is in a file that must outlive it.
+    pub fn holding(command: Command, name: &'static str, file: Option<NamedTempFile>) -> Self {
+        Self {
+            _secret_file: file,
+            ..Self::new(command, name)
+        }
+    }
+
     fn new(command: Command, name: &'static str) -> Self {
         Self {
             command,
@@ -179,7 +191,7 @@ pub fn mysql_query(secret: &DatabaseSecret, sql: &str) -> Result<String> {
 // ---------------------------------------------------------------- MongoDB
 
 /// The password goes into a file only the agent can read, never onto the command line.
-fn mongo(program: &str, secret: &DatabaseSecret) -> Result<(Command, Option<NamedTempFile>)> {
+pub fn mongo(program: &str, secret: &DatabaseSecret) -> Result<(Command, Option<NamedTempFile>)> {
     let tls: &[&str] = match secret.ssl_mode.as_str() {
         "disable" | "allow" | "prefer" => &[],
         "require" => &["--ssl", "--tlsInsecure"],
@@ -317,6 +329,11 @@ pub fn dump_increment(secret: &DatabaseSecret, files: &[String]) -> Result<Tool>
     Ok(Tool::new(command, "log dump"))
 }
 
+/// MongoDB's incremental backup: the oplog between two positions.
+pub fn dump_oplog(secret: &DatabaseSecret, since: &str, to: &str) -> Result<Tool> {
+    oplog::dump(secret, Timestamp::parse(since)?, Timestamp::parse(to)?)
+}
+
 /// Replays one incremental backup; it reads the file from standard input.
 pub fn restore_increment(
     secret: &DatabaseSecret,
@@ -327,7 +344,12 @@ pub fn restore_increment(
     until: &str,
 ) -> Result<Tool> {
     let name = checked(secret, name)?;
-    let mut command = helper(helper::BINLOG_APPLY, secret, name, source)?;
+    let task = if secret.engine == "mongodb" {
+        helper::OPLOG_APPLY
+    } else {
+        helper::BINLOG_APPLY
+    };
+    let mut command = helper(task, secret, name, source)?;
     command.env(helper::ARGS, serde_json::to_string(&[from, to, until])?);
     command.stdin(Stdio::piped()).stdout(Stdio::null());
     Ok(Tool::new(command, "log replay"))
@@ -388,14 +410,11 @@ pub fn dump(secret: &DatabaseSecret, name: &str, track: bool) -> Result<Tool> {
         }
         "mongodb" => {
             let (mut command, file) = mongo("mongodump", secret)?;
-            command
-                .arg("--quiet")
-                .arg(format!("--db={name}"))
-                .arg("--archive");
-            Tool {
-                _secret_file: file,
-                ..Tool::new(command, "mongodump")
+            command.arg("--quiet").arg("--archive");
+            if name != MONGO_ALL {
+                command.arg(format!("--db={name}"));
             }
+            Tool::holding(command, "mongodump", file)
         }
         "sqlite" => {
             let path = sqlite_path(&sqlite_root()?, &secret.host, name)?;
@@ -464,17 +483,27 @@ pub fn restore(secret: &DatabaseSecret, name: &str, source: &str) -> Result<(Too
             if !valid_target("mongodb", source) {
                 return Err("the source database name is missing".into());
             }
+            if (source == MONGO_ALL) != (name == MONGO_ALL) {
+                return Err(
+                    format!("a backup of the whole instance is restored to {MONGO_ALL}").into(),
+                );
+            }
             let (mut command, file) = mongo("mongorestore", secret)?;
-            command
-                .args(["--quiet", "--archive", "--drop", "--stopOnError"])
-                .arg(format!("--nsInclude={source}.*"))
-                .arg(format!("--nsFrom={source}.*"))
-                .arg(format!("--nsTo={name}.*"));
-            let tool = Tool {
-                _secret_file: file,
-                ..Tool::new(command, "mongorestore")
-            };
-            (tool, false)
+            // Not --quiet: it would also hide why a restore failed.
+            command.args(["--archive", "--drop", "--stopOnError"]);
+            if source == MONGO_ALL {
+                // Accounts and the server's own records are the target's: replacing them
+                // would end the session that is restoring.
+                command
+                    .arg("--nsExclude=admin.*")
+                    .arg("--nsExclude=config.*");
+            } else {
+                command
+                    .arg(format!("--nsInclude={source}.*"))
+                    .arg(format!("--nsFrom={source}.*"))
+                    .arg(format!("--nsTo={name}.*"));
+            }
+            (Tool::holding(command, "mongorestore", file), false)
         }
         "sqlite" => {
             let target = sqlite_path(&sqlite_root()?, &secret.host, name)?;

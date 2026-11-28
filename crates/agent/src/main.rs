@@ -3,6 +3,7 @@ mod binlog;
 mod engines;
 mod helper;
 mod manifest;
+mod oplog;
 mod pipeline;
 mod progress;
 mod redis;

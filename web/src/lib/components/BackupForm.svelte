@@ -4,7 +4,7 @@
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 	import { request, type Backup, type DbServer, type Destination } from '#lib/api/http.ts';
-	import { engines, namePattern, targetField } from '#lib/api/index.ts';
+	import { canFollow, namePattern, targetField } from '#lib/api/index.ts';
 	import { kinds } from '#lib/storage.ts';
 	import FormField from './FormField.svelte';
 	import PageHeader from './PageHeader.svelte';
@@ -47,7 +47,7 @@
 	const bases = $derived(
 		backups.filter((b) => {
 			const engine = engineOf(b);
-			return !b.base_id && b.retention_unit !== 'gfs' && !!engine && engines[engine].incremental;
+			return !b.base_id && b.retention_unit !== 'gfs' && !!engine && canFollow(engine, b.database_name);
 		})
 	);
 	const base = $derived(bases.find((b) => b.id === baseId));
@@ -116,7 +116,7 @@
 		{#if bases.length}
 			<FormField label={t('backups.base')} help={t('backups.baseHelp')}>{#snippet children(a)}<Select {...a} required bind:value={baseId} options={bases.map((b) => ({ value: b.id, label: b.name, brand: engineOf(b), description: `${b.server} / ${b.database_name}` }))} />{/snippet}</FormField>
 			<p class="mb-3 text-sm text-dim">{t('backups.inherits')}</p>
-			{#if baseEngine === 'mysql' || baseEngine === 'mariadb'}<p class="mb-3 rounded-lg bg-muted p-3 text-sm">{t(`requirement.${baseEngine}`)}</p>{/if}
+			{#if baseEngine === 'mysql' || baseEngine === 'mariadb' || baseEngine === 'mongodb'}<p class="mb-3 rounded-lg bg-muted p-3 text-sm">{t(`requirement.${baseEngine}`)}</p>{/if}
 		{:else}
 			<p class="mb-3 text-sm text-warn" role="alert">{t('backups.noBase')}</p>
 		{/if}

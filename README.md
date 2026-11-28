@@ -28,12 +28,12 @@ Done:
 - [x] SSH tunnels to databases
 - [x] SFTP, FTP/FTPS and Samba storage
 - [x] Redis, Elasticsearch and OpenSearch
-- [x] Incremental backups for MySQL and MariaDB, restore to a point in time
+- [x] Incremental backups for MySQL, MariaDB and MongoDB, restore to a point in time
 
 Planned:
 
 - [ ] Google Drive storage
-- [ ] Incremental backups for MongoDB and PostgreSQL
+- [ ] Incremental backups for PostgreSQL
 
 ## Run
 
@@ -90,7 +90,11 @@ needs the binary log on in ROW format, and the user `RELOAD`, `REPLICATION SLAVE
 `REPLICATION CLIENT` (MariaDB: `BINLOG MONITOR`). If the log was purged, a new full backup
 is taken. A restore goes into a new or empty database.
 
-The incremental files hold the binary log of the whole server. Schema changes made across
+For MongoDB the full backup takes the whole instance (database name `_all`) from a replica
+set, and the incremental ones keep its oplog. Restoring writes every database back but
+leaves the target's accounts alone; restore an incremental snapshot to get a single moment.
+
+The MySQL and MariaDB incremental files hold the binary log of the whole server. Schema changes made across
 databases while using the backed up one are replayed too.
 
 ## Backups

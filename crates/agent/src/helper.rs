@@ -5,7 +5,7 @@ use std::{env, process::ExitCode};
 
 use dbm_shared::jobs::DatabaseSecret;
 
-use crate::{Result, binlog, redis, search};
+use crate::{Result, binlog, oplog, redis, search};
 
 pub const TASK: &str = "DBM_HELPER";
 pub const SECRET: &str = "DBM_HELPER_SECRET";
@@ -20,6 +20,7 @@ pub const SEARCH_DUMP: &str = "search-dump";
 pub const SEARCH_RESTORE: &str = "search-restore";
 pub const BINLOG_DUMP: &str = "binlog-dump";
 pub const BINLOG_APPLY: &str = "binlog-apply";
+pub const OPLOG_APPLY: &str = "oplog-apply";
 
 fn task(task: &str) -> Result<()> {
     let secret: DatabaseSecret = serde_json::from_str(&env::var(SECRET)?)?;
@@ -48,6 +49,10 @@ fn task(task: &str) -> Result<()> {
                 until: &until,
             };
             binlog::apply(&secret, &replay, std::io::stdin().lock())
+        }
+        OPLOG_APPLY => {
+            let [_, _, until]: [String; 3] = serde_json::from_str(&env::var(ARGS)?)?;
+            oplog::apply(&secret, &until, std::io::stdin().lock())
         }
         other => Err(format!("unknown helper {other}").into()),
     }
